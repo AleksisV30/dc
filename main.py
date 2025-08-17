@@ -221,10 +221,8 @@ def embed(title: str, desc: Optional[str] = None, color: int = 0x00C2FF) -> disc
     return discord.Embed(title=title, description=desc or "", color=color)
 
 def avatar_url_from(id_str: str, avatar_hash: Optional[str]) -> str:
-    # Return a working Discord CDN avatar URL
     if avatar_hash:
         return f"https://cdn.discordapp.com/avatars/{id_str}/{avatar_hash}.png?size=64"
-    # default avatar sprite 0..5
     idx = int(id_str) % 6
     return f"https://cdn.discordapp.com/embed/avatars/{idx}.png?size=64"
 
@@ -290,7 +288,7 @@ def read_session(request: Request) -> dict | None:
     try: return signer.loads(raw)
     except BadSignature: return None
 
-# ---- HTML (same dark style; header with tabs; owner promo creator) ----
+# ---- HTML (tabs, header with balance+avatar; no escaped backticks) ----
 INDEX_HTML = """
 <!doctype html>
 <html>
@@ -441,7 +439,7 @@ INDEX_HTML = """
     async function render(){
       const auth = qs('authArea');
       try{
-        const me = await j('/api/me');          // now includes avatar_url
+        const me = await j('/api/me');          // includes avatar_url
         const bal = await j('/api/balance');
         auth.innerHTML = `
           <span class="chip">${fmtDL(bal.balance)}</span>
@@ -449,25 +447,25 @@ INDEX_HTML = """
         `;
         loginCard.style.display='none';
 
-        // REFERRAL
+        // REFERRAL: state + claim
         const ref = await j('/api/referral/state');
         if(ref.name){
           const base = location.origin;
           const link = base + '/?ref=' + encodeURIComponent(ref.name);
-          qs('refContent').innerHTML = \`
-            <p>Your referral name: <b>\${ref.name}</b></p>
+          qs('refContent').innerHTML = `
+            <p>Your referral name: <b>${ref.name}</b></p>
             <p>Share this link:</p>
-            <p><code>\${link}</code></p>
-          \`;
+            <p><code>${link}</code></p>
+          `;
         } else {
-          qs('refContent').innerHTML = \`
+          qs('refContent').innerHTML = `
             <p>Claim a referral name to get your link.</p>
             <div style="display:flex; gap:8px; align-items:center; max-width:420px">
               <input id="refName" placeholder="3-20 letters/numbers/_-" />
               <button class="btn primary" id="claimBtn">Claim</button>
             </div>
             <div id="refMsg" class="muted" style="margin-top:8px"></div>
-          \`;
+          `;
           qs('claimBtn').onclick = async ()=>{
             const name = qs('refName').value.trim();
             const msg = qs('refMsg');
@@ -483,7 +481,7 @@ INDEX_HTML = """
         // PROMO: my redemptions
         const mine = await j('/api/promo/my');
         qs('myCodes').innerHTML = mine.rows.length
-          ? '<ul>' + mine.rows.map(r=>\`<li><code>\${r.code}</code> — \${new Date(r.redeemed_at).toLocaleString()}</li>\`).join('') + '</ul>'
+          ? '<ul>' + mine.rows.map(r=>`<li><code>${r.code}</code> — ${new Date(r.redeemed_at).toLocaleString()}</li>`).join('') + '</ul>'
           : 'No redemptions yet.';
 
         // Owner promo creator
@@ -495,7 +493,7 @@ INDEX_HTML = """
             const m = parseInt(qs('cMax').value, 10);
             const msg = qs('cMsg'); msg.textContent='';
             try{
-              if(Number.isNaN(a) || a === 0) throw new Error('Amount must be non-zero');
+              if(Number.isNaN(a) || a == 0) throw new Error('Amount must be non-zero');
               if(Number.isNaN(m) || m < 1) throw new Error('Max uses must be >= 1');
               const res = await j('/api/admin/promo/create', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({code:c||null, amount:a, max_uses:m})});
               msg.textContent = 'Created code: ' + res.code;
@@ -521,20 +519,25 @@ INDEX_HTML = """
     }
 
     // redeem promo
-    qs('redeemBtn').onclick = async ()=>{
-      const code = qs('promoInput').value.trim();
-      const msg = qs('promoMsg');
-      msg.textContent = '';
-      if(!code){ msg.textContent = 'Enter a code.'; return; }
-      try{
-        const res = await j('/api/promo/redeem', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({code})});
-        msg.textContent = 'Success! New balance: ' + fmtDL(res.new_balance);
-        qs('promoInput').value='';
-        render();
-      }catch(e){
-        msg.textContent = 'Error: ' + e.message;
+    document.addEventListener('DOMContentLoaded', ()=>{
+      const redeemBtn = document.getElementById('redeemBtn');
+      if(redeemBtn){
+        redeemBtn.onclick = async ()=>{
+          const code = document.getElementById('promoInput').value.trim();
+          const msg = document.getElementById('promoMsg');
+          msg.textContent = '';
+          if(!code){ msg.textContent = 'Enter a code.'; return; }
+          try{
+            const res = await j('/api/promo/redeem', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({code})});
+            msg.textContent = 'Success! New balance: ' + fmtDL(res.new_balance);
+            document.getElementById('promoInput').value='';
+            render();
+          }catch(e){
+            msg.textContent = 'Error: ' + e.message;
+          }
+        };
       }
-    };
+    });
 
     render();
   </script>
@@ -578,7 +581,6 @@ async def callback(code: str | None = None):
                                headers={"Authorization": f"{token['token_type']} {token['access_token']}"}
                               )).json()
     resp = RedirectResponse(url="/")
-    # store only essentials
     payload = {"id": str(me["id"]), "username": me.get("username", "#"), "avatar": me.get("avatar")}
     set_session(resp, payload)
     return resp
@@ -668,7 +670,7 @@ async def api_admin_promo_create(request: Request, body: CreatePromoBody):
     if body.max_uses < 1: raise HTTPException(400, "Max uses must be >= 1")
     return create_promo(str(OWNER_ID), body.code, int(body.amount), int(body.max_uses), body.expires_at)
 
-# (member search endpoint kept from earlier, if you still use it elsewhere)
+# (optional) Member search endpoint still available if you need it later
 @app.get("/api/admin/members")
 async def api_admin_members(request: Request, q: str = Query("", description="Search after @ (optional)")):
     require_owner(request)

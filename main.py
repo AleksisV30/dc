@@ -29,10 +29,13 @@ GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 GEM = "💎"
-HOUSE_EDGE = Decimal("0.01")     # 1% edge
 MIN_BET = Decimal("1.00")        # 1.00 DL minimum
 MAX_BET = Decimal("1000000.00")
 BETTING_SECONDS = 10             # Crash betting window
+
+# House edges (env-tunable)
+HOUSE_EDGE_CRASH = Decimal(os.getenv("HOUSE_EDGE_CRASH", "0.06"))  # 6% default for Crash
+HOUSE_EDGE_MINES = Decimal(os.getenv("HOUSE_EDGE_MINES", "0.03"))  # 3% per safe reveal for Mines
 
 TWO = Decimal("0.01")
 
@@ -46,8 +49,9 @@ def q2(x: Decimal) -> Decimal:
 # ---------- Time helpers ----------
 UTC = datetime.timezone.utc
 def now_utc() -> datetime.datetime: return datetime.datetime.now(UTC)
-def iso(dt: Optional[datetime.datetime]) -> Optional[str]:
+def iso(dt: Optional[str|datetime.datetime]) -> Optional[str]:
     if dt is None: return None
+    if isinstance(dt, str): return dt
     return dt.astimezone(UTC).isoformat()
 
 # ---------- DB helpers ----------
@@ -288,13 +292,15 @@ def create_promo(cur, actor_id: str, code: Optional[str], amount, max_uses: int 
 
 # ---- Crash math & DB ----
 def _u(): return (secrets.randbelow(1_000_000_000)+1)/1_000_000_001.0
-def gen_bust(edge: Decimal = HOUSE_EDGE) -> float:
+
+def gen_bust(edge: Decimal) -> float:
+    # Inverse CDF with edge: higher edge lowers expected bust
     u = _u()
-    B = max(1.0, float((Decimal("1.0")-edge)/Decimal(str(u))))
+    B = max(1.0, float((Decimal("1.0") - edge) / Decimal(str(u))))
     return math.floor(B*100)/100.0
 
 def run_duration_for(bust: float) -> float:
-    # MUCH slower curve than before
+    # Slow curve
     return min(22.0, 8.0 + math.log(bust + 1.0) * 6.0)
 
 def current_multiplier(started_at: datetime.datetime, expected_end_at: datetime.datetime, bust: float, at: Optional[datetime.datetime] = None) -> float:
@@ -376,7 +382,7 @@ def begin_running(cur, round_id: int):
     st = cur.fetchone()
     if not st or st[0] != 'betting': return None
 
-    bust = gen_bust(HOUSE_EDGE)
+    bust = gen_bust(HOUSE_EDGE_CRASH)
     dur = run_duration_for(bust)
     now = now_utc()
     exp_end = now + datetime.timedelta(seconds=dur)
@@ -542,12 +548,12 @@ def picks_count_from_bitmask(mask: int) -> int:
     return mask.bit_count()
 
 def mines_multiplier(mines: int, picks_count: int) -> float:
-    # Fair multiplier Π (25 - i)/(25 - mines - i); apply 1% edge per safe pick
+    # Fair multiplier Π (25 - i)/(25 - mines - i); apply env-based edge per safe pick
     if picks_count <= 0: return 1.0
     total = Decimal("1.0")
     for i in range(picks_count):
         total *= D(25 - i) / D(max(1, 25 - mines - i))
-        total *= (Decimal("1.0") - HOUSE_EDGE)
+        total *= (Decimal("1.0") - HOUSE_EDGE_MINES)
     return float(total)
 
 @with_conn
@@ -1129,6 +1135,7 @@ HTML_TEMPLATE = """
   </div>
 
   <script>
+    const HOUSE_EDGE_MINES = __HOUSE_EDGE_MINES__;
     function qs(id){return document.getElementById(id)}
     const tabGames = qs('tab-games'), tabRef=qs('tab-ref'), tabPromo=qs('tab-promo');
     const pgGames=qs('page-games'), pgCrash=qs('page-crash'), pgMines=qs('page-mines'), pgRef=qs('page-ref'), pgPromo=qs('page-promo'), pgProfile=qs('page-profile'), loginCard=qs('loginCard');
@@ -1487,7 +1494,7 @@ HTML_TEMPLATE = """
       let t=1.0;
       for(let i=0;i<picks;i++){
         t *= (25 - i) / Math.max(1, (25 - mines - i));
-        t *= (1 - 0.01);
+        t *= (1 - HOUSE_EDGE_MINES);
       }
       return t;
     }
@@ -1643,7 +1650,7 @@ HTML_TEMPLATE = """
       }catch(e){}
     }
     async function updateChatGate(){
-      try{ await j('/api/me'); isLogged = true; }catch(e){ isLogged = false; }  // <-- fixed (true/false)
+      try{ await j('/api/me'); isLogged = true; }catch(e){ isLogged = false; }
       if(isLogged){
         const prof = await j('/api/profile'); myLevel = prof.level || 1;
       }else{ myLevel = 0; }
@@ -1718,7 +1725,11 @@ HTML_TEMPLATE = """
 </html>
 """
 
-INDEX_HTML = HTML_TEMPLATE.replace("__OWNER_ID__", str(OWNER_ID))
+INDEX_HTML = (
+    HTML_TEMPLATE
+      .replace("__OWNER_ID__", str(OWNER_ID))
+      .replace("__HOUSE_EDGE_MINES__", f"{float(HOUSE_EDGE_MINES)}")
+)
 
 # ----- Routes -----
 @app.get("/", response_class=HTMLResponse)

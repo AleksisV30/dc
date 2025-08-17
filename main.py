@@ -56,7 +56,18 @@ def iso(dt: Optional[str|datetime.datetime]) -> Optional[str]:
     return dt.astimezone(UTC).isoformat()
 
 # ---------- FastAPI ----------
+from fastapi.staticfiles import StaticFiles
+import os
+
 app = FastAPI()
+
+# Ensure the folder exists so StaticFiles won't crash
+BASE_DIR = os.path.dirname(__file__)
+STATIC_DIR = os.path.join(BASE_DIR, "static")
+os.makedirs(STATIC_DIR, exist_ok=True)
+
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
 # serve /static for your future images
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
@@ -2227,3 +2238,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+

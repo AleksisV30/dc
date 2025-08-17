@@ -7,16 +7,16 @@ import psycopg
 import discord
 from discord.ext import commands
 from fastapi import FastAPI, Request, HTTPException, Query
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from itsdangerous import URLSafeSerializer, BadSignature
 import uvicorn
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 # ---------- Config ----------
 PREFIX = "."
 BOT_TOKEN = os.getenv("DISCORD_TOKEN")
 CLIENT_ID = os.getenv("DISCORD_CLIENT_ID")
-CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
+CLIENT_SECRET = os.getenv("CLIENT_SECRET") or os.getenv("DISCORD_CLIENT_SECRET")  # allow either name
 OAUTH_REDIRECT = os.getenv("OAUTH_REDIRECT")
 SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret")
 PORT = int(os.getenv("PORT", "8080"))
@@ -26,7 +26,7 @@ GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 GEM = "💎"
-HOUSE_EDGE = 0.01  # 1% house edge for Crash
+HOUSE_EDGE = 0.05  # 1% house edge for Crash
 MIN_BET = 1       # DL
 MAX_BET = 1_000_000
 
@@ -44,14 +44,12 @@ def with_conn(fn):
 
 @with_conn
 def init_db(cur):
-    # balances
     cur.execute("""
         CREATE TABLE IF NOT EXISTS balances (
             user_id TEXT PRIMARY KEY,
             balance INTEGER NOT NULL DEFAULT 0
         )
     """)
-    # logs
     cur.execute("""
         CREATE TABLE IF NOT EXISTS balance_log (
             id BIGSERIAL PRIMARY KEY,
@@ -62,7 +60,6 @@ def init_db(cur):
             created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # promo codes
     cur.execute("""
         CREATE TABLE IF NOT EXISTS promo_codes (
             code TEXT PRIMARY KEY,
@@ -74,7 +71,6 @@ def init_db(cur):
             created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # redemptions (1 per user per code)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS promo_redemptions (
             user_id TEXT NOT NULL,
@@ -83,7 +79,6 @@ def init_db(cur):
             PRIMARY KEY(user_id, code)
         )
     """)
-    # profiles (referral name + XP)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS profiles (
             user_id TEXT PRIMARY KEY,
@@ -94,8 +89,6 @@ def init_db(cur):
         )
     """)
     cur.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS xp INTEGER NOT NULL DEFAULT 0")
-
-    # crash game history
     cur.execute("""
         CREATE TABLE IF NOT EXISTS crash_games (
             id BIGSERIAL PRIMARY KEY,
@@ -132,20 +125,47 @@ def adjust_balance(cur, actor_id: str, target_id: str, amount: int, reason: Opti
     return int(cur.fetchone()[0])
 
 @with_conn
-def get_top_balances(cur, limit: int = 20):
-    cur.execute("SELECT user_id, balance FROM balances ORDER BY balance DESC LIMIT %s", (limit,))
-    return [{"user_id": r[0], "balance": int(r[1])} for r in cur.fetchall()]
+def get_profile(cur, user_id: str):
+    cur.execute("SELECT display_name, xp FROM profiles WHERE user_id = %s", (user_id,))
+    row = cur.fetchone()
+    return {"display_name": row[0], "xp": int(row[1])} if row else None
 
 @with_conn
-def get_recent_logs(cur, limit: int = 20):
+def get_profile_name(cur, user_id: str):
+    cur.execute("SELECT display_name FROM profiles WHERE user_id = %s", (user_id,))
+    row = cur.fetchone()
+    return row[0] if row else None
+
+@with_conn
+def ensure_profile_row(cur, user_id: str):
+    cur.execute("INSERT INTO profiles(user_id, display_name, name_lower) VALUES (%s, %s, %s) ON CONFLICT (user_id) DO NOTHING",
+                (user_id, f"user_{user_id[-4:]}", f"user_{user_id[-4:]}"))
+    cur.execute("SELECT display_name, xp FROM profiles WHERE user_id = %s", (user_id,))
+    r = cur.fetchone()
+    return {"display_name": r[0], "xp": int(r[1])}
+
+@with_conn
+def add_xp(cur, user_id: str, amount: int):
+    ensure_profile_row(user_id)
+    cur.execute("UPDATE profiles SET xp = xp + %s WHERE user_id = %s", (amount, user_id))
+
+@with_conn
+def my_redemptions(cur, user_id: str):
+    cur.execute("SELECT code, redeemed_at FROM promo_redemptions WHERE user_id=%s ORDER BY redeemed_at DESC LIMIT 50", (user_id,))
+    return [{"code": r[0], "redeemed_at": str(r[1])} for r in cur.fetchall()]
+
+def _rand_code(n=8):
+    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=n))
+
+@with_conn
+def create_promo(cur, actor_id: str, code: Optional[str], amount: int, max_uses: int = 1, expires_at: Optional[str] = None):
+    code = (code.strip().upper() if code else _rand_code())
     cur.execute("""
-        SELECT actor_id, target_id, amount, reason, created_at
-        FROM balance_log
-        ORDER BY id DESC
-        LIMIT %s
-    """, (limit,))
-    rows = cur.fetchall()
-    return [{"actor_id":r[0], "target_id":r[1], "amount":int(r[2]), "reason":r[3], "created_at":str(r[4])} for r in rows]
+        INSERT INTO promo_codes(code, amount, max_uses, expires_at, created_by)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (code) DO UPDATE SET amount=EXCLUDED.amount, max_uses=EXCLUDED.max_uses, expires_at=EXCLUDED.expires_at
+    """, (code, amount, max_uses, expires_at, actor_id))
+    return {"ok": True, "code": code}
 
 # ---- Promo helpers ----
 class PromoError(Exception): ...
@@ -171,7 +191,6 @@ def redeem_promo(cur, user_id: str, code: str) -> int:
     cur.execute("SELECT 1 FROM promo_redemptions WHERE user_id=%s AND code=%s", (user_id, code))
     if cur.fetchone():
         raise PromoAlreadyRedeemed("You already redeemed this code")
-    # apply
     cur.execute("INSERT INTO balances (user_id, balance) VALUES (%s, 0) ON CONFLICT (user_id) DO NOTHING", (user_id,))
     cur.execute("UPDATE balances SET balance = balance + %s WHERE user_id = %s", (amount, user_id))
     cur.execute("UPDATE promo_codes SET uses = uses + 1 WHERE code = %s", (code,))
@@ -181,93 +200,19 @@ def redeem_promo(cur, user_id: str, code: str) -> int:
     cur.execute("SELECT balance FROM balances WHERE user_id = %s", (user_id,))
     return int(cur.fetchone()[0])
 
-@with_conn
-def my_redemptions(cur, user_id: str):
-    cur.execute("SELECT code, redeemed_at FROM promo_redemptions WHERE user_id=%s ORDER BY redeemed_at DESC LIMIT 50", (user_id,))
-    return [{"code": r[0], "redeemed_at": str(r[1])} for r in cur.fetchall()]
-
-def _rand_code(n=8):
-    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=n))
-
-@with_conn
-def create_promo(cur, actor_id: str, code: Optional[str], amount: int, max_uses: int = 1, expires_at: Optional[str] = None):
-    code = (code.strip().upper() if code else _rand_code())
-    cur.execute("""
-        INSERT INTO promo_codes(code, amount, max_uses, expires_at, created_by)
-        VALUES (%s, %s, %s, %s, %s)
-        ON CONFLICT (code) DO UPDATE SET amount=EXCLUDED.amount, max_uses=EXCLUDED.max_uses, expires_at=EXCLUDED.expires_at
-    """, (code, amount, max_uses, expires_at, actor_id))
-    return {"ok": True, "code": code}
-
-# ---- Profiles (referral name + XP/level) ----
-NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{3,20}$")
-
-@with_conn
-def get_profile(cur, user_id: str):
-    cur.execute("SELECT display_name, xp FROM profiles WHERE user_id = %s", (user_id,))
-    row = cur.fetchone()
-    return {"display_name": row[0], "xp": int(row[1])} if row else None
-
-@with_conn
-def get_profile_name(cur, user_id: str):
-    cur.execute("SELECT display_name FROM profiles WHERE user_id = %s", (user_id,))
-    row = cur.fetchone()
-    return row[0] if row else None
-
-@with_conn
-def set_profile_name(cur, user_id: str, name: str):
-    if not NAME_RE.match(name):
-        raise ValueError("Name must be 3-20 chars [a-zA-Z0-9_-]")
-    name_lower = name.lower()
-    cur.execute("SELECT user_id FROM profiles WHERE name_lower = %s AND user_id <> %s", (name_lower, user_id))
-    if cur.fetchone():
-        raise ValueError("Name is already taken")
-    cur.execute("""
-        INSERT INTO profiles(user_id, display_name, name_lower)
-        VALUES (%s, %s, %s)
-        ON CONFLICT (user_id)
-        DO UPDATE SET display_name = EXCLUDED.display_name, name_lower = EXCLUDED.name_lower
-    """, (user_id, name, name_lower))
-    return {"ok": True, "name": name}
-
-@with_conn
-def ensure_profile_row(cur, user_id: str):
-    cur.execute("INSERT INTO profiles(user_id, display_name, name_lower) VALUES (%s, %s, %s) ON CONFLICT (user_id) DO NOTHING",
-                (user_id, f"user_{user_id[-4:]}", f"user_{user_id[-4:]}"))
-    cur.execute("SELECT display_name, xp FROM profiles WHERE user_id = %s", (user_id,))
-    r = cur.fetchone()
-    return {"display_name": r[0], "xp": int(r[1])}
-
-@with_conn
-def add_xp(cur, user_id: str, amount: int):
-    ensure_profile_row(user_id)
-    cur.execute("UPDATE profiles SET xp = xp + %s WHERE user_id = %s", (amount, user_id))
-
-def xp_to_level(xp: int):
-    level = 1 + (xp // 100)
-    base = (level - 1) * 100
-    next_at = level * 100
-    progress = xp - base
-    needed = next_at - base
-    pct = 0 if needed == 0 else int(progress * 100 / needed)
-    return {"level": int(level), "xp": int(xp), "progress": int(progress), "next_needed": int(needed), "pct": pct}
-
 # ---- Crash game logic ----
 def _rand_unit():
-    # uniform (0,1), never 0
     n = secrets.randbelow(1_000_000_000) + 1  # 1..1e9
     return n / 1_000_000_001.0
 
 def gen_crash_bust(edge: float = HOUSE_EDGE) -> float:
-    # Provably-fair style: P(B >= x) = (1 - edge) / x, x >= 1
-    u = _rand_unit()  # (0,1)
+    # P(B >= x) = (1 - edge) / x, x >= 1
+    u = _rand_unit()
     B = max(1.0, (1.0 - edge) / u)
-    # floor to 2 decimals
     return math.floor(B * 100.0) / 100.0
 
 @with_conn
 def crash_play_db(cur, user_id: str, bet: int, cashout: float, edge: float = HOUSE_EDGE):
-    # Ensure balance row exists and lock it
     cur.execute("INSERT INTO balances (user_id, balance) VALUES (%s, 0) ON CONFLICT (user_id) DO NOTHING", (user_id,))
     cur.execute("SELECT balance FROM balances WHERE user_id=%s FOR UPDATE", (user_id,))
     row = cur.fetchone()
@@ -279,44 +224,30 @@ def crash_play_db(cur, user_id: str, bet: int, cashout: float, edge: float = HOU
     if bal < bet:
         raise ValueError("Insufficient balance")
 
-    # Deduct bet
+    # take bet
     cur.execute("UPDATE balances SET balance = balance - %s WHERE user_id = %s", (bet, user_id))
 
-    # Generate bust and resolve
     bust = gen_crash_bust(edge)
     win = 0
     if cashout <= bust:
-        win = int(math.floor(bet * cashout + 1e-9))  # integer DL payout
-
-    # Credit win if any
-    if win > 0:
+        win = int(math.floor(bet * cashout + 1e-9))
         cur.execute("UPDATE balances SET balance = balance + %s WHERE user_id = %s", (win, user_id))
 
-    # XP gain: at least 1, capped
     xp_gain = max(1, min(bet, 50))
     ensure_profile_row(user_id)
     cur.execute("UPDATE profiles SET xp = xp + %s WHERE user_id = %s", (xp_gain, user_id))
 
-    # Record game
     cur.execute("""
         INSERT INTO crash_games(user_id, bet, cashout, bust, win, xp_gain)
         VALUES (%s, %s, %s, %s, %s, %s)
         RETURNING id
     """, (user_id, bet, float(cashout), float(bust), win, xp_gain))
-    game_id = cur.fetchone()[0]
+    game_id = int(cur.fetchone()[0])
 
-    # Get new balance
     cur.execute("SELECT balance FROM balances WHERE user_id=%s", (user_id,))
     new_bal = int(cur.fetchone()[0])
 
-    return {
-        "id": int(game_id),
-        "bust": float(bust),
-        "win": int(win),
-        "net": int(win - bet),
-        "new_balance": new_bal,
-        "xp_gain": int(xp_gain),
-    }
+    return {"id": game_id, "bust": float(bust), "win": int(win), "net": int(win - bet), "new_balance": new_bal, "xp_gain": int(xp_gain)}
 
 @with_conn
 def crash_history(cur, user_id: str, limit: int = 10):
@@ -445,26 +376,35 @@ INDEX_HTML = """
     .btn{display:inline-flex; align-items:center; gap:8px; padding:8px 12px; border-radius:10px; border:1px solid var(--border); background:#0f1a33; cursor:pointer}
     .btn.primary{background:linear-gradient(135deg,#3b82f6,#22c1dc); border-color:transparent}
     .grid{display:grid; gap:16px; grid-template-columns:1fr}
-    @media(min-width:900px){.grid{grid-template-columns:1fr 1fr}}
+    @media(min-width:1000px){.grid{grid-template-columns:1fr 1fr}}
     .card{background:var(--card); border:1px solid var(--border); border-radius:16px; padding:16px}
     .label{color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.1em}
     .big{font-size:28px; font-weight:800}
-    table{width:100%; border-collapse:collapse; margin-top:10px}
-    th,td{border-bottom:1px solid var(--border); padding:8px 6px; text-align:left}
     .muted{color:var(--muted)}
     input{width:100%; background:#0e1833; color:#e8efff; border:1px solid var(--border); border-radius:10px; padding:10px}
-    .games-grid{display:grid; gap:12px; grid-template-columns:1fr; margin-top:16px}
-    @media(min-width:1000px){.games-grid{grid-template-columns:repeat(2,1fr)}}
-    .game{background:#0f1a33;border:1px solid var(--border);border-radius:16px;padding:14px}
+    .game-card{background:#0f1a33;border:1px solid var(--border);border-radius:16px;padding:14px;cursor:pointer;transition:transform .08s ease}
+    .game-card:hover{transform:translateY(-2px)}
     .banner{font-weight:900; font-size:18px}
     .owner{margin-top:16px; border-top:1px dashed var(--border); padding-top:12px}
-    .xpbar{height:10px; background:#0e1833; border:1px solid var(--border); border-radius:999px; overflow:hidden}
-    .xpfill{height:100%; background:linear-gradient(90deg,#22c1dc,#3b82f6)}
-    .modal{position:fixed; inset:0; background:rgba(0,0,0,.6); display:none; align-items:center; justify-content:center; padding:20px}
-    .modal .box{background:#0f1a33; border:1px solid var(--border); border-radius:16px; padding:16px; max-width:520px; width:100%}
-    .bust{font-weight:800}
+
+    /* Crash page */
+    .crash-wrap{display:flex; flex-direction:column; gap:10px}
+    .cr-row{display:grid; grid-template-columns:1fr 1fr; gap:12px}
+    .cr-line{position:relative; height:18px; background:#0e1833; border:1px solid var(--border); border-radius:999px; overflow:hidden}
+    .cr-fill{position:absolute; left:0; top:0; bottom:0; width:0%; background:linear-gradient(90deg,#22c1dc,#3b82f6)}
+    .cr-marker{position:absolute; top:-6px; width:2px; height:30px; background:#f59e0b; opacity:.9}
+    .cr-marker.bust{background:#ef4444}
+    .cr-head{display:flex; align-items:center; gap:10px}
+    .cr-multi{font-size:28px; font-weight:900}
+    .cr-small{font-size:12px; color:var(--muted)}
+    table{width:100%; border-collapse:collapse; margin-top:10px}
+    th,td{border-bottom:1px solid var(--border); padding:8px 6px; text-align:left}
     .win{color:#34d399}
     .lose{color:#ef4444}
+
+    /* Modal */
+    .modal{position:fixed; inset:0; background:rgba(0,0,0,.6); display:none; align-items:center; justify-content:center; padding:20px}
+    .modal .box{background:#0f1a33; border:1px solid var(--border); border-radius:16px; padding:16px; max-width:520px; width:100%}
   </style>
 </head>
 <body>
@@ -481,36 +421,67 @@ INDEX_HTML = """
   </div>
 
   <div class="container" style="padding-top:16px">
+    <!-- Games list -->
     <div id="page-games">
       <div class="card">
-        <div class="label">Crash — House edge 1%</div>
-        <div class="grid" style="grid-template-columns:1fr 1fr; gap:12px">
-          <div>
-            <div class="label">Bet (DL)</div>
-            <input id="crBet" type="number" min="1" step="1" placeholder="min 1" />
-          </div>
-          <div>
-            <div class="label">Cashout goal (×)</div>
-            <input id="crCash" type="number" min="1.01" step="0.01" value="2.00" />
-          </div>
-        </div>
-        <div style="margin-top:10px; display:flex; gap:8px; align-items:center">
-          <button class="btn primary" id="crPlay">Play</button>
-          <span class="muted">You can set any goal (e.g., 1.10×, 2×, 5×...). Min bet is 1 DL.</span>
-        </div>
-        <div id="crMsg" class="muted" style="margin-top:8px"></div>
-        <div id="crLast" style="margin-top:12px"></div>
-      </div>
-
-      <div class="card">
         <div class="label">Games</div>
-        <div class="games-grid">
-          <div class="game"><div class="big">🎯 Coin Flip</div><div class="muted">Coming soon.</div></div>
-          <div class="game"><div class="big">🃏 Blackjack</div><div class="muted">Coming soon.</div></div>
+        <div class="grid">
+          <div class="game-card" id="openCrash">
+            <div class="big">🚀 Crash</div>
+            <div class="muted">Click to play. Set a cashout goal, watch the multiplier climb… don’t get busted!</div>
+          </div>
+          <div class="game-card">
+            <div class="big">🎯 Coin Flip</div>
+            <div class="muted">Coming soon.</div>
+          </div>
         </div>
       </div>
     </div>
 
+    <!-- Crash page -->
+    <div id="page-crash" style="display:none">
+      <div class="card">
+        <div class="cr-head">
+          <div class="big">🚀 Crash</div>
+          <div class="cr-small">House edge 1% • Min bet 1 DL</div>
+        </div>
+        <div class="crash-wrap">
+          <div class="cr-row">
+            <div>
+              <div class="label">Bet (DL)</div>
+              <input id="crBet" type="number" min="1" step="1" placeholder="min 1"/>
+            </div>
+            <div>
+              <div class="label">Cashout goal (×)</div>
+              <input id="crCash" type="number" min="1.01" step="0.01" value="2.00"/>
+            </div>
+          </div>
+
+          <div class="cr-head" style="margin-top:4px">
+            <div class="cr-multi" id="crNow">1.00×</div>
+            <div class="cr-small" id="crHint">Set your bet and goal, then press Play.</div>
+          </div>
+
+          <div class="cr-line">
+            <div class="cr-fill" id="crFill"></div>
+            <div class="cr-marker" id="crCashMarker" style="display:none"></div>
+            <div class="cr-marker bust" id="crBustMarker" style="display:none"></div>
+          </div>
+
+          <div style="display:flex; gap:8px; align-items:center">
+            <button class="btn primary" id="crPlay">Play</button>
+            <span id="crMsg" class="muted"></span>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="label">Your recent rounds</div>
+        <div id="crLast" class="muted">—</div>
+      </div>
+    </div>
+
+    <!-- Referral -->
     <div id="page-ref" style="display:none">
       <div class="card">
         <div class="label">Referral</div>
@@ -518,6 +489,7 @@ INDEX_HTML = """
       </div>
     </div>
 
+    <!-- Promo Codes -->
     <div id="page-promo" style="display:none">
       <div class="card">
         <div class="label">Promo Codes</div>
@@ -538,7 +510,7 @@ INDEX_HTML = """
       </div>
     </div>
 
-    <!-- Profile page -->
+    <!-- Profile -->
     <div id="page-profile" style="display:none">
       <div class="card">
         <div class="label">Profile</div>
@@ -546,7 +518,6 @@ INDEX_HTML = """
 
         <div id="ownerPanel" class="owner" style="display:none">
           <div class="label">Owner Panel</div>
-          <!-- Adjust balance -->
           <div class="grid" style="grid-template-columns:2fr 1fr 2fr auto; gap:8px">
             <div><div class="label">Discord ID or &lt;@mention&gt;</div><input id="tIdent" placeholder="ID or <@id>"/></div>
             <div><div class="label">Amount (+/- DL)</div><input id="tAmt" type="number" placeholder="10 or -5"/></div>
@@ -555,7 +526,6 @@ INDEX_HTML = """
           </div>
           <div id="tMsg" class="muted" style="margin-top:8px"></div>
 
-          <!-- Create promo -->
           <div class="label" style="margin-top:12px">Create Promo Code</div>
           <div class="grid" style="grid-template-columns:1fr 1fr 1fr; gap:8px">
             <div><div class="label">Code (optional)</div><input id="cCode" placeholder="auto-generate if empty"/></div>
@@ -567,6 +537,7 @@ INDEX_HTML = """
       </div>
     </div>
 
+    <!-- Login card -->
     <div id="loginCard" class="card" style="display:none">
       <div class="label">Get Started</div>
       <p>If you’re not logged in, click <b>Login with Discord</b>. If you’re new, click <b>Register</b> to see how to join:</p>
@@ -599,15 +570,16 @@ INDEX_HTML = """
   <script>
     function qs(id){return document.getElementById(id)}
     const tabGames = qs('tab-games'), tabRef=qs('tab-ref'), tabPromo=qs('tab-promo');
-    const pgGames=qs('page-games'), pgRef=qs('page-ref'), pgPromo=qs('page-promo'), loginCard=qs('loginCard'), pgProfile=qs('page-profile');
+    const pgGames=qs('page-games'), pgCrash=qs('page-crash'), pgRef=qs('page-ref'), pgPromo=qs('page-promo'), pgProfile=qs('page-profile'), loginCard=qs('loginCard');
 
     function fmtDL(n){ return `💎 ${Number(n).toLocaleString()} DL`; }
     async function j(u, opt={}){ const r=await fetch(u, Object.assign({credentials:'include'},opt)); if(!r.ok) throw new Error(await r.text()); return r.json(); }
 
     function setTab(which){
       [tabGames,tabRef,tabPromo].forEach(t=>t.classList.remove('active'));
-      [pgGames,pgRef,pgPromo,pgProfile].forEach(p=>p.style.display='none');
+      [pgGames,pgCrash,pgRef,pgPromo,pgProfile].forEach(p=>p.style.display='none');
       if(which==='games'){ tabGames.classList.add('active'); pgGames.style.display=''; }
+      if(which==='crash'){ pgCrash.style.display=''; }
       if(which==='ref'){ tabRef.classList.add('active'); pgRef.style.display=''; }
       if(which==='promo'){ tabPromo.classList.add('active'); pgPromo.style.display=''; }
       if(which==='profile'){ pgProfile.style.display=''; }
@@ -617,6 +589,7 @@ INDEX_HTML = """
     tabRef.onclick=()=>setTab('ref');
     tabPromo.onclick=()=>setTab('promo');
     qs('homeLink').onclick=(e)=>{ e.preventDefault(); setTab('games'); };
+    qs('openCrash').onclick=()=>setTab('crash');
 
     qs('registerBtn')?.addEventListener('click', ()=> {
       const info = qs('registerInfo');
@@ -634,7 +607,7 @@ INDEX_HTML = """
     async function render(){
       const auth = qs('authArea');
       try{
-        const me = await j('/api/me');          // includes avatar_url
+        const me = await j('/api/me');
         const bal = await j('/api/balance');
 
         auth.innerHTML = `
@@ -642,16 +615,13 @@ INDEX_HTML = """
           <img class="avatar" id="avatarBtn" src="${safeAvatar(me)}" title="${me.username}" onerror="this.style.display='none'">
         `;
         loginCard.style.display='none';
-
-        // Balance click → modal, Avatar click → profile
         qs('balanceBtn').onclick = openModal;
         qs('avatarBtn').onclick = ()=>setTab('profile');
 
-        // ---- REFERRAL tab ----
+        // Referral content
         const refState = await j('/api/referral/state');
         if(refState.name){
-          const base = location.origin;
-          const link = base + '/?ref=' + encodeURIComponent(refState.name);
+          const link = location.origin + '/?ref=' + encodeURIComponent(refState.name);
           qs('refContent').innerHTML = `
             <p>Your referral name: <b>${refState.name}</b></p>
             <p>Share this link:</p>
@@ -676,20 +646,18 @@ INDEX_HTML = """
           };
         }
 
-        // ---- PROMO tab (my redemptions) ----
+        // Promo redemptions
         const mine = await j('/api/promo/my');
         qs('myCodes').innerHTML = mine.rows.length
           ? '<ul>' + mine.rows.map(r=>`<li><code>${r.code}</code> — ${new Date(r.redeemed_at).toLocaleString()}</li>`).join('') + '</ul>'
           : 'No redemptions yet.';
 
-        // ---- PROFILE page ----
+        // Profile box
         const prof = await j('/api/profile');
-        const lvl = prof.level;
-        const pct = Math.max(0, Math.min(100, prof.progress_pct));
-        const avatar = safeAvatar(me);
+        const lvl = prof.level, pct = Math.max(0, Math.min(100, prof.progress_pct));
         qs('profileBox').innerHTML = `
           <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap">
-            <img src="${avatar}" class="avatar" style="width:56px; height:56px">
+            <img src="${safeAvatar(me)}" class="avatar" style="width:56px; height:56px">
             <div>
               <div class="big">${me.username}</div>
               <div class="muted">ID: ${me.id}</div>
@@ -698,7 +666,6 @@ INDEX_HTML = """
               <a class="btn" href="/logout">Logout</a>
             </div>
           </div>
-
           <div class="grid" style="margin-top:12px">
             <div class="card" style="padding:12px">
               <div class="label">Balance</div>
@@ -708,15 +675,17 @@ INDEX_HTML = """
             <div class="card" style="padding:12px">
               <div class="label">Level</div>
               <div><b>Level ${lvl}</b> — XP ${prof.xp} / ${((lvl-1)*100)+100}</div>
-              <div class="xpbar" style="margin-top:8px"><div class="xpfill" style="width:${pct}%;"></div></div>
+              <div style="height:10px; background:#0e1833; border:1px solid var(--border); border-radius:999px; overflow:hidden; margin-top:8px">
+                <div style="height:100%; width:${pct}%; background:linear-gradient(90deg,#22c1dc,#3b82f6)"></div>
+              </div>
               <div class="muted" style="margin-top:6px">${prof.progress}/${prof.next_needed} XP to next level</div>
             </div>
           </div>
         `;
 
-        // Owner panel on profile
+        // Owner panel
         if (me.id === 'OWNER_PLACEHOLDER') {
-          const box = qs('ownerPanel'); box.style.display='';
+          qs('ownerPanel').style.display='';
           qs('tApply').onclick = async ()=>{
             const ident = qs('tIdent').value.trim();
             const amt = parseInt(qs('tAmt').value, 10);
@@ -748,52 +717,100 @@ INDEX_HTML = """
           qs('ownerPanel').style.display='none';
         }
 
-        // Hook up CRASH play button + load last plays
-        const crPlayBtn = document.getElementById('crPlay');
-        const crMsg = document.getElementById('crMsg');
-        const crLast = document.getElementById('crLast');
-
+        // Crash history on enter crash page
         async function loadCrashHistory(){
           try{
             const h = await j('/api/game/crash/history');
-            if (!h.rows.length){ crLast.innerHTML = '<div class="muted">No recent rounds.</div>'; return; }
-            crLast.innerHTML = `
-              <div class="label">Your recent rounds</div>
-              <table><thead><tr><th>When</th><th>Bet</th><th>Goal</th><th>Bust</th><th>Win</th><th>XP</th></tr></thead>
-              <tbody>
-                ${h.rows.map(r=>`
-                  <tr>
-                    <td>${new Date(r.created_at).toLocaleString()}</td>
-                    <td>${fmtDL(r.bet)}</td>
-                    <td>${r.cashout.toFixed(2)}×</td>
-                    <td class="bust">${r.bust.toFixed(2)}×</td>
-                    <td class="${r.win>0?'win':'lose'}">${r.win>0?fmtDL(r.win):'-'}</td>
-                    <td>${r.xp_gain}</td>
-                  </tr>
-                `).join('')}
-              </tbody></table>
-            `;
-          }catch(e){ crLast.innerHTML = '<div class="muted">Unable to load history.</div>'; }
+            qs('crLast').innerHTML = h.rows.length
+              ? `<table><thead><tr><th>When</th><th>Bet</th><th>Goal</th><th>Bust</th><th>Win</th><th>XP</th></tr></thead>
+                 <tbody>${
+                   h.rows.map(r=>`
+                     <tr>
+                       <td>${new Date(r.created_at).toLocaleString()}</td>
+                       <td>${fmtDL(r.bet)}</td>
+                       <td>${r.cashout.toFixed(2)}×</td>
+                       <td>${r.bust.toFixed(2)}×</td>
+                       <td class="${r.win>0?'win':'lose'}">${r.win>0?fmtDL(r.win):'-'}</td>
+                       <td>${r.xp_gain}</td>
+                     </tr>`).join('')
+                 }</tbody></table>`
+              : 'No recent rounds.';
+          }catch(e){ qs('crLast').textContent = 'Unable to load history.'; }
         }
+
+        // Crash play with animated multiplier line
+        const crPlayBtn = qs('crPlay'), crMsg = qs('crMsg');
+        const crNow = qs('crNow'), crHint = qs('crHint');
+        const crFill = qs('crFill'), cashMarker = qs('crCashMarker'), bustMarker = qs('crBustMarker');
+
+        function resetLine(){
+          crFill.style.width = '0%';
+          crNow.textContent = '1.00×';
+          crHint.textContent = 'Set your bet and goal, then press Play.';
+          cashMarker.style.display='none';
+          bustMarker.style.display='none';
+        }
+        resetLine();
 
         crPlayBtn.onclick = async ()=>{
           crMsg.textContent='';
-          const bet = parseInt(document.getElementById('crBet').value, 10);
-          const cash = parseFloat(document.getElementById('crCash').value);
+          const bet = parseInt(qs('crBet').value, 10);
+          const cash = parseFloat(qs('crCash').value);
           if(Number.isNaN(bet) || bet < 1){ crMsg.textContent = 'Enter a bet of at least 1 DL.'; return; }
           if(Number.isNaN(cash) || cash < 1.01){ crMsg.textContent = 'Cashout goal must be at least 1.01×.'; return; }
+
+          crPlayBtn.disabled = true;
+          crHint.textContent = 'Round in progress…';
           try{
-            const res = await j('/api/game/crash/play', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({bet, cashout: cash})});
-            const outcome = res.win > 0 ? `<span class="win">You won ${fmtDL(res.win)}!</span>` : `<span class="lose">Busted at ${res.bust.toFixed(2)}× — you lost.</span>`;
-            crMsg.innerHTML = `${outcome} New balance: <b>${fmtDL(res.new_balance)}</b> (+${res.xp_gain} XP)`;
-            // refresh header balance & profile stats
-            try{ render(); }catch(e){}
-            loadCrashHistory();
+            const res = await j('/api/game/crash/play', {
+              method:'POST', headers:{'Content-Type':'application/json'},
+              body: JSON.stringify({bet, cashout: cash})
+            });
+
+            // Animate 1.00× -> bust (accelerating)
+            const bust = res.bust;
+            const dur = Math.min(7.0, 1.2 + Math.log(bust + 1) * 1.6); //  ~1.2s..7s
+            const start = performance.now();
+            const lnBust = Math.log(bust);
+            // markers
+            cashMarker.style.display = 'block';
+            bustMarker.style.display = 'block';
+            const cashFrac = Math.min(1, Math.log(Math.max(1.0001, cash)) / lnBust);
+            cashMarker.style.left = (cashFrac * 100) + '%';
+            bustMarker.style.left = '100%';
+
+            function frame(now){
+              const t = Math.min(1, (now - start)/ (dur*1000));
+              // exponential growth to exactly hit bust at t=1
+              const m = Math.exp(lnBust * t); // 1 -> bust
+              crNow.textContent = m.toFixed(2) + '×';
+              const fillPct = (Math.log(m) / lnBust) * 100;
+              crFill.style.width = fillPct + '%';
+              if(t < 1) requestAnimationFrame(frame);
+              else {
+                // final outcome
+                const won = res.win > 0;
+                crHint.textContent = won ? 'You cashed out before bust!' : 'Busted!';
+                crMsg.innerHTML = (won
+                  ? `<span class="win">You won ${fmtDL(res.win)}!</span>`
+                  : `<span class="lose">Busted at ${bust.toFixed(2)}× — you lost.</span>`
+                ) + ` New balance: <b>${fmtDL(res.new_balance)}</b> (+${res.xp_gain} XP)`;
+                // refresh header/profile and history
+                try { render(); } catch (e) {}
+                loadCrashHistory();
+                crPlayBtn.disabled = false;
+              }
+            }
+            requestAnimationFrame(frame);
+
           }catch(e){
+            crPlayBtn.disabled = false;
             crMsg.textContent = 'Error: ' + e.message;
+            resetLine();
           }
         };
 
+        // load crash history once when visiting crash
         loadCrashHistory();
 
       }catch(e){
@@ -811,7 +828,10 @@ INDEX_HTML = """
       }
     }
 
+    // Initial render
     render();
+
+    // Click avatar -> profile, balance -> modal handled inside render
   </script>
 </body>
 </html>
@@ -824,7 +844,7 @@ async def index():
 
 @app.get("/login")
 async def login():
-    if not (CLIENT_ID and OAUTH_REDIRECT):
+    if not (CLIENT_ID and OAUTH_REDIRECT and CLIENT_SECRET):
         raise HTTPException(500, "OAuth not configured")
     params = {
         "response_type": "code",
@@ -867,11 +887,7 @@ async def logout():
 async def api_me(request: Request):
     user = read_session(request)
     if not user: raise HTTPException(401, "Not logged in")
-    return {
-        "id": user["id"],
-        "username": user.get("username", ""),
-        "avatar_url": avatar_url_from(user["id"], user.get("avatar"))
-    }
+    return {"id": user["id"], "username": user.get("username", ""), "avatar_url": avatar_url_from(user["id"], user.get("avatar"))}
 
 @app.get("/api/balance")
 async def api_balance(request: Request):
@@ -906,15 +922,20 @@ async def api_profile(request: Request):
     if not user: raise HTTPException(401, "Not logged in")
     uid = str(user["id"])
     info = ensure_profile_row(uid)
-    lvl = xp_to_level(info["xp"])
+    xp = info["xp"]
+    level = 1 + (xp // 100)
+    base = (level - 1) * 100
+    next_at = level * 100
+    progress = xp - base
+    pct = 0 if next_at == base else int(progress * 100 / (next_at - base))
     return {
         "user_id": uid,
         "display_name": info["display_name"],
-        "xp": info["xp"],
-        "level": lvl["level"],
-        "progress": lvl["progress"],
-        "next_needed": lvl["next_needed"],
-        "progress_pct": lvl["pct"],
+        "xp": xp,
+        "level": level,
+        "progress": progress,
+        "next_needed": (next_at - base),
+        "progress_pct": pct,
         "balance": get_balance(uid),
     }
 
@@ -950,7 +971,7 @@ class CreatePromoBody(BaseModel):
     code: Optional[str] = None
     amount: int
     max_uses: int = 1
-    expires_at: Optional[str] = None  # optional ISO string
+    expires_at: Optional[str] = None
 
 def require_owner(request: Request):
     user = read_session(request)
@@ -989,8 +1010,7 @@ async def api_game_crash_play(request: Request, body: CrashPlayBody):
     if bet > MAX_BET: raise HTTPException(400, f"Max bet is {MAX_BET} DL")
     if cash < 1.01: raise HTTPException(400, "Cashout must be at least 1.01×")
     try:
-        res = crash_play_db(str(user["id"]), bet, cash, HOUSE_EDGE)
-        return res
+        return crash_play_db(str(user["id"]), bet, cash, HOUSE_EDGE)
     except ValueError as e:
         raise HTTPException(400, str(e))
 

@@ -1,6 +1,7 @@
 import os, json, asyncio, re, random, string, math, secrets, datetime, hashlib
 from urllib.parse import urlencode
 from typing import Optional, Tuple, Dict, List
+from decimal import Decimal, ROUND_DOWN, getcontext
 
 import httpx
 import psycopg
@@ -13,6 +14,8 @@ import uvicorn
 from pydantic import BaseModel
 
 # ---------- Config ----------
+getcontext().prec = 28  # high precision for Decimal math
+
 PREFIX = "."
 BOT_TOKEN = os.getenv("DISCORD_TOKEN")
 CLIENT_ID = os.getenv("DISCORD_CLIENT_ID")
@@ -26,10 +29,19 @@ GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 GEM = "💎"
-HOUSE_EDGE = 0.01      # 1% per action
-MIN_BET = 1            # DL
-MAX_BET = 1_000_000
-BETTING_SECONDS = 10   # Crash betting window
+HOUSE_EDGE = Decimal("0.01")     # 1% edge (mines per safe pick; crash built into bust)
+MIN_BET = Decimal("1.00")        # 1.00 DL minimum
+MAX_BET = Decimal("1000000.00")
+BETTING_SECONDS = 10             # Crash betting window
+
+TWO = Decimal("0.01")
+
+def D(x) -> Decimal:
+    if isinstance(x, Decimal): return x
+    return Decimal(str(x))
+
+def q2(x: Decimal) -> Decimal:
+    return D(x).quantize(TWO, rounding=ROUND_DOWN)
 
 # ---------- Time helpers ----------
 UTC = datetime.timezone.utc
@@ -56,19 +68,24 @@ def init_db(cur):
     cur.execute("""
         CREATE TABLE IF NOT EXISTS balances (
             user_id TEXT PRIMARY KEY,
-            balance INTEGER NOT NULL DEFAULT 0
+            balance NUMERIC(18,2) NOT NULL DEFAULT 0
         )
     """)
+    # migrate type if needed
+    cur.execute("ALTER TABLE balances ALTER COLUMN balance TYPE NUMERIC(18,2) USING balance::numeric")
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS balance_log (
             id BIGSERIAL PRIMARY KEY,
             actor_id TEXT NOT NULL,
             target_id TEXT NOT NULL,
-            amount INTEGER NOT NULL,
+            amount NUMERIC(18,2) NOT NULL,
             reason TEXT,
             created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    cur.execute("ALTER TABLE balance_log ALTER COLUMN amount TYPE NUMERIC(18,2) USING amount::numeric")
+
     # profiles / levels
     cur.execute("""
         CREATE TABLE IF NOT EXISTS profiles (
@@ -85,7 +102,7 @@ def init_db(cur):
     cur.execute("""
         CREATE TABLE IF NOT EXISTS promo_codes (
             code TEXT PRIMARY KEY,
-            amount INTEGER NOT NULL,
+            amount NUMERIC(18,2) NOT NULL,
             max_uses INTEGER NOT NULL DEFAULT 1,
             uses INTEGER NOT NULL DEFAULT 0,
             expires_at TIMESTAMPTZ,
@@ -93,6 +110,7 @@ def init_db(cur):
             created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    cur.execute("ALTER TABLE promo_codes ALTER COLUMN amount TYPE NUMERIC(18,2) USING amount::numeric")
     cur.execute("""
         CREATE TABLE IF NOT EXISTS promo_redemptions (
             user_id TEXT NOT NULL,
@@ -119,31 +137,32 @@ def init_db(cur):
         CREATE TABLE IF NOT EXISTS crash_bets (
             round_id BIGINT NOT NULL,
             user_id TEXT NOT NULL,
-            bet INTEGER NOT NULL,
+            bet NUMERIC(18,2) NOT NULL,
             cashout NUMERIC(8,2) NOT NULL,
             cashed_out NUMERIC(8,2),
             cashed_out_at TIMESTAMPTZ,
-            win INTEGER NOT NULL DEFAULT 0,
+            win NUMERIC(18,2) NOT NULL DEFAULT 0,
             resolved BOOLEAN NOT NULL DEFAULT FALSE,
             PRIMARY KEY(round_id, user_id)
         )
     """)
-    cur.execute("ALTER TABLE crash_bets ADD COLUMN IF NOT EXISTS cashed_out NUMERIC(8,2)")
-    cur.execute("ALTER TABLE crash_bets ADD COLUMN IF NOT EXISTS cashed_out_at TIMESTAMPTZ")
-    cur.execute("ALTER TABLE crash_bets ADD COLUMN IF NOT EXISTS resolved BOOLEAN NOT NULL DEFAULT FALSE")
-
+    # migrate types
+    cur.execute("ALTER TABLE crash_bets ALTER COLUMN bet TYPE NUMERIC(18,2) USING bet::numeric")
+    cur.execute("ALTER TABLE crash_bets ALTER COLUMN win TYPE NUMERIC(18,2) USING win::numeric")
     cur.execute("""
         CREATE TABLE IF NOT EXISTS crash_games (
             id BIGSERIAL PRIMARY KEY,
             user_id TEXT NOT NULL,
-            bet INTEGER NOT NULL,
+            bet NUMERIC(18,2) NOT NULL,
             cashout NUMERIC(8,2) NOT NULL,
             bust NUMERIC(10,2) NOT NULL,
-            win INTEGER NOT NULL,
+            win NUMERIC(18,2) NOT NULL,
             xp_gain INTEGER NOT NULL,
             created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    cur.execute("ALTER TABLE crash_games ALTER COLUMN bet TYPE NUMERIC(18,2) USING bet::numeric")
+    cur.execute("ALTER TABLE crash_games ALTER COLUMN win TYPE NUMERIC(18,2) USING win::numeric")
 
     # global chat
     cur.execute("""
@@ -161,33 +180,36 @@ def init_db(cur):
         CREATE TABLE IF NOT EXISTS mines_games (
             id BIGSERIAL PRIMARY KEY,
             user_id TEXT NOT NULL,
-            bet INTEGER NOT NULL,
+            bet NUMERIC(18,2) NOT NULL,
             mines INTEGER NOT NULL,
-            board TEXT NOT NULL,               -- 25 chars '0'/'1'
-            picks BIGINT NOT NULL DEFAULT 0,   -- bitmask of revealed tiles
+            board TEXT NOT NULL,
+            picks BIGINT NOT NULL DEFAULT 0,
             started_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
             ended_at TIMESTAMPTZ,
             status TEXT NOT NULL DEFAULT 'active',  -- active|lost|cashed
             seed TEXT NOT NULL,
             commit_hash TEXT NOT NULL,
-            win INTEGER NOT NULL DEFAULT 0
+            win NUMERIC(18,2) NOT NULL DEFAULT 0
         )
     """)
+    cur.execute("ALTER TABLE mines_games ALTER COLUMN bet TYPE NUMERIC(18,2) USING bet::numeric")
+    cur.execute("ALTER TABLE mines_games ALTER COLUMN win TYPE NUMERIC(18,2) USING win::numeric")
 
 # ---- balances / profiles ----
 @with_conn
-def get_balance(cur, user_id: str) -> int:
+def get_balance(cur, user_id: str) -> Decimal:
     cur.execute("SELECT balance FROM balances WHERE user_id = %s", (user_id,))
-    row = cur.fetchone(); return int(row[0]) if row else 0
+    row = cur.fetchone(); return q2(row[0]) if row else Decimal("0.00")
 
 @with_conn
-def adjust_balance(cur, actor_id: str, target_id: str, amount: int, reason: Optional[str]) -> int:
+def adjust_balance(cur, actor_id: str, target_id: str, amount, reason: Optional[str]) -> Decimal:
+    amount = q2(D(amount))
     cur.execute("INSERT INTO balances (user_id, balance) VALUES (%s, 0) ON CONFLICT (user_id) DO NOTHING", (target_id,))
     cur.execute("UPDATE balances SET balance = balance + %s WHERE user_id = %s", (amount, target_id))
     cur.execute("INSERT INTO balance_log(actor_id, target_id, amount, reason) VALUES (%s, %s, %s, %s)",
                 (actor_id, target_id, amount, reason))
     cur.execute("SELECT balance FROM balances WHERE user_id = %s", (target_id,))
-    return int(cur.fetchone()[0])
+    return q2(cur.fetchone()[0])
 
 NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{3,20}$")
 
@@ -223,7 +245,7 @@ def profile_info(cur, user_id: str):
     base = (level - 1) * 100; need = level * 100 - base
     progress = xp - base; pct = 0 if need==0 else int(progress*100/need)
     bal = get_balance(user_id)
-    return {"xp": xp, "level": level, "progress": progress, "next_needed": need, "progress_pct": pct, "balance": bal}
+    return {"xp": xp, "level": level, "progress": progress, "next_needed": need, "progress_pct": pct, "balance": float(bal)}
 
 # ---- promos ----
 class PromoError(Exception): ...
@@ -233,7 +255,7 @@ class PromoExpired(PromoError): ...
 class PromoExhausted(PromoError): ...
 
 @with_conn
-def redeem_promo(cur, user_id: str, code: str) -> int:
+def redeem_promo(cur, user_id: str, code: str) -> Decimal:
     code = code.strip().upper()
     cur.execute("SELECT code, amount, max_uses, uses, expires_at FROM promo_codes WHERE code=%s", (code,))
     row = cur.fetchone()
@@ -252,28 +274,32 @@ def redeem_promo(cur, user_id: str, code: str) -> int:
     cur.execute("INSERT INTO balance_log(actor_id,target_id,amount,reason) VALUES (%s,%s,%s,%s)",
                 ("promo", user_id, amount, f"promo:{code}"))
     cur.execute("SELECT balance FROM balances WHERE user_id=%s", (user_id,))
-    return int(cur.fetchone()[0])
+    return q2(cur.fetchone()[0])
 
 def _rand_code(n=8): return ''.join(random.choices(string.ascii_uppercase+string.digits, k=n))
 
 @with_conn
-def create_promo(cur, actor_id: str, code: Optional[str], amount: int, max_uses: int = 1, expires_at: Optional[str] = None):
+def create_promo(cur, actor_id: str, code: Optional[str], amount, max_uses: int = 1, expires_at: Optional[str] = None):
+    amt = q2(D(amount))
     code = (code.strip().upper() if code else _rand_code())
     cur.execute("""
         INSERT INTO promo_codes(code,amount,max_uses,expires_at,created_by)
         VALUES (%s,%s,%s,%s,%s)
         ON CONFLICT (code) DO UPDATE SET amount=EXCLUDED.amount, max_uses=EXCLUDED.max_uses, expires_at=EXCLUDED.expires_at
-    """, (code, amount, max_uses, expires_at, actor_id))
+    """, (code, amt, max_uses, expires_at, actor_id))
     return {"ok": True, "code": code}
 
 # ---- Crash math & DB ----
 def _u(): return (secrets.randbelow(1_000_000_000)+1)/1_000_000_001.0
-def gen_bust(edge: float = HOUSE_EDGE) -> float:
-    u = _u(); B = max(1.0, (1.0-edge)/u)
+def gen_bust(edge: Decimal = HOUSE_EDGE) -> float:
+    # bust distribution 1+ with implicit edge
+    u = _u()
+    B = max(1.0, float((Decimal("1.0")-edge)/Decimal(str(u))))
     return math.floor(B*100)/100.0
 
 def run_duration_for(bust: float) -> float:
-    return min(7.0, 1.2 + math.log(bust+1.0)*1.6)
+    # MUCH slower than before
+    return min(14.0, 3.0 + math.log(bust+1.0)*3.0)
 
 def current_multiplier(started_at: datetime.datetime, expected_end_at: datetime.datetime, bust: float, at: Optional[datetime.datetime] = None) -> float:
     at = at or now_utc()
@@ -305,7 +331,7 @@ def ensure_betting_round(cur) -> Tuple[int, dict]:
     }
 
 @with_conn
-def place_bet(cur, user_id: str, bet: int, cashout: float):
+def place_bet(cur, user_id: str, bet: Decimal, cashout: float):
     cur.execute("""SELECT id, betting_ends_at FROM crash_rounds
                    WHERE status='betting'
                    ORDER BY id DESC LIMIT 1""")
@@ -318,18 +344,18 @@ def place_bet(cur, user_id: str, bet: int, cashout: float):
 
     cur.execute("INSERT INTO balances(user_id,balance) VALUES (%s,0) ON CONFLICT(user_id) DO NOTHING", (user_id,))
     cur.execute("SELECT balance FROM balances WHERE user_id=%s FOR UPDATE", (user_id,))
-    bal = int(cur.fetchone()[0])
-    if bet < MIN_BET: raise ValueError(f"Min bet is {MIN_BET} DL")
-    if bet > MAX_BET: raise ValueError(f"Max bet is {MAX_BET} DL")
+    bal = D(cur.fetchone()[0])
+    if bet < MIN_BET: raise ValueError(f"Min bet is {MIN_BET:.2f} DL")
+    if bet > MAX_BET: raise ValueError(f"Max bet is {MAX_BET:.2f} DL")
     if bal < bet: raise ValueError("Insufficient balance")
-    cur.execute("UPDATE balances SET balance=balance-%s WHERE user_id=%s", (bet, user_id))
+    cur.execute("UPDATE balances SET balance=balance-%s WHERE user_id=%s", (q2(bet), user_id))
 
     try:
         cur.execute("""INSERT INTO crash_bets(round_id,user_id,bet,cashout)
                        VALUES(%s,%s,%s,%s)""",
-                    (round_id, user_id, bet, float(cashout)))
+                    (round_id, user_id, q2(bet), float(cashout)))
     except Exception:
-        cur.execute("UPDATE balances SET balance=balance+%s WHERE user_id=%s", (bet, user_id))
+        cur.execute("UPDATE balances SET balance=balance+%s WHERE user_id=%s", (q2(bet), user_id))
         raise ValueError("You already placed a bet this round")
 
     return {"round_id": round_id}
@@ -377,19 +403,19 @@ def cashout_now(cur, user_id: str) -> Dict:
                 (rid, user_id))
     b = cur.fetchone()
     if not b: raise ValueError("You have no active bet")
-    bet, cash_goal, cashed_out, resolved = int(b[0]), float(b[1]), b[2], bool(b[3])
+    bet, cash_goal, cashed_out, resolved = D(b[0]), float(b[1]), b[2], bool(b[3])
     if resolved or cashed_out is not None:
         raise ValueError("Already cashed out")
 
     m = current_multiplier(started_at, exp_end, bust, now)
     if m >= bust: raise ValueError("Too late — crashed")
-    win = int(math.floor(bet * m + 1e-9))
+    win = q2(bet * D(m))
     cur.execute("UPDATE balances SET balance=balance+%s WHERE user_id=%s", (win, user_id))
     cur.execute("""UPDATE crash_bets
                    SET cashed_out=%s, cashed_out_at=%s, win=%s, resolved=TRUE
                    WHERE round_id=%s AND user_id=%s""",
-                (float(m), now, int(win), rid, user_id))
-    return {"round_id": rid, "multiplier": m, "win": win}
+                (float(m), now, win, rid, user_id))
+    return {"round_id": rid, "multiplier": m, "win": float(win)}
 
 @with_conn
 def resolve_round_end(cur, round_id: int, bust: float):
@@ -397,33 +423,33 @@ def resolve_round_end(cur, round_id: int, bust: float):
                    FROM crash_bets WHERE round_id=%s""", (round_id,))
     bets = cur.fetchall()
     for uid, bet, goal, cashed, resolved, win in bets:
-        uid = str(uid); bet=int(bet); goal=float(goal); win=int(win); resolved=bool(resolved)
+        uid = str(uid); bet=D(bet); goal=float(goal); win=D(win); resolved=bool(resolved)
         if resolved and cashed is not None:
-            xp_gain = max(1, min(bet, 50))
+            xp_gain = max(1, min(int(bet), 50))
             cur.execute("""INSERT INTO crash_games(user_id,bet,cashout,bust,win,xp_gain)
                            VALUES(%s,%s,%s,%s,%s,%s)""",
-                        (uid, bet, float(cashed), float(bust), win, xp_gain))
+                        (uid, q2(bet), float(cashed), float(bust), q2(win), xp_gain))
             ensure_profile_row(uid)
             cur.execute("UPDATE profiles SET xp=xp+%s WHERE user_id=%s", (xp_gain, uid))
             continue
 
         if not resolved:
             if goal <= bust:
-                win = int(math.floor(bet * goal + 1e-9))
+                win = q2(bet * D(goal))
                 cur.execute("UPDATE balances SET balance=balance+%s WHERE user_id=%s", (win, uid))
                 cur.execute("""UPDATE crash_bets SET win=%s, resolved=TRUE WHERE round_id=%s AND user_id=%s""",
-                            (int(win), round_id, uid))
+                            (win, round_id, uid))
                 cashed_val = goal
             else:
                 cur.execute("""UPDATE crash_bets SET resolved=TRUE WHERE round_id=%s AND user_id=%s""",
                             (round_id, uid))
-                win = 0
+                win = Decimal("0.00")
                 cashed_val = goal
 
-            xp_gain = max(1, min(bet, 50))
+            xp_gain = max(1, min(int(bet), 50))
             cur.execute("""INSERT INTO crash_games(user_id,bet,cashout,bust,win,xp_gain)
                            VALUES(%s,%s,%s,%s,%s,%s)""",
-                        (uid, bet, float(cashed_val), float(bust), int(win), xp_gain))
+                        (uid, q2(bet), float(cashed_val), float(bust), q2(win), xp_gain))
             ensure_profile_row(uid)
             cur.execute("UPDATE profiles SET xp=xp+%s WHERE user_id=%s", (xp_gain, uid))
 
@@ -457,16 +483,54 @@ def your_bet(cur, round_id: int, user_id: str):
                    FROM crash_bets WHERE round_id=%s AND user_id=%s""", (round_id, user_id))
     r = cur.fetchone()
     if not r: return None
-    return {"bet": int(r[0]), "cashout": float(r[1]),
+    return {"bet": float(q2(D(r[0]))), "cashout": float(r[1]),
             "cashed_out": (float(r[2]) if r[2] is not None else None),
-            "resolved": bool(r[3]), "win": int(r[4])}
+            "resolved": bool(r[3]), "win": float(q2(D(r[4])))}
 
 @with_conn
 def your_history(cur, user_id: str, limit: int = 10):
     cur.execute("""SELECT bet, cashout, bust, win, xp_gain, created_at
                    FROM crash_games WHERE user_id=%s
                    ORDER BY id DESC LIMIT %s""", (user_id, limit))
-    return [{"bet":int(r[0]),"cashout":float(r[1]),"bust":float(r[2]),"win":int(r[3]),"xp_gain":int(r[4]),"created_at":str(r[5])} for r in cur.fetchall()]
+    return [{"bet":float(q2(D(r[0]))),"cashout":float(r[1]),"bust":float(r[2]),"win":float(q2(D(r[3]))),"xp_gain":int(r[4]),"created_at":str(r[5])} for r in cur.fetchall()]
+
+# ---------- Global Chat ----------
+@with_conn
+def chat_send(cur, user_id: str, username: str, text: str):
+    text = (text or "").strip()
+    if not text: raise ValueError("Message is empty")
+    if len(text) > 300: raise ValueError("Message is too long (max 300)")
+    ensure_profile_row(user_id)
+    cur.execute("SELECT xp FROM profiles WHERE user_id=%s", (user_id,))
+    xp = int(cur.fetchone()[0])
+    lvl = 1 + xp // 100
+    if lvl < 5: raise PermissionError("You must be level 5 to chat")
+    cur.execute("INSERT INTO chat_messages(user_id, username, text) VALUES (%s,%s,%s) RETURNING id, created_at",
+                (user_id, username, text))
+    row = cur.fetchone()
+    return {"id": int(row[0]), "created_at": str(row[1])}
+
+@with_conn
+def chat_fetch(cur, since_id: int, limit: int = 50):
+    if since_id <= 0:
+        cur.execute("""SELECT id, user_id, username, text, created_at
+                       FROM chat_messages ORDER BY id DESC LIMIT %s""", (limit,))
+        rows = list(reversed(cur.fetchall()))
+    else:
+        cur.execute("""SELECT id, user_id, username, text, created_at
+                       FROM chat_messages WHERE id > %s ORDER BY id ASC LIMIT %s""", (since_id, limit))
+        rows = cur.fetchall()
+    uids = list({r[1] for r in rows})
+    levels: Dict[str, int] = {}
+    if uids:
+        cur.execute("SELECT user_id, xp FROM profiles WHERE user_id = ANY(%s)", (uids,))
+        for uid, xp in cur.fetchall():
+            levels[str(uid)] = 1 + int(xp) // 100
+    out = []
+    for mid, uid, uname, txt, ts in rows:
+        lvl = levels.get(str(uid), 1)
+        out.append({"id": int(mid), "user_id": str(uid), "username": uname, "level": int(lvl), "text": txt, "created_at": str(ts)})
+    return out
 
 # ---------- MINES helpers ----------
 def mines_random_board(mines: int) -> str:
@@ -482,14 +546,13 @@ def picks_count_from_bitmask(mask: int) -> int:
     return mask.bit_count()
 
 def mines_multiplier(mines: int, picks_count: int) -> float:
-    # Fair multiplier (no edge): Π (25 - i)/(25 - mines - i), i=0..picks-1
-    # Apply house edge per safe pick.
+    # Fair multiplier Π (25 - i)/(25 - mines - i); apply 1% edge per safe pick
     if picks_count <= 0: return 1.0
-    total = 1.0
+    total = Decimal("1.0")
     for i in range(picks_count):
-        total *= (25.0 - i) / max(1.0, (25.0 - mines - i))
-        total *= (1.0 - HOUSE_EDGE)
-    return total
+        total *= D(25 - i) / D(max(1, 25 - mines - i))
+        total *= (Decimal("1.0") - HOUSE_EDGE)
+    return float(total)
 
 @with_conn
 def mines_active_for(cur, user_id: str):
@@ -499,15 +562,12 @@ def mines_active_for(cur, user_id: str):
                    ORDER BY id DESC LIMIT 1""", (user_id,))
     r = cur.fetchone()
     if not r: return None
-    return {
-        "id": int(r[0]), "bet": int(r[1]), "mines": int(r[2]),
-        "board": str(r[3]), "picks": int(r[4]),
-        "seed": str(r[5]), "hash": str(r[6]), "status": str(r[7])
-    }
+    return {"id": int(r[0]), "bet": float(q2(D(r[1]))), "mines": int(r[2]),
+            "board": str(r[3]), "picks": int(r[4]), "seed": str(r[5]), "hash": str(r[6]), "status": str(r[7])}
 
 @with_conn
-def mines_start(cur, user_id: str, bet: int, mines: int):
-    if bet < MIN_BET or bet > MAX_BET: raise ValueError(f"Bet must be between {MIN_BET} and {MAX_BET}")
+def mines_start(cur, user_id: str, bet: Decimal, mines: int):
+    if bet < MIN_BET or bet > MAX_BET: raise ValueError(f"Bet must be between {MIN_BET:.2f} and {MAX_BET:.2f}")
     if mines < 1 or mines > 24: raise ValueError("Mines must be between 1 and 24")
     cur.execute("SELECT 1 FROM mines_games WHERE user_id=%s AND status='active'", (user_id,))
     if cur.fetchone(): raise ValueError("You already have an active Mines game")
@@ -515,16 +575,16 @@ def mines_start(cur, user_id: str, bet: int, mines: int):
     # balance
     cur.execute("INSERT INTO balances(user_id,balance) VALUES (%s,0) ON CONFLICT(user_id) DO NOTHING", (user_id,))
     cur.execute("SELECT balance FROM balances WHERE user_id=%s FOR UPDATE", (user_id,))
-    bal = int(cur.fetchone()[0])
+    bal = D(cur.fetchone()[0])
     if bal < bet: raise ValueError("Insufficient balance")
-    cur.execute("UPDATE balances SET balance=balance-%s WHERE user_id=%s", (bet, user_id))
+    cur.execute("UPDATE balances SET balance=balance-%s WHERE user_id=%s", (q2(bet), user_id))
 
     board = mines_random_board(mines)
     seed = secrets.token_hex(16)
     commit_hash = sha256(f"{seed}:{board}")
     cur.execute("""INSERT INTO mines_games(user_id, bet, mines, board, seed, commit_hash)
                    VALUES (%s,%s,%s,%s,%s,%s) RETURNING id""",
-                (user_id, bet, mines, board, seed, commit_hash))
+                (user_id, q2(bet), mines, board, seed, commit_hash))
     gid = int(cur.fetchone()[0])
     return {"id": gid, "hash": commit_hash}
 
@@ -536,26 +596,23 @@ def mines_pick(cur, user_id: str, index: int):
                    ORDER BY id DESC LIMIT 1 FOR UPDATE""", (user_id,))
     r = cur.fetchone()
     if not r: raise ValueError("No active Mines game")
-    gid, bet, mines, board, picks, status = int(r[0]), int(r[1]), int(r[2]), str(r[3]), int(r[4]), str(r[5])
+    gid, bet, mines, board, picks, status = int(r[0]), D(r[1]), int(r[2]), str(r[3]), int(r[4]), str(r[5])
     bit = 1 << index
     if picks & bit: raise ValueError("Tile already revealed")
 
-    # reveal
     is_mine = (board[index] == '1')
     new_picks = picks | bit
     if is_mine:
-        # lost
         cur.execute("""UPDATE mines_games
                        SET picks=%s, status='lost', ended_at=NOW()
                        WHERE id=%s""", (new_picks, gid))
         return {"status": "lost", "board": board, "index": index}
     else:
-        # safe
         cur.execute("""UPDATE mines_games SET picks=%s WHERE id=%s""", (new_picks, gid))
         pcount = picks_count_from_bitmask(new_picks)
         mult = mines_multiplier(mines, pcount)
-        win = int(math.floor(bet * mult))
-        return {"status": "active", "picks": new_picks, "multiplier": round(mult, 4), "potential_win": win}
+        win = q2(bet * D(mult))
+        return {"status": "active", "picks": new_picks, "multiplier": float(mult), "potential_win": float(win)}
 
 @with_conn
 def mines_cashout(cur, user_id: str):
@@ -564,16 +621,16 @@ def mines_cashout(cur, user_id: str):
                    ORDER BY id DESC LIMIT 1 FOR UPDATE""", (user_id,))
     r = cur.fetchone()
     if not r: raise ValueError("No active Mines game")
-    gid, bet, mines, board, picks, status = int(r[0]), int(r[1]), int(r[2]), str(r[3]), int(r[4]), str(r[5])
+    gid, bet, mines, board, picks, status = int(r[0]), D(r[1]), int(r[2]), str(r[3]), int(r[4]), str(r[5])
     pcount = picks_count_from_bitmask(picks)
     if pcount < 1: raise ValueError("Reveal at least one tile before cashing out")
     mult = mines_multiplier(mines, pcount)
-    win = int(math.floor(bet * mult))
+    win = q2(bet * D(mult))
     cur.execute("UPDATE balances SET balance=balance+%s WHERE user_id=%s", (win, user_id))
     cur.execute("""UPDATE mines_games
                    SET status='cashed', win=%s, ended_at=NOW()
                    WHERE id=%s""", (win, gid))
-    return {"win": win, "board": board}
+    return {"win": float(win), "board": board}
 
 @with_conn
 def mines_state(cur, user_id: str):
@@ -582,7 +639,7 @@ def mines_state(cur, user_id: str):
                    ORDER BY id DESC LIMIT 1""", (user_id,))
     r = cur.fetchone()
     if not r: return None
-    return {"id": int(r[0]), "bet": int(r[1]), "mines": int(r[2]),
+    return {"id": int(r[0]), "bet": float(q2(D(r[1]))), "mines": int(r[2]),
             "picks": int(r[3]), "hash": str(r[4]), "status": str(r[5])}
 
 @with_conn
@@ -594,14 +651,17 @@ def mines_history(cur, user_id: str, limit: int = 15):
     out = []
     for r in rows:
         out.append({
-            "id": int(r[0]), "bet": int(r[1]), "mines": int(r[2]), "win": int(r[3]),
+            "id": int(r[0]), "bet": float(q2(D(r[1]))), "mines": int(r[2]), "win": float(q2(D(r[3]))),
             "status": str(r[4]), "started_at": str(r[5]), "ended_at": str(r[6]),
             "hash": str(r[7]), "seed": str(r[8]), "board": str(r[9])
         })
     return out
 
 # ---------- Discord bot ----------
-def fmt_dl(n: int) -> str: return f"{GEM} {n:,} DL"
+def fmt_dl(n) -> str:
+    v = q2(D(n))
+    return f"{GEM} {v:,.2f} DL"
+
 def embed(title: str, desc: Optional[str] = None, color: int = 0x00C2FF) -> discord.Embed:
     return discord.Embed(title=title, description=desc or "", color=color)
 def avatar_url_from(id_str: str, avatar_hash: Optional[str]) -> str:
@@ -635,9 +695,9 @@ async def help_command(ctx: commands.Context):
     await ctx.reply(embed=e, mention_author=False)
 
 @with_conn
-def get_user_balance(cur, uid: str) -> int:
+def get_user_balance(cur, uid: str) -> Decimal:
     cur.execute("SELECT balance FROM balances WHERE user_id=%s", (uid,))
-    r = cur.fetchone(); return int(r[0]) if r else 0
+    r = cur.fetchone(); return q2(r[0]) if r else Decimal("0.00")
 
 @bot.command(name="bal")
 async def bal(ctx: commands.Context, user: discord.User | None = None):
@@ -648,16 +708,20 @@ async def bal(ctx: commands.Context, user: discord.User | None = None):
     await ctx.reply(embed=e, mention_author=False)
 
 @bot.command(name="addbal")
-async def addbal(ctx: commands.Context, user: discord.User | None = None, amount: int | None = None):
+async def addbal(ctx: commands.Context, user: discord.User | None = None, amount: str | None = None):
     if ctx.author.id != OWNER_ID:
         return await ctx.reply(embed=embed("Not allowed","Only the owner can adjust balances.",0xEF4444), mention_author=False)
     if user is None or amount is None:
-        return await ctx.reply(embed=embed("Usage", f"`{PREFIX}addbal @User <amount>`", 0xF59E0B), mention_author=False)
-    if amount == 0:
+        return await ctx.reply(embed=embed("Usage", f"`{PREFIX}addbal @User <amount>` (e.g. 1.24)", 0xF59E0B), mention_author=False)
+    try:
+        delta = q2(D(amount))
+    except Exception:
+        return await ctx.reply(embed=embed("Invalid amount","Use a number like 1 or 1.24",0xEF4444), mention_author=False)
+    if delta == 0:
         return await ctx.reply(embed=embed("Invalid amount","Amount cannot be zero.",0xEF4444), mention_author=False)
-    new_balance = adjust_balance(str(ctx.author.id), str(user.id), amount, reason="bot addbal")
-    sign = "+" if amount > 0 else ""
-    e = embed("Balance Updated", f"**Target:** {user.mention}\n**Change:** `{sign}{amount}` → {fmt_dl(new_balance)}", 0x60A5FA)
+    new_balance = adjust_balance(str(ctx.author.id), str(user.id), delta, reason="bot addbal")
+    sign = "+" if delta > 0 else ""
+    e = embed("Balance Updated", f"**Target:** {user.mention}\n**Change:** `{sign}{delta}` → {fmt_dl(new_balance)}", 0x60A5FA)
     e.set_footer(text="Currency: Growtopia Diamond Locks (DL)")
     await ctx.reply(embed=e, mention_author=False)
 
@@ -708,16 +772,13 @@ HTML_TEMPLATE = """
     .btn{display:inline-flex; align-items:center; gap:8px; padding:10px 14px; border-radius:12px; border:1px solid var(--border); background:linear-gradient(180deg,#0e1833,#0b1326); cursor:pointer; font-weight:600}
     .btn.primary{background:linear-gradient(135deg,#3b82f6,#22c1dc); border-color:transparent}
     .btn.ghost{ background:#162a52; border:1px solid var(--border); color:#eaf2ff; }
-    .btn.ghost:hover{ filter:brightness(1.1) }
     .btn.cashout{
       background: linear-gradient(135deg,#22c55e,#16a34a);
       border-color: transparent;
       box-shadow: 0 6px 14px rgba(34,197,94,.25);
       font-weight:800;
     }
-    .btn.cashout:hover{ filter:brightness(1.05) }
     .btn.cashout[disabled]{ filter:grayscale(.5) brightness(.8); opacity:.8; cursor:not-allowed }
-
     .grid{display:grid; gap:16px; grid-template-columns:1fr}
     @media(min-width:980px){.grid{grid-template-columns:1fr 1fr}}
     .card{background:linear-gradient(180deg,var(--bg2),#0b1428); border:1px solid var(--border); border-radius:18px; padding:16px; box-shadow: 0 6px 20px rgba(0,0,0,.25)}
@@ -730,40 +791,12 @@ HTML_TEMPLATE = """
     .game-card:hover{transform:translateY(-2px); box-shadow:0 8px 18px rgba(0,0,0,.25)}
     .owner{margin-top:16px; border-top:1px dashed var(--border); padding-top:12px}
 
-    /* Crash page */
-    .crash-wrap{display:flex; flex-direction:column; gap:12px}
-    .cr-top{display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px}
-    .cr-metric{display:flex; align-items:baseline; gap:10px}
-    .cr-multi{font-size:34px; font-weight:900}
-    .cr-small{font-size:12px; color:var(--muted)}
-    .chip2{display:inline-block; padding:6px 8px; background:#0d1a36; color:#cfe6ff; border:1px solid var(--border); border-radius:999px; font-size:12px; margin:2px}
-    .bust-bad{color:#ef6a6a}
-    .bust-good{color:#4bd3a8}
-
     /* Crash graph */
     .cr-graph-wrap{position:relative; height:240px; background:#0e1833; border:1px solid var(--border); border-radius:16px; overflow:hidden}
     canvas{display:block; width:100%; height:100%}
 
-    /* Modal */
-    .modal{position:fixed; inset:0; background:rgba(0,0,0,.6); display:none; align-items:center; justify-content:center; padding:20px; z-index:30}
-    .modal .box{background:#0f1a33; border:1px solid var(--border); border-radius:16px; padding:16px; max-width:520px; width:100%}
-
-    /* Chat drawer */
-    .chat-drawer{position:fixed; top:64px; right:0; width:360px; max-width:100vw; bottom:0; background:linear-gradient(180deg,#0e1936,#0c152a); border-left:1px solid var(--border); transform:translateX(100%); transition:transform .18s ease; z-index:25; display:flex; flex-direction:column}
-    .chat-drawer.open{transform:translateX(0)}
-    .chat-head{display:flex; align-items:center; justify-content:space-between; padding:10px 12px; border-bottom:1px solid var(--border)}
-    .chat-body{flex:1; overflow-y:auto; padding:10px 12px; display:flex; flex-direction:column; gap:8px}
-    .chat-input{padding:10px 12px; border-top:1px solid var(--border); display:flex; gap:8px}
-    .msg{background:#0e1833; border:1px solid var(--border); border-radius:12px; padding:8px}
-    .msghead{display:flex; gap:6px; align-items:center; font-size:13px}
-    .lvl{font-size:12px; color:#8aa0c7}
-    .time{margin-left:auto; font-size:11px; color:#8aa0c7}
-    .txt{margin-top:4px; font-size:14px; white-space:pre-wrap; word-break:break-word}
-    .disabled-note{font-size:12px; color:#8aa0c7; padding:0 12px 10px}
-
-    /* Mines */
-    .mines-top{display:flex; gap:12px; align-items:center; flex-wrap:wrap; justify-content:space-between}
-    .mines-grid{display:grid; grid-template-columns:repeat(5, 1fr); gap:8px; margin-top:12px}
+    /* Mines two-column layout */
+    .mines-grid{display:grid; grid-template-columns:repeat(5, 1fr); gap:8px}
     .tile{
       aspect-ratio:1/1; border-radius:12px; border:1px solid var(--border);
       background:linear-gradient(180deg,#0f1936,#0c152a); display:flex; align-items:center; justify-content:center;
@@ -774,16 +807,10 @@ HTML_TEMPLATE = """
     .tile.safe{ background:linear-gradient(135deg,#16a34a,#22c55e); border-color:transparent }
     .tile.mine{ background:linear-gradient(135deg,#ef4444,#b91c1c); border-color:transparent }
     .tile.revealed{ cursor:default }
-    .meta{display:flex; gap:8px; align-items:center; flex-wrap:wrap}
     .tag{padding:6px 8px; border-radius:999px; border:1px solid var(--border); background:#0c1631; color:#cfe6ff; font-size:12px}
 
-    @media (max-width: 640px){
-      .big{font-size:22px}
-      .cr-multi{font-size:28px}
-      .header-inner{padding:8px}
-      .avatar{width:30px;height:30px}
-      .chip{padding:6px 8px}
-      .cr-graph-wrap{height:200px}
+    @media (max-width: 900px){
+      .mines-two{grid-template-columns: 1fr !important}
     }
   </style>
 </head>
@@ -821,87 +848,90 @@ HTML_TEMPLATE = """
     <!-- Crash -->
     <div id="page-crash" style="display:none">
       <div class="card">
-        <div class="cr-top">
-          <div class="cr-metric">
-            <div class="cr-multi" id="crNow">0.00×</div>
-            <div class="cr-small" id="crHint">Loading…</div>
+        <div style="display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap">
+          <div style="display:flex; align-items:baseline; gap:10px">
+            <div class="big" id="crNow">0.00×</div>
+            <div class="muted" id="crHint">Loading…</div>
           </div>
-          <div class="meta">
-            <button class="chip" id="backToGames">← Games</button>
-          </div>
+          <button class="chip" id="backToGames">← Games</button>
         </div>
 
-        <div class="cr-graph-wrap">
+        <div class="cr-graph-wrap" style="margin-top:10px">
           <canvas id="crCanvas"></canvas>
         </div>
 
-        <div class="crash-wrap">
-          <div class="chips" id="lastBusts">Loading last rounds…</div>
+        <div style="margin-top:12px">
+          <div id="lastBusts" class="muted">Loading last rounds…</div>
+        </div>
 
-          <div class="grid" style="grid-template-columns:1fr 1fr; gap:12px">
-            <div>
-              <div class="label">Bet (DL)</div>
-              <input id="crBet" type="number" min="1" step="1" placeholder="min 1"/>
-            </div>
-            <div>
-              <div class="label">Auto Cashout (×) — optional</div>
-              <input id="crCash" type="number" min="1.01" step="0.01" placeholder="e.g. 2.00"/>
-            </div>
+        <div class="grid" style="grid-template-columns:1fr 1fr; gap:12px; margin-top:8px">
+          <div>
+            <div class="label">Bet (DL)</div>
+            <input id="crBet" type="number" min="1" step="0.01" placeholder="min 1.00"/>
           </div>
-
-          <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap">
-            <button class="btn primary" id="crPlace">Place Bet</button>
-            <button class="btn cashout" id="crCashout" style="display:none">💸 Cash Out</button>
-            <span id="crMsg" class="muted"></span>
+          <div>
+            <div class="label">Auto Cashout (×) — optional</div>
+            <input id="crCash" type="number" min="1.01" step="0.01" placeholder="e.g. 2.00"/>
           </div>
         </div>
-      </div>
 
-      <div class="card">
-        <div class="label">Your recent rounds</div>
-        <div id="crLast" class="muted">—</div>
+        <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:8px">
+          <button class="btn primary" id="crPlace">Place Bet</button>
+          <button class="btn cashout" id="crCashout" style="display:none">💸 Cash Out</button>
+          <span id="crMsg" class="muted"></span>
+        </div>
+
+        <div class="card" style="margin-top:14px">
+          <div class="label">Your recent rounds</div>
+          <div id="crLast" class="muted">—</div>
+        </div>
       </div>
     </div>
 
     <!-- Mines -->
     <div id="page-mines" style="display:none">
       <div class="card">
-        <div class="mines-top">
-          <div>
-            <div class="big">💣 Mines</div>
-            <div class="muted">Choose mines, reveal safes, and cash out anytime.</div>
-          </div>
-          <div><button class="chip" id="backToGames2">← Games</button></div>
+        <div style="display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap">
+          <div class="big">💣 Mines</div>
+          <button class="chip" id="backToGames2">← Games</button>
         </div>
 
-        <div class="grid" style="grid-template-columns:1fr 1fr; gap:12px; margin-top:10px">
+        <!-- two-column layout -->
+        <div class="grid mines-two" style="grid-template-columns: 380px 1fr; margin-top:12px; gap:16px">
+          <!-- LEFT: settings & stats -->
           <div>
             <div class="label">Bet (DL)</div>
-            <input id="mBet" type="number" min="1" step="1" placeholder="min 1"/>
-          </div>
-          <div>
-            <div class="label">Mines (1–24)</div>
+            <input id="mBet" type="number" min="1" step="0.01" placeholder="min 1.00"/>
+
+            <div class="label" style="margin-top:10px">Mines (1–24)</div>
             <input id="mMines" type="number" min="1" max="24" step="1" value="3"/>
+
+            <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:12px">
+              <button class="btn primary" id="mStart">Start Game</button>
+              <button class="btn cashout" id="mCash" style="display:none">💸 Cash Out</button>
+              <span id="mMsg" class="muted"></span>
+            </div>
+
+            <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:12px">
+              <span class="tag" id="mHash">Commit: —</span>
+              <span class="tag" id="mStatus">Status: —</span>
+            </div>
+
+            <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:8px">
+              <span class="tag" id="mMult">Multiplier: 1.00×</span>
+              <span class="tag" id="mPotential">Potential: —</span>
+            </div>
+
+            <div class="card" style="margin-top:14px">
+              <div class="label">Recent Mines Games</div>
+              <div id="mHist" class="muted">—</div>
+            </div>
           </div>
-        </div>
 
-        <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:10px 0 6px">
-          <button class="btn primary" id="mStart">Start Game</button>
-          <button class="btn cashout" id="mCash" style="display:none">💸 Cash Out</button>
-          <span id="mMsg" class="muted"></span>
-        </div>
-
-        <div class="meta">
-          <span class="tag" id="mHash">Commit: —</span>
-          <span class="tag" id="mStatus">Status: —</span>
-          <span class="tag" id="mPotential">Potential: —</span>
-        </div>
-
-        <div class="mines-grid" id="mGrid"></div>
-
-        <div class="card" style="margin-top:14px">
-          <div class="label">Recent Mines Games</div>
-          <div id="mHist" class="muted">—</div>
+          <!-- RIGHT: board -->
+          <div>
+            <div class="mines-grid" id="mGrid"></div>
+          </div>
         </div>
       </div>
     </div>
@@ -945,7 +975,7 @@ HTML_TEMPLATE = """
           <div class="label">Owner Panel</div>
           <div class="grid" style="grid-template-columns:2fr 1fr 2fr auto; gap:8px">
             <div><div class="label">Discord ID or &lt;@mention&gt;</div><input id="tIdent" placeholder="ID or <@id>"/></div>
-            <div><div class="label">Amount (+/- DL)</div><input id="tAmt" type="number" placeholder="10 or -5"/></div>
+            <div><div class="label">Amount (+/- DL)</div><input id="tAmt" type="text" placeholder="10 or -5.25"/></div>
             <div><div class="label">Reason (optional)</div><input id="tReason" placeholder="promo/correction/prize"/></div>
             <div style="align-self:end"><button class="btn primary" id="tApply">Apply</button></div>
           </div>
@@ -954,7 +984,7 @@ HTML_TEMPLATE = """
           <div class="label" style="margin-top:12px">Create Promo Code</div>
           <div class="grid" style="grid-template-columns:1fr 1fr 1fr; gap:8px">
             <div><div class="label">Code (optional)</div><input id="cCode" placeholder="auto-generate if empty"/></div>
-            <div><div class="label">Amount (DL)</div><input id="cAmount" type="number" placeholder="e.g. 10"/></div>
+            <div><div class="label">Amount (DL)</div><input id="cAmount" type="text" placeholder="e.g. 10 or 1.24"/></div>
             <div><div class="label">Max Uses</div><input id="cMax" type="number" placeholder="e.g. 100"/></div>
           </div>
           <div style="margin-top:8px"><button class="btn primary" id="cMake">Create</button> <span id="cMsg" class="muted"></span></div>
@@ -1008,7 +1038,7 @@ HTML_TEMPLATE = """
     const tabGames = qs('tab-games'), tabRef=qs('tab-ref'), tabPromo=qs('tab-promo');
     const pgGames=qs('page-games'), pgCrash=qs('page-crash'), pgMines=qs('page-mines'), pgRef=qs('page-ref'), pgPromo=qs('page-promo'), pgProfile=qs('page-profile'), loginCard=qs('loginCard');
 
-    function fmtDL(n){ return `💎 ${Number(n).toLocaleString()} DL`; }
+    function fmtDL(n){ const v=Number(n||0); return `💎 ${v.toLocaleString(undefined,{minimumFractionDigits:2, maximumFractionDigits:2})} DL`; }
     async function j(u, opt={}){ const r=await fetch(u, Object.assign({credentials:'include'},opt)); if(!r.ok) throw new Error(await r.text()); return r.json(); }
 
     function setTab(which){
@@ -1057,7 +1087,7 @@ HTML_TEMPLATE = """
       }
     }
 
-    // Profile / Referral / Promos
+    // Profile / Referral / Promos (same as before, shortened)
     async function renderProfile(){
       try{
         const me = await j('/api/me'); const prof = await j('/api/profile');
@@ -1082,13 +1112,13 @@ HTML_TEMPLATE = """
           </div>
         `;
         const ownerPanel = qs('ownerPanel');
-        if(me.id === '__OWNER_ID__'){ ownerPanel.style.display=''; }
-        else ownerPanel.style.display='none';
+        const meInfo = await j('/api/me');
+        if(meInfo.id === '__OWNER_ID__'){ ownerPanel.style.display=''; } else ownerPanel.style.display='none';
 
         const tApply = qs('tApply'); if(tApply){
           tApply.onclick = async ()=>{
             const identifier = qs('tIdent').value.trim();
-            const amount = parseInt(qs('tAmt').value,10) || 0;
+            const amount = qs('tAmt').value.trim();
             const reason = qs('tReason').value.trim() || null;
             const msg = qs('tMsg'); msg.textContent = '';
             try{
@@ -1101,7 +1131,7 @@ HTML_TEMPLATE = """
         const cMake = qs('cMake'); if(cMake){
           cMake.onclick = async ()=>{
             const code = qs('cCode').value.trim() || null;
-            const amount = parseInt(qs('cAmount').value,10) || 0;
+            const amount = qs('cAmount').value.trim() || "0";
             const max_uses = parseInt(qs('cMax').value,10) || 1;
             const msg = qs('cMsg'); msg.textContent='';
             try{
@@ -1143,7 +1173,7 @@ HTML_TEMPLATE = """
       }catch(e){}
     }
 
-    // -------- Crash state + live now polling (client-stepped animation) --------
+    // -------- Crash (slower) --------
     const crNowEl = qs('crNow'), crHint = qs('crHint'), crMsg = qs('crMsg');
     const lastBustsEl = qs('lastBusts'), cashBtn = qs('crCashout'), placeBtn = qs('crPlace');
 
@@ -1151,7 +1181,7 @@ HTML_TEMPLATE = """
     let roundId = null;
     let haveActiveBet = false;
 
-    // Canvas + path (WHITE line)
+    // Canvas
     const canv = qs('crCanvas'); const ctx = canv.getContext('2d');
     function resizeCanvas(){
       const dpr = window.devicePixelRatio || 1;
@@ -1177,7 +1207,7 @@ HTML_TEMPLATE = """
     }
     resizeCanvas();
 
-    // Multiplier animation (0.01 steps, starts slow then accelerates)
+    // Multiplier animation (much slower)
     let clientMult = 0.00;
     let serverTarget = 1.00;
     let rafId = null, runStartTs = 0, lastTs = 0, stepAcc = 0, lastDrawnM = 0.00;
@@ -1219,7 +1249,7 @@ HTML_TEMPLATE = """
       if(!lastTs) lastTs = ts;
       const dt = Math.min(0.1, (ts - lastTs)/1000); lastTs = ts;
       const tSec = Math.max(0, (ts - runStartTs)/1000);
-      const baseRate = 0.15, maxRate = 3.00, tau = 2.6;
+      const baseRate = 0.04, maxRate = 0.6, tau = 4.0; // much slower than before
       const ratePerSec = baseRate + (maxRate - baseRate) * (1 - Math.exp(-tSec / tau));
       stepAcc += ratePerSec * dt;
       while(stepAcc >= 0.01 && clientMult < serverTarget){
@@ -1238,12 +1268,11 @@ HTML_TEMPLATE = """
         roundId = s.round_id; crPhase = s.phase;
 
         lastBustsEl.innerHTML = s.last_busts.length
-          ? s.last_busts.map(v=>`<span class="chip2 ${v<2?'bust-bad':'bust-good'}">${v.toFixed(2)}×</span>`).join('')
+          ? s.last_busts.map(v=>`<span class="chip">${v.toFixed(2)}×</span>`).join('')
           : 'No history yet.';
 
         haveActiveBet = !!(s.your_bet && !s.your_bet.resolved);
 
-        // Toggle buttons: replace Place Bet with Cash Out when you have a bet
         if(haveActiveBet){
           placeBtn.style.display = 'none';
           cashBtn.style.display = '';
@@ -1261,7 +1290,6 @@ HTML_TEMPLATE = """
           stopRunAnim();
           if(s.bust){ crNowEl.textContent = s.bust.toFixed(2)+'×'; }
           crHint.textContent = 'Preparing next round…';
-          // When round ends, your bet is resolved; reset buttons.
           cashBtn.disabled = true;
         }
         if(crPhase==='betting'){
@@ -1276,8 +1304,6 @@ HTML_TEMPLATE = """
         crHint.textContent = 'Disconnected. Reconnecting…';
       }
     }
-
-    // server "now" polling
     async function pollNow(){
       if(crPhase!=='running') return;
       try{
@@ -1288,25 +1314,21 @@ HTML_TEMPLATE = """
       }catch(e){}
     }
 
-    // Place bet
     placeBtn.onclick = async ()=>{
       try{
-        const bet = parseInt(document.getElementById('crBet').value,10);
+        const bet = parseFloat(document.getElementById('crBet').value);
         const cashVal = document.getElementById('crCash').value.trim();
         let cash = cashVal==='' ? 1000 : parseFloat(cashVal);
-        if(Number.isNaN(bet) || bet < 1) throw new Error('Enter a bet of at least 1 DL.');
-        if(Number.isNaN(cash) || cash < 1.01) throw new Error('Auto cashout must be at least 1.01×, or leave empty.');
+        if(!isFinite(bet) || bet < 1) throw new Error('Enter a bet of at least 1.00 DL.');
+        if(!isFinite(cash) || cash < 1.01) throw new Error('Auto cashout must be at least 1.01×, or leave empty.');
         await j('/api/crash/bet', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({bet, cashout: cash})});
         crMsg.textContent = 'Bet placed for this round.';
-        await renderHeader(); // update balance
+        await renderHeader();
         haveActiveBet = true;
-        // Immediately flip to Cash Out button (disabled until running)
         placeBtn.style.display='none';
         cashBtn.style.display=''; cashBtn.disabled = (crPhase!=='running');
       }catch(e){ crMsg.textContent = 'Error: '+e.message; }
     };
-
-    // Cash Out
     cashBtn.onclick = async ()=>{
       if(cashBtn.disabled) return;
       try{
@@ -1316,14 +1338,12 @@ HTML_TEMPLATE = """
         haveActiveBet = false;
         cashBtn.style.display = 'none';
         placeBtn.style.display = '';
-      }catch(e){
-        crMsg.textContent = 'Cashout failed: '+e.message;
-      }
+      }catch(e){ crMsg.textContent = 'Cashout failed: '+e.message; }
     };
 
     // ---- MINES ----
     const mGrid = qs('mGrid'), mStart = qs('mStart'), mCash = qs('mCash'), mMsg = qs('mMsg');
-    const mHash = qs('mHash'), mStatus = qs('mStatus'), mPotential = qs('mPotential');
+    const mHash = qs('mHash'), mStatus = qs('mStatus'), mPotential = qs('mPotential'), mMult = qs('mMult');
     let mActive = false, mPicks = 0, mGameId = null, mMines = 3, mBet = 0;
 
     function buildGrid(){
@@ -1346,50 +1366,62 @@ HTML_TEMPLATE = """
         else { b.textContent=''; }
         if(board){
           if(board[i]==='1'){ b.classList.add('mine','revealed'); b.textContent='💥'; }
-          else if(((mPicks>>i)&1)===1){ /* already marked safe */ }
         }
       }
     }
+    function clientMinesMultiplier(mines, picks){
+      if(picks<=0) return 1.0;
+      let t=1.0;
+      for(let i=0;i<picks;i++){
+        t *= (25 - i) / Math.max(1, (25 - mines - i));
+        t *= (1 - 0.01);
+      }
+      return t;
+    }
+
     async function onTileClick(e){
       if(!mActive) return;
       const el = e.currentTarget;
       const idx = parseInt(el.dataset.idx,10);
-      if(((mPicks>>idx)&1)===1) return; // already revealed
+      if(((mPicks>>idx)&1)===1) return;
       try{
         const r = await j('/api/mines/pick',{method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({index: idx})});
         if(r.status==='lost'){
           mActive=false; mStatus.textContent='Status: Lost';
           updateGridReveal(r.board);
-          mMsg.textContent='💥 You hit a mine. Better luck next time.';
+          mMult.textContent='Multiplier: —';
+          mPotential.textContent='Potential: —';
+          mMsg.textContent='💥 You hit a mine.';
           mStart.style.display=''; mCash.style.display='none';
           renderHeader();
           renderMinesHistory();
         }else{
           mPicks = r.picks;
           mPotential.textContent = 'Potential: '+fmtDL(r.potential_win);
+          mMult.textContent = 'Multiplier: ' + (r.multiplier||clientMinesMultiplier(mMines, countBits(mPicks))).toFixed(4)+'×';
           mStatus.textContent='Status: Active';
           updateGridReveal();
-          // Allow cash out after at least one safe
           if(mPicks>0){ mCash.disabled=false; }
         }
       }catch(err){ mMsg.textContent='Error: '+err.message; }
     }
+    function countBits(x){ return x.toString(2).split('0').join('').length; }
 
     async function minesStart(){
       try{
-        const bet = parseInt(document.getElementById('mBet').value,10);
+        const bet = parseFloat(document.getElementById('mBet').value);
         const mines = parseInt(document.getElementById('mMines').value,10);
-        if(Number.isNaN(bet) || bet < 1) throw new Error('Enter a bet of at least 1 DL.');
-        if(Number.isNaN(mines) || mines<1 || mines>24) throw new Error('Mines must be 1–24.');
+        if(!isFinite(bet) || bet < 1) throw new Error('Enter a bet of at least 1.00 DL.');
+        if(!isFinite(mines) || mines<1 || mines>24) throw new Error('Mines must be 1–24.');
         const r = await j('/api/mines/start',{method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({bet, mines})});
         mActive=true; mPicks=0; mGameId=r.id; mMines=mines; mBet=bet;
         mHash.textContent = 'Commit: '+r.hash;
         mStatus.textContent = 'Status: Active';
-        mPotential.textContent = 'Potential: '+fmtDL(bet); // starts at ~bet (actually < bet after edge, but we display bet)
+        mMult.textContent = 'Multiplier: 1.0000×';
+        mPotential.textContent = 'Potential: '+fmtDL(bet);
         mMsg.textContent='';
         buildGrid(); updateGridReveal();
-        mStart.style.display='none'; mCash.style.display='';
-        mCash.disabled=true;
+        mStart.style.display='none'; mCash.style.display=''; mCash.disabled=true;
         renderHeader();
         renderMinesHistory();
       }catch(err){ mMsg.textContent='Error: '+err.message; }
@@ -1400,6 +1432,7 @@ HTML_TEMPLATE = """
         mActive=false;
         mStatus.textContent='Status: Cashed';
         mMsg.textContent='✅ Cashed out: '+fmtDL(r.win);
+        mMult.textContent='Multiplier: —';
         updateGridReveal(r.board);
         mStart.style.display=''; mCash.style.display='none';
         renderHeader();
@@ -1419,15 +1452,17 @@ HTML_TEMPLATE = """
           mHash.textContent='Commit: '+s.hash;
           mStatus.textContent='Status: Active';
           mStart.style.display='none'; mCash.style.display=''; mCash.disabled=(mPicks<1);
+          mMult.textContent = 'Multiplier: ' + clientMinesMultiplier(mMines, countBits(mPicks)).toFixed(4)+'×';
+          mPotential.textContent = 'Potential: '+fmtDL(mBet * clientMinesMultiplier(mMines, countBits(mPicks)));
           updateGridReveal();
         }else{
           mActive=false; mPicks=0; mGameId=null;
-          mHash.textContent='Commit: —'; mStatus.textContent='Status: —'; mPotential.textContent='Potential: —';
+          mHash.textContent='Commit: —'; mStatus.textContent='Status: —'; mMult.textContent='Multiplier: —'; mPotential.textContent='Potential: —';
           mStart.style.display=''; mCash.style.display='none';
         }
       }catch(e){
         mActive=false; mPicks=0; mGameId=null;
-        mHash.textContent='Commit: —'; mStatus.textContent='Status: —'; mPotential.textContent='Potential: —';
+        mHash.textContent='Commit: —'; mStatus.textContent='Status: —'; mMult.textContent='Multiplier: —'; mPotential.textContent='Potential: —';
         mStart.style.display=''; mCash.style.display='none';
       }
       renderMinesHistory();
@@ -1456,7 +1491,7 @@ HTML_TEMPLATE = """
       }
     }
 
-    // Chat
+    // Chat (unchanged)
     const drawer = qs('chatDrawer'), chatBody=qs('chatBody'), chatText=qs('chatText'), chatSend=qs('chatSend');
     const chatNote = qs('chatNote'), chatDisabled = qs('chatDisabled');
     let chatOpen=false, chatPoll=null, lastChatId=0, myLevel=0, isLogged=false;
@@ -1506,8 +1541,8 @@ HTML_TEMPLATE = """
     qs('chatClose').onclick = closeChat;
 
     // Periodic
-    setInterval(()=>{ if(pgCrash.style.display!=='none') refreshCrash(); }, 800);
-    setInterval(()=>{ if(pgCrash.style.display!=='none') pollNow(); }, 250);
+    setInterval(()=>{ if(pgCrash.style.display!=='none') refreshCrash(); }, 900);
+    setInterval(()=>{ if(pgCrash.style.display!=='none') pollNow(); }, 300);
 
     // Other tabs & data
     tabGames.onclick=()=>setTab('games');
@@ -1546,7 +1581,6 @@ HTML_TEMPLATE = """
 </html>
 """
 
-# Build final HTML (inject owner id)
 INDEX_HTML = HTML_TEMPLATE.replace("__OWNER_ID__", str(OWNER_ID))
 
 # ----- Routes -----
@@ -1558,26 +1592,16 @@ async def index():
 async def login():
     if not (CLIENT_ID and OAUTH_REDIRECT and CLIENT_SECRET):
         raise HTTPException(500, "OAuth not configured")
-    params = {
-        "response_type": "code",
-        "client_id": CLIENT_ID,
-        "scope": "identify",
-        "redirect_uri": OAUTH_REDIRECT,
-        "prompt": "none"
-    }
+    params = {"response_type":"code","client_id":CLIENT_ID,"scope":"identify","redirect_uri":OAUTH_REDIRECT,"prompt":"none"}
     return RedirectResponse(f"{DISCORD_API}/oauth2/authorize?{urlencode(params)}")
 
 @app.get("/callback")
 async def callback(code: str | None = None):
-    if not code:
-        raise HTTPException(400, "Missing code")
+    if not code: raise HTTPException(400, "Missing code")
     async with httpx.AsyncClient() as client:
         token = (await client.post(f"{DISCORD_API}/oauth2/token", data={
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": OAUTH_REDIRECT
+            "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET,
+            "grant_type": "authorization_code", "code": code, "redirect_uri": OAUTH_REDIRECT
         })).json()
         if "access_token" not in token:
             raise HTTPException(400, f"OAuth token error: {token}")
@@ -1591,9 +1615,7 @@ async def callback(code: str | None = None):
 
 @app.get("/logout")
 async def logout():
-    resp = RedirectResponse(url="/")
-    resp.delete_cookie("session")
-    return resp
+    resp = RedirectResponse(url="/"); resp.delete_cookie("session"); return resp
 
 @app.get("/api/me")
 async def api_me(request: Request):
@@ -1605,7 +1627,7 @@ async def api_me(request: Request):
 async def api_balance(request: Request):
     user = read_session(request)
     if not user: raise HTTPException(401, "Not logged in")
-    return {"balance": get_balance(str(user["id"]))}
+    return {"balance": float(get_balance(str(user["id"])))}
 
 # Profiles / referrals
 class SetNameBody(BaseModel): name: str
@@ -1648,21 +1670,19 @@ async def api_promo_redeem(request: Request, body: RedeemBody):
     if not user: raise HTTPException(401, "Not logged in")
     try:
         new_bal = redeem_promo(str(user["id"]), body.code)
-        return {"new_balance": new_bal}
-    except PromoAlreadyRedeemed as e: raise HTTPException(400, str(e))
-    except PromoInvalid as e: raise HTTPException(400, str(e))
-    except PromoExpired as e: raise HTTPException(400, str(e))
-    except PromoExhausted as e: raise HTTPException(400, str(e))
+        return {"new_balance": float(new_bal)}
+    except (PromoAlreadyRedeemed, PromoInvalid, PromoExpired, PromoExhausted) as e:
+        raise HTTPException(400, str(e))
 
 # Owner admin
 class AdjustBody(BaseModel):
     identifier: str
-    amount: int
+    amount: str
     reason: Optional[str] = None
 
 class CreatePromoBody(BaseModel):
     code: Optional[str] = None
-    amount: int
+    amount: str
     max_uses: int = 1
     expires_at: Optional[str] = None
 
@@ -1682,27 +1702,34 @@ async def api_admin_adjust(request: Request, body: AdjustBody):
     actor = require_owner(request)
     uid = parse_user_identifier(body.identifier)
     if not uid: raise HTTPException(400, "Invalid identifier (use raw ID or <@mention>)")
-    if body.amount == 0: raise HTTPException(400, "Amount cannot be zero")
-    new_balance = adjust_balance(str(actor["id"]), uid, int(body.amount), body.reason)
-    return {"user_id": uid, "new_balance": new_balance}
+    try:
+        delta = q2(D(body.amount))
+    except Exception:
+        raise HTTPException(400, "Invalid amount")
+    if delta == 0: raise HTTPException(400, "Amount cannot be zero")
+    new_balance = adjust_balance(str(actor["id"]), uid, delta, body.reason)
+    return {"user_id": uid, "new_balance": float(new_balance)}
 
 @app.post("/api/admin/promo/create")
 async def api_admin_promo_create(request: Request, body: CreatePromoBody):
     require_owner(request)
-    if body.amount == 0: raise HTTPException(400, "Amount cannot be zero")
+    try:
+        amt = q2(D(body.amount))
+    except Exception:
+        raise HTTPException(400, "Invalid amount")
+    if amt == 0: raise HTTPException(400, "Amount cannot be zero")
     if body.max_uses < 1: raise HTTPException(400, "Max uses must be >= 1")
-    return create_promo(str(OWNER_ID), body.code, int(body.amount), int(body.max_uses), body.expires_at)
+    return create_promo(str(OWNER_ID), body.code, amt, int(body.max_uses), body.expires_at)
 
 # Crash API
 class BetBody(BaseModel):
-    bet: int
+    bet: float
     cashout: float
 
 @app.get("/api/crash/state")
 async def api_crash_state(request: Request):
     user = read_session(request)
     if not user: raise HTTPException(401, "Not logged in")
-
     r = load_round()
     rid, phase = (r["id"], r["status"]) if r else (None, "betting")
     yb = your_bet(rid, user["id"]) if rid else None
@@ -1714,7 +1741,7 @@ async def api_crash_state(request: Request):
         "started_at":       iso(r["started_at"])       if r else None,
         "bust": r["bust"] if (r and phase=='ended') else None,
         "your_bet": yb,
-        "min_bet": MIN_BET,
+        "min_bet": float(MIN_BET),
         "last_busts": last_busts(15)
     }
 
@@ -1730,9 +1757,9 @@ async def api_crash_now():
 async def api_crash_bet(request: Request, body: BetBody):
     user = read_session(request)
     if not user: raise HTTPException(401, "Not logged in")
-    bet = int(body.bet); cash = float(body.cashout)
-    if bet < MIN_BET: raise HTTPException(400, f"Min bet is {MIN_BET} DL")
-    if bet > MAX_BET: raise HTTPException(400, f"Max bet is {MAX_BET} DL")
+    bet = q2(D(body.bet)); cash = float(body.cashout)
+    if bet < MIN_BET: raise HTTPException(400, f"Min bet is {MIN_BET:.2f} DL")
+    if bet > MAX_BET: raise HTTPException(400, f"Max bet is {MAX_BET:.2f} DL")
     if cash < 1.01: cash = 1000.0
     try:
         res = place_bet(user["id"], bet, cash)
@@ -1757,8 +1784,7 @@ async def api_game_crash_history(request: Request, limit: int = Query(10, ge=1, 
     return {"rows": your_history(user["id"], limit)}
 
 # Global Chat API
-class ChatSendBody(BaseModel):
-    text: str
+class ChatSendBody(BaseModel): text: str
 
 @app.get("/api/chat/fetch")
 async def api_chat_fetch(request: Request, since_id: int = Query(0, ge=0), limit: int = Query(50, ge=1, le=200)):
@@ -1781,7 +1807,7 @@ async def api_chat_send(request: Request, body: ChatSendBody):
 
 # MINES API
 class MinesStartBody(BaseModel):
-    bet: int
+    bet: float
     mines: int
 
 class MinesPickBody(BaseModel):
@@ -1806,7 +1832,7 @@ async def api_mines_start(request: Request, body: MinesStartBody):
     user = read_session(request)
     if not user: raise HTTPException(401, "Not logged in")
     try:
-        res = mines_start(user["id"], int(body.bet), int(body.mines))
+        res = mines_start(user["id"], q2(D(body.bet)), int(body.mines))
         return res
     except ValueError as e:
         raise HTTPException(400, str(e))
@@ -1843,7 +1869,7 @@ async def crash_loop():
         if r["status"] == "betting":
             wait = (r["betting_ends_at"] - now).total_seconds()
             if wait > 0: await asyncio.sleep(min(wait, 0.5))
-            else: begin = begin_running(rid)
+            else: begin_running(rid)
         elif r["status"] == "running":
             if r["expected_end_at"]:
                 wait = (r["expected_end_at"] - now).total_seconds()
@@ -1864,7 +1890,6 @@ async def crash_loop():
 async def main():
     import traceback, sys
     init_db()
-
     config = uvicorn.Config(app, host="0.0.0.0", port=PORT, log_level="info")
     server = uvicorn.Server(config)
 

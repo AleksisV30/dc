@@ -1056,7 +1056,7 @@ HTML_TEMPLATE = """
       // acceleration curve: begins slow, ramps to ~3.0x/s
       const tSec = Math.max(0, (ts - runStartTs)/1000);
       const baseRate = 0.15;     // start speed
-      const maxRate  = 3.00;     # noqa
+      const maxRate  = 3.00;
       const tau = 2.6;           // ramp time constant
       const ratePerSec = baseRate + (maxRate - baseRate) * (1 - Math.exp(-tSec / tau));
 

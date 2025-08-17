@@ -595,7 +595,12 @@ HTML_TEMPLATE = """
     .avatar{width:34px;height:34px;border-radius:50%;object-fit:cover;border:1px solid var(--border); cursor:pointer}
     .btn{display:inline-flex; align-items:center; gap:8px; padding:10px 14px; border-radius:12px; border:1px solid var(--border); background:linear-gradient(180deg,#0e1833,#0b1326); cursor:pointer; font-weight:600}
     .btn.primary{background:linear-gradient(135deg,#3b82f6,#22c1dc); border-color:transparent}
-    .btn.ghost{background:transparent}
+    .btn.ghost{
+      background:#162a52;
+      border:1px solid var(--border);
+      color:#eaf2ff;
+    }
+    .btn.ghost:hover{ filter:brightness(1.1) }
     .grid{display:grid; gap:16px; grid-template-columns:1fr}
     @media(min-width:980px){.grid{grid-template-columns:1fr 1fr}}
     .card{background:linear-gradient(180deg,var(--bg2),#0b1428); border:1px solid var(--border); border-radius:18px; padding:16px; box-shadow: 0 6px 20px rgba(0,0,0,.25)}
@@ -779,18 +784,12 @@ HTML_TEMPLATE = """
       </div>
     </div>
 
-    <!-- Login card -->
+    <!-- Login card (Discord only) -->
     <div id="loginCard" class="card" style="display:none">
       <div class="label">Get Started</div>
-      <p>If you’re not logged in, click <b>Login with Discord</b>. If you’re new, click <b>Register</b>:</p>
+      <p>Use Discord to log in and see your balance, play games, and chat.</p>
       <div style="display:flex; gap:8px; flex-wrap:wrap">
         <a class="btn primary" href="/login">Login with Discord</a>
-        <button class="btn" id="registerBtn">Register</button>
-      </div>
-      <div id="registerInfo" class="muted" style="margin-top:10px; display:none">
-        <p>1) Join our Discord server.</p>
-        <p>2) DM the bot and run <code>.signup &lt;password&gt;</code> to set your site password (optional).</p>
-        <p>3) Then use <b>Login with Discord</b> here to see your balance and play.</p>
       </div>
     </div>
   </div>
@@ -872,15 +871,8 @@ HTML_TEMPLATE = """
         qs('avatarBtn').onclick = ()=>{ setTab('profile'); renderProfile(); };
         qs('chatBtn').onclick = toggleChat;
       }catch(e){
-        auth.innerHTML = `
-          <a class="btn primary" href="/login">Login</a>
-          <button class="btn" id="registerBtn2">Register</button>
-        `;
+        auth.innerHTML = `<a class="btn primary" href="/login">Login with Discord</a>`;
         loginCard.style.display='';
-        document.getElementById('registerBtn2').onclick = ()=> {
-          const info = qs('registerInfo'); info.style.display = 'block';
-          window.scrollTo({top: document.body.scrollHeight, behavior:'smooth'});
-        };
       }
     }
 
@@ -978,7 +970,7 @@ HTML_TEMPLATE = """
     let haveActiveBet = false;
     let betResolved = false;
 
-    // Canvas + path
+    // Canvas + path (WHITE line, visible)
     const canv = qs('crCanvas'); const ctx = canv.getContext('2d');
     function resizeCanvas(){
       const dpr = window.devicePixelRatio || 1;
@@ -992,9 +984,10 @@ HTML_TEMPLATE = """
     function redrawAxis(){
       const w = canv.clientWidth, h = canv.clientHeight;
       ctx.clearRect(0,0,w,h);
-      ctx.globalAlpha = 0.25;
-      ctx.strokeStyle = '#23304c';
+      ctx.globalAlpha = 1;
+      ctx.strokeStyle = '#203255';
       ctx.lineWidth = 1;
+      ctx.globalAlpha = 0.35;
       for(let i=0;i<=5;i++){
         const y = h - (i*h/5);
         ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(w,y); ctx.stroke();
@@ -1003,50 +996,50 @@ HTML_TEMPLATE = """
     }
     resizeCanvas();
 
-    // Multiplier animation (0.01 steps with acceleration)
-    let clientMult = 0.00;        // what we display
-    let serverTarget = 1.00;      // latest from server /api/crash/now
+    // Multiplier animation (0.01 steps, starts slow then accelerates)
+    let clientMult = 0.00;        // drawn multiplier
+    let serverTarget = 1.00;      // latest server "now" value
     let rafId = null;
     let runStartTs = 0;
+    let lastTs = 0;
+    let stepAcc = 0;              // how much "mult distance" we can move this frame
+    let lastDrawnM = 0.00;
 
     function mapPoint(mult){
       const w = canv.clientWidth, h = canv.clientHeight;
       const maxM = 20.0;
       const yf = Math.min(1, Math.log(Math.max(1.0001, mult)) / Math.log(maxM));
       const y = h - (h * yf);
-      // slight rightward curve as it rises
       const xf = Math.pow(yf, 1.35);
       const x = (w * (0.12 + 0.76 * xf));
       return [x,y];
     }
-    let lastDrawnM = 0.00;
     function resetGraph(){
       redrawAxis();
       lastDrawnM = 0.00;
       clientMult = 0.00;
     }
     function drawStep(toMult){
-      // draw from lastDrawnM -> toMult as curved line
       const [px,py] = mapPoint(lastDrawnM || 1.00);
-      const [x,y] = mapPoint(toMult || 1.00);
+      const [x,y]   = mapPoint(toMult   || 1.00);
       ctx.lineJoin = 'round'; ctx.lineCap = 'round';
-      const grad = ctx.createLinearGradient(0, canv.clientHeight, 0, 0);
-      grad.addColorStop(0,'#22c1dc'); grad.addColorStop(1,'#3b82f6');
-      ctx.strokeStyle = grad; ctx.lineWidth = 4;
+      ctx.strokeStyle = '#ffffff';   // WHITE line
+      ctx.lineWidth = 3.5;
+      ctx.shadowColor = 'rgba(255,255,255,.25)'; ctx.shadowBlur = 6;
       ctx.beginPath();
-      // small quadratic curve toward the new point
-      const cx = (px + x) / 2;
-      const cy = Math.min(py, y) - 8;
+      const cx = (px + x) / 2, cy = Math.min(py, y) - 8; // slight bow
       ctx.moveTo(px, py);
       ctx.quadraticCurveTo(cx, cy, x, y);
       ctx.stroke();
+      ctx.shadowBlur = 0;
       lastDrawnM = toMult;
     }
-
     function startRunAnim(){
       resetGraph();
       runStartTs = performance.now();
-      clientMult = 0.00;     // visual from 0.00 like you requested
+      lastTs = 0;
+      stepAcc = 0;
+      clientMult = 0.00;
       serverTarget = 1.00;
       crNowEl.textContent = '0.00×';
       if(rafId) cancelAnimationFrame(rafId);
@@ -1055,23 +1048,27 @@ HTML_TEMPLATE = """
     function stopRunAnim(){
       if(rafId){ cancelAnimationFrame(rafId); rafId=null; }
     }
-    function tick(){
-      // acceleration: step grows over time
-      const tSec = Math.max(0, (performance.now() - runStartTs)/1000);
-      const base = 0.01;                           // 0.01 per tick base
-      const accelFactor = 1 + 2.2*Math.pow(tSec, 1.15); // grows with time
-      const target = serverTarget;
+    function tick(ts){
+      if(!lastTs) lastTs = ts;
+      const dt = Math.min(0.1, (ts - lastTs)/1000);
+      lastTs = ts;
 
-      if(clientMult < target){
-        // advance in exact 0.01 increments up to the current server target
-        const rawNext = clientMult + base*accelFactor;
-        const next = Math.min(target, Math.round(rawNext * 100)/100);
-        // ensure at least +0.01 if below target
-        const stepped = (next <= clientMult && target > clientMult) ? (Math.min(target, clientMult + 0.01)) : next;
-        clientMult = stepped;
+      // acceleration curve: begins slow, ramps to ~3.0x/s
+      const tSec = Math.max(0, (ts - runStartTs)/1000);
+      const baseRate = 0.15;     // start speed
+      const maxRate  = 3.00;     # noqa
+      const tau = 2.6;           // ramp time constant
+      const ratePerSec = baseRate + (maxRate - baseRate) * (1 - Math.exp(-tSec / tau));
+
+      stepAcc += ratePerSec * dt;
+      while(stepAcc >= 0.01 && clientMult < serverTarget){
+        const next = Math.min(serverTarget, +(clientMult + 0.01).toFixed(2));
+        clientMult = next;
         crNowEl.textContent = clientMult.toFixed(2)+'×';
         drawStep(clientMult);
+        stepAcc -= 0.01;
       }
+
       rafId = requestAnimationFrame(tick);
     }
 
@@ -1080,17 +1077,14 @@ HTML_TEMPLATE = """
         const s = await j('/api/crash/state');
         roundId = s.round_id; crPhase = s.phase;
 
-        // bust history
         lastBustsEl.innerHTML = s.last_busts.length
           ? s.last_busts.map(v=>`<span class="chip2 ${v<2?'bust-bad':'bust-good'}">${v.toFixed(2)}×</span>`).join('')
           : 'No history yet.';
 
-        // your bet UI
         haveActiveBet = !!(s.your_bet && !s.your_bet.resolved);
         betResolved = !!(s.your_bet && s.your_bet.resolved);
         cashBtn.style.display = (crPhase==='running' && haveActiveBet) ? '' : 'none';
 
-        // phase transitions
         if(lastPhase !== 'running' && crPhase === 'running'){
           crHint.textContent = 'Round running… Tap Cash Out anytime.';
           startRunAnim();
@@ -1113,7 +1107,7 @@ HTML_TEMPLATE = """
       }
     }
 
-    // poll server "now" (no end time) and only raise our target
+    // server "now" polling (never reveals end)
     async function pollNow(){
       if(crPhase!=='running') return;
       try{
@@ -1152,7 +1146,7 @@ HTML_TEMPLATE = """
       }
     };
 
-    // Chat (login gate fixed)
+    // Chat
     const drawer = qs('chatDrawer'), chatBody=qs('chatBody'), chatText=qs('chatText'), chatSend=qs('chatSend');
     const chatNote = qs('chatNote'), chatDisabled = qs('chatDisabled');
     let chatOpen=false, chatPoll=null, lastChatId=0, myLevel=0, isLogged=false;

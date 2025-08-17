@@ -9,6 +9,7 @@ import discord
 from discord.ext import commands
 from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from itsdangerous import URLSafeSerializer, BadSignature
 import uvicorn
 from pydantic import BaseModel
@@ -53,6 +54,11 @@ def iso(dt: Optional[str|datetime.datetime]) -> Optional[str]:
     if dt is None: return None
     if isinstance(dt, str): return dt
     return dt.astimezone(UTC).isoformat()
+
+# ---------- FastAPI ----------
+app = FastAPI()
+# serve /static for your future images
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # ---------- DB helpers ----------
 def with_conn(fn):
@@ -724,7 +730,6 @@ async def addbal(ctx: commands.Context, user: discord.User | None = None, amount
     await ctx.reply(embed=e, mention_author=False)
 
 # ---------- Web (FastAPI + Frontend) ----------
-app = FastAPI()
 signer = URLSafeSerializer(SECRET_KEY, salt="session")
 
 def set_session(resp: RedirectResponse, payload: dict):
@@ -777,16 +782,28 @@ HTML_TEMPLATE = """
       font-weight:800;
     }
     .btn.cashout[disabled]{ filter:grayscale(.5) brightness(.8); opacity:.8; cursor:not-allowed }
-    .grid{display:grid; gap:16px; grid-template-columns:1fr}
-    @media(min-width:980px){.grid{grid-template-columns:1fr 1fr}}
-    .card{background:linear-gradient(180deg,var(--bg2),#0b1428); border:1px solid var(--border); border-radius:18px; padding:16px; box-shadow: 0 6px 20px rgba(0,0,0,.25)}
-    .label{color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.1em}
-    .big{font-size:28px; font-weight:800}
-    .muted{color:var(--muted)}
-    input, .input{width:100%; background:#0e1833; color:#e8efff; border:1px solid var(--border); border-radius:12px; padding:12px; outline:none}
-    input:focus{border-color:#356adf; box-shadow:0 0 0 2px rgba(53,106,223,.25)}
-    .game-card{display:flex; flex-direction:column; gap:4px; background:linear-gradient(180deg,#0f1a33,#0c152a); border:1px solid var(--border); border-radius:16px; padding:16px; cursor:pointer; transition:transform .08s ease, box-shadow .12s ease}
+    .games-grid{display:grid; gap:14px; grid-template-columns:1fr}
+    @media(min-width:700px){.games-grid{grid-template-columns:1fr 1fr}}
+    @media(min-width:1020px){.games-grid{grid-template-columns:1fr 1fr 1fr}}
+    .game-card{
+      position:relative;
+      min-height:130px;
+      display:flex; flex-direction:column; justify-content:flex-end; gap:4px;
+      background:linear-gradient(180deg,#0f1a33,#0c152a);
+      border:1px solid var(--border); border-radius:16px; padding:16px; cursor:pointer;
+      transition:transform .08s ease, box-shadow .12s ease, border-color .12s ease, background .18s ease;
+      overflow:hidden;
+    }
     .game-card:hover{transform:translateY(-2px); box-shadow:0 8px 18px rgba(0,0,0,.25)}
+    .game-card .title{font-size:20px; font-weight:800}
+    .game-card .muted{opacity:.9}
+    .ribbon{
+      position:absolute; top:12px; right:-32px; transform:rotate(35deg);
+      background:linear-gradient(135deg,#f59e0b,#fb923c);
+      color:#1a1206; font-weight:900; padding:6px 50px; border:1px solid rgba(0,0,0,.2);
+      text-shadow:0 1px 0 rgba(255,255,255,.2);
+    }
+
     .owner{margin-top:16px; border-top:1px dashed var(--border); padding-top:12px}
 
     /* Crash graph */
@@ -800,118 +817,42 @@ HTML_TEMPLATE = """
     }
 
     /* ----- MINES layout ----- */
-    .mines-two{
-      grid-template-columns: 360px 1fr !important;
-      align-items: stretch;
-    }
-    .mines-wrap{
-      display:grid;
-      place-items:center;
-      height: calc(100vh - 180px);
-      min-height: 420px;
-      padding: 6px;
-    }
+    .mines-two{ grid-template-columns: 360px 1fr !important; align-items: stretch; display:grid; gap:16px }
+    .mines-wrap{ display:grid; place-items:center; height: calc(100vh - 180px); min-height: 420px; padding: 6px; }
     .mines-grid{
-      --cell: clamp(
-        48px,
-        min( calc((100vw - 440px)/5), calc((100vh - 320px)/5) ),
-        110px
-      );
-      display:grid;
-      gap:10px;
-      grid-template-columns: repeat(5, var(--cell));
-      justify-content:center;
-      align-content:center;
-      padding: 6px;
-      width: 100%;
+      --cell: clamp(48px, min( calc((100vw - 440px)/5), calc((100vh - 320px)/5) ), 110px);
+      display:grid; gap:10px; grid-template-columns: repeat(5, var(--cell)); justify-content:center; align-content:center; padding: 6px; width: 100%;
     }
     .tile{
-      position:relative;
-      width: var(--cell);
-      aspect-ratio: 1/1;
-      border-radius: clamp(10px, calc(var(--cell)*0.18), 16px);
+      position:relative; width: var(--cell); aspect-ratio: 1/1; border-radius: clamp(10px, calc(var(--cell)*0.18), 16px);
       border:1px solid var(--border);
-      background:
-        radial-gradient(120% 120% at 30% 0%, #19264f 0%, #0c152a 55%),
-        linear-gradient(180deg,#0f1936,#0c152a);
-      display:flex; align-items:center; justify-content:center;
-      font-weight:900;
-      font-size: clamp(13px, calc(var(--cell)*0.34), 22px);
-      cursor:pointer; user-select:none;
-      transition:transform .09s ease, box-shadow .14s ease, background .18s ease, border-color .14s ease, opacity .14s ease;
+      background: radial-gradient(120% 120% at 30% 0%, #19264f 0%, #0c152a 55%), linear-gradient(180deg,#0f1936,#0c152a);
+      display:flex; align-items:center; justify-content:center; font-weight:900; font-size: clamp(13px, calc(var(--cell)*0.34), 22px);
+      cursor:pointer; user-select:none; transition:transform .09s ease, box-shadow .14s ease, background .18s ease, border-color .14s ease, opacity .14s ease;
       box-shadow: 0 8px 22px rgba(0,0,0,.35), inset 0 0 0 1px rgba(255,255,255,.03);
       overflow:hidden;
     }
-    .tile::after{
-      content:"";
-      position:absolute; inset:0;
-      background: linear-gradient(145deg, rgba(255,255,255,.18), transparent 40%);
-      mix-blend-mode: soft-light;
-      opacity:.22;
-      transition:opacity .2s ease;
-    }
-    .tile:hover{
-      transform:translateY(-1px);
-      box-shadow: 0 10px 26px rgba(0,0,0,.45), inset 0 0 0 1px rgba(255,255,255,.05);
-    }
-    .tile .icon{
-      filter: drop-shadow(0 2px 6px rgba(0,0,0,.45));
-    }
-    .tile.safe{
-      background: linear-gradient(135deg,#16a34a 0%, #22c55e 70%);
-      border-color: transparent;
-      color:#06240f;
-    }
-    .tile.mine{
-      background: linear-gradient(135deg,#ef4444 0%, #b91c1c 70%);
-      border-color: transparent;
-      color:#260808;
-    }
+    .tile::after{ content:""; position:absolute; inset:0; background: linear-gradient(145deg, rgba(255,255,255,.18), transparent 40%); mix-blend-mode: soft-light; opacity:.22; transition:opacity .2s ease; }
+    .tile:hover{ transform:translateY(-1px); box-shadow: 0 10px 26px rgba(0,0,0,.45), inset 0 0 0 1px rgba(255,255,255,.05); }
+    .tile .icon{ filter: drop-shadow(0 2px 6px rgba(0,0,0,.45)); }
+    .tile.safe{ background: linear-gradient(135deg,#16a34a 0%, #22c55e 70%); border-color: transparent; color:#06240f; }
+    .tile.mine{ background: linear-gradient(135deg,#ef4444 0%, #b91c1c 70%); border-color: transparent; color:#260808; }
     .tile.revealed{ cursor:default; }
     .tile.pop{ animation: pop .2s ease; }
-    @keyframes pop{
-      from{ transform: scale(.92); opacity:.7 }
-      to  { transform: scale(1);   opacity:1 }
-    }
-    /* Explosions on mine reveal */
+    @keyframes pop{ from{ transform: scale(.92); opacity:.7 } to{ transform: scale(1); opacity:1 } }
     .tile.explode{ animation: shake .4s ease-in-out; }
-    .tile.explode::before{
-      content:"";
-      position:absolute; inset:-2px;
-      border-radius: inherit;
-      background: radial-gradient(circle, rgba(255,255,255,.85), rgba(239,68,68,.6) 40%, transparent 70%);
-      opacity:0; animation: exflash .6s ease-out;
-    }
-    @keyframes exflash{
-      0%{ opacity:.95; transform: scale(.9); }
-      80%{ opacity:.15; transform: scale(1.05); }
-      100%{ opacity:0; transform: scale(1); }
-    }
-    @keyframes shake{
-      0%,100%{ transform: translate(0,0) }
-      20%{ transform: translate(-2px,-1px) }
-      40%{ transform: translate(3px,1px) }
-      60%{ transform: translate(-2px,2px) }
-      80%{ transform: translate(1px,-2px) }
-    }
+    .tile.explode::before{ content:""; position:absolute; inset:-2px; border-radius: inherit; background: radial-gradient(circle, rgba(255,255,255,.85), rgba(239,68,68,.6) 40%, transparent 70%); opacity:0; animation: exflash .6s ease-out; }
+    @keyframes exflash{ 0%{ opacity:.95; transform: scale(.9); } 80%{ opacity:.15; transform: scale(1.05); } 100%{ opacity:0; transform: scale(1); } }
+    @keyframes shake{ 0%,100%{ transform: translate(0,0) } 20%{ transform: translate(-2px,-1px) } 40%{ transform: translate(3px,1px) } 60%{ transform: translate(-2px,2px) } 80%{ transform: translate(1px,-2px) } }
 
-    .mines-stats{
-      display:flex; gap:8px; flex-wrap:wrap; margin-top:10px
-    }
-    .stat{
-      background:#0c1631; border:1px solid var(--border); color:#dce7ff;
-      padding:6px 10px; border-radius:999px; font-size:12px; white-space:nowrap
-    }
+    .mines-stats{ display:flex; gap:8px; flex-wrap:wrap; margin-top:10px }
+    .stat{ background:#0c1631; border:1px solid var(--border); color:#dce7ff; padding:6px 10px; border-radius:999px; font-size:12px; white-space:nowrap }
 
     @media (max-width: 980px){
       .mines-two{ grid-template-columns: 1fr !important; }
       .mines-wrap{ height:auto; min-height: 360px; }
       .mines-grid{
-        --cell: clamp(
-          52px,
-          min( calc((100vw - 48px)/5), calc((100vh - 320px)/5) ),
-          100px
-        );
+        --cell: clamp(52px, min( calc((100vw - 48px)/5), calc((100vh - 320px)/5) ), 100px);
         justify-content:center;
       }
     }
@@ -938,6 +879,24 @@ HTML_TEMPLATE = """
     .lvl{ color:#cfe6ff; font-size:12px; border:1px solid var(--border); padding:2px 6px; border-radius:999px; background:#0c1631 }
     .owner-badge{ color:#fff; background:#3b82f6; border-color:transparent }
     .disabled-note{ padding:8px 12px; font-size:13px; color:#dbe6ff; background:#0c1631; border-bottom:1px solid var(--border) }
+
+    /* Coming Soon hero pages */
+    .soon-hero{
+      position:relative; overflow:hidden; border-radius:16px; border:1px solid var(--border);
+      background: radial-gradient(1200px 500px at -10% -20%, rgba(59,130,246,.25), transparent 60%),
+                  linear-gradient(180deg,#0f1a33,#0b1326);
+      padding:22px;
+    }
+    .soon-hero h2{ margin:0; font-size:28px }
+    .soon-hero p{ margin:.3rem 0 0; color:var(--muted) }
+    .soon-badge{
+      position:absolute; top:14px; right:14px;
+      background:linear-gradient(135deg,#f59e0b,#fb923c);
+      color:#1a1206; padding:6px 10px; border-radius:999px; font-weight:900; border:1px solid rgba(0,0,0,.25)
+    }
+    .soon-grid{ display:grid; gap:12px; grid-template-columns:1fr; margin-top:12px }
+    @media(min-width:800px){ .soon-grid{ grid-template-columns: 1fr 1fr } }
+    .soon-card{ background:linear-gradient(180deg,#0f1a33,#0b1326); border:1px solid var(--border); border-radius:16px; padding:14px }
   </style>
 </head>
 <body>
@@ -957,15 +916,51 @@ HTML_TEMPLATE = """
     <!-- Games -->
     <div id="page-games">
       <div class="card">
-        <div class="label">Games</div>
-        <div class="grid">
-          <div class="game-card" id="openCrash">
-            <div class="big">🚀 Crash</div>
+        <div class="games-grid">
+          <div class="game-card" id="openCrash" style="background-image: radial-gradient(600px 280px at 10% -10%, rgba(59,130,246,.25), transparent 60%);">
+            <div class="title">🚀 Crash</div>
             <div class="muted">Shared rounds • 10s betting • Live cashout</div>
           </div>
-          <div class="game-card" id="openMines">
-            <div class="big">💣 Mines</div>
+          <div class="game-card" id="openMines" style="background-image: radial-gradient(600px 280px at 85% -20%, rgba(34,197,94,.25), transparent 60%);">
+            <div class="title">💣 Mines</div>
             <div class="muted">5×5 board • Choose mines • Cash out anytime</div>
+          </div>
+
+          <!-- Coming Soon games -->
+          <div class="game-card" id="openLimbo">
+            <div class="ribbon">COMING SOON</div>
+            <div class="title">🎯 Limbo</div>
+            <div class="muted">Pick a multiplier and pray</div>
+          </div>
+          <div class="game-card" id="openTowers">
+            <div class="ribbon">COMING SOON</div>
+            <div class="title">🗼 Towers</div>
+            <div class="muted">Climb floors • Avoid the trap</div>
+          </div>
+          <div class="game-card" id="openKeno">
+            <div class="ribbon">COMING SOON</div>
+            <div class="title">🎲 Keno</div>
+            <div class="muted">Pick numbers • Big hits</div>
+          </div>
+          <div class="game-card" id="openPlinko">
+            <div class="ribbon">COMING SOON</div>
+            <div class="title">🟡 Plinko</div>
+            <div class="muted">Drop the puck • Aim for edge</div>
+          </div>
+          <div class="game-card" id="openBlackjack">
+            <div class="ribbon">COMING SOON</div>
+            <div class="title">🃏 Blackjack</div>
+            <div class="muted">21 or bust • Skill + luck</div>
+          </div>
+          <div class="game-card" id="openPump">
+            <div class="ribbon">COMING SOON</div>
+            <div class="title">📈 Pump</div>
+            <div class="muted">Ride the wave • Cash before pop</div>
+          </div>
+          <div class="game-card" id="openCoinflip">
+            <div class="ribbon">COMING SOON</div>
+            <div class="title">🪙 Coinflip</div>
+            <div class="muted">50/50 • Double or none</div>
           </div>
         </div>
       </div>
@@ -992,7 +987,7 @@ HTML_TEMPLATE = """
           <div id="lastBusts" class="muted">Loading last rounds…</div>
         </div>
 
-        <div class="grid" style="grid-template-columns:1fr 1fr; gap:12px; margin-top:8px">
+        <div class="games-grid" style="grid-template-columns:1fr 1fr; gap:12px; margin-top:8px">
           <div>
             <div class="label">Bet (DL)</div>
             <input id="crBet" type="number" min="1" step="0.01" placeholder="min 1.00"/>
@@ -1024,7 +1019,7 @@ HTML_TEMPLATE = """
           <button class="chip" id="backToGames2">← Games</button>
         </div>
 
-        <div class="grid mines-two" style="margin-top:12px; gap:16px">
+        <div class="mines-two" style="margin-top:12px">
           <!-- LEFT: settings & stats + recent games under -->
           <div>
             <div class="label">Bet (DL)</div>
@@ -1077,7 +1072,7 @@ HTML_TEMPLATE = """
     <div id="page-promo" style="display:none">
       <div class="card">
         <div class="label">Promo Codes</div>
-        <div class="grid">
+        <div class="games-grid" style="grid-template-columns:1fr 1fr">
           <div>
             <div class="label">Redeem a code</div>
             <div style="display:flex; gap:8px; align-items:center">
@@ -1102,7 +1097,7 @@ HTML_TEMPLATE = """
 
         <div id="ownerPanel" class="owner" style="display:none">
           <div class="label">Owner Panel</div>
-          <div class="grid" style="grid-template-columns:2fr 1fr 2fr auto; gap:8px">
+          <div class="games-grid" style="grid-template-columns:2fr 1fr 2fr auto">
             <div><div class="label">Discord ID or &lt;@mention&gt;</div><input id="tIdent" placeholder="ID or <@id>"/></div>
             <div><div class="label">Amount (+/- DL)</div><input id="tAmt" type="text" placeholder="10 or -5.25"/></div>
             <div><div class="label">Reason (optional)</div><input id="tReason" placeholder="promo/correction/prize"/></div>
@@ -1111,13 +1106,105 @@ HTML_TEMPLATE = """
           <div id="tMsg" class="muted" style="margin-top:8px"></div>
 
           <div class="label" style="margin-top:12px">Create Promo Code</div>
-          <div class="grid" style="grid-template-columns:1fr 1fr 1fr; gap:8px">
+          <div class="games-grid" style="grid-template-columns:1fr 1fr 1fr">
             <div><div class="label">Code (optional)</div><input id="cCode" placeholder="auto-generate if empty"/></div>
             <div><div class="label">Amount (DL)</div><input id="cAmount" type="text" placeholder="e.g. 10 or 1.24"/></div>
             <div><div class="label">Max Uses</div><input id="cMax" type="number" placeholder="e.g. 100"/></div>
           </div>
           <div style="margin-top:8px"><button class="btn primary" id="cMake">Create</button> <span id="cMsg" class="muted"></span></div>
         </div>
+      </div>
+    </div>
+
+    <!-- Coming Soon Pages -->
+    <div id="page-limbo" style="display:none">
+      <div class="soon-hero">
+        <div class="soon-badge">Coming Soon</div>
+        <h2>🎯 Limbo</h2>
+        <p>Set your multiplier and hold your breath. Higher risk, higher reward.</p>
+        <div class="soon-grid">
+          <div class="soon-card"><div class="label">RTP</div><div class="big">~96–98%</div></div>
+          <div class="soon-card"><div class="label">Min Bet</div><div class="big">1.00 DL</div></div>
+        </div>
+        <button class="chip" id="backFromLimbo" style="margin-top:12px">← Back to Games</button>
+      </div>
+    </div>
+
+    <div id="page-towers" style="display:none">
+      <div class="soon-hero">
+        <div class="soon-badge">Coming Soon</div>
+        <h2>🗼 Towers</h2>
+        <p>Pick one safe tile per floor. Each floor multiplies your win—miss and you fall.</p>
+        <div class="soon-grid">
+          <div class="soon-card"><div class="label">Floors</div><div class="big">8–12</div></div>
+          <div class="soon-card"><div class="label">House Edge</div><div class="big">Fair & transparent</div></div>
+        </div>
+        <button class="chip" id="backFromTowers" style="margin-top:12px">← Back to Games</button>
+      </div>
+    </div>
+
+    <div id="page-keno" style="display:none">
+      <div class="soon-hero">
+        <div class="soon-badge">Coming Soon</div>
+        <h2>🎲 Keno</h2>
+        <p>Choose numbers and let the draw decide. More hits = bigger payouts.</p>
+        <div class="soon-grid">
+          <div class="soon-card"><div class="label">Board</div><div class="big">10×10</div></div>
+          <div class="soon-card"><div class="label">Picks</div><div class="big">1–10</div></div>
+        </div>
+        <button class="chip" id="backFromKeno" style="margin-top:12px">← Back to Games</button>
+      </div>
+    </div>
+
+    <div id="page-plinko" style="display:none">
+      <div class="soon-hero">
+        <div class="soon-badge">Coming Soon</div>
+        <h2>🟡 Plinko</h2>
+        <p>Drop balls through a peg board—pray for the edges!</p>
+        <div class="soon-grid">
+          <div class="soon-card"><div class="label">Rows</div><div class="big">8–16</div></div>
+          <div class="soon-card"><div class="label">Risk</div><div class="big">Low / Med / High</div></div>
+        </div>
+        <button class="chip" id="backFromPlinko" style="margin-top:12px">← Back to Games</button>
+      </div>
+    </div>
+
+    <div id="page-blackjack" style="display:none">
+      <div class="soon-hero">
+        <div class="soon-badge">Coming Soon</div>
+        <h2>🃏 Blackjack</h2>
+        <p>Beat the dealer to 21. Strategy meets luck—splits & doubles supported.</p>
+        <div class="soon-grid">
+          <div class="soon-card"><div class="label">Decks</div><div class="big">4–6</div></div>
+          <div class="soon-card"><div class="label">Payout</div><div class="big">Blackjack 3:2</div></div>
+        </div>
+        <button class="chip" id="backFromBlackjack" style="margin-top:12px">← Back to Games</button>
+      </div>
+    </div>
+
+    <div id="page-pump" style="display:none">
+      <div class="soon-hero">
+        <div class="soon-badge">Coming Soon</div>
+        <h2>📈 Pump</h2>
+        <p>Ride a volatile curve—cash before the pop. Like Crash… crankier.</p>
+        <div class="soon-grid">
+          <div class="soon-card"><div class="label">Mode</div><div class="big">Volatility+</div></div>
+          <div class="soon-card"><div class="label">Max Mult</div><div class="big">Huge 👀</div></div>
+        </div>
+        <button class="chip" id="backFromPump" style="margin-top:12px">← Back to Games</button>
+      </div>
+    </div>
+
+    <div id="page-coinflip" style="display:none">
+      <div class="soon-hero">
+        <div class="soon-badge">Coming Soon</div>
+        <h2>🪙 Coinflip</h2>
+        <p>50/50 double-up. Create or join flips with friends.</p>
+        <div class="soon-grid">
+          <div class="soon-card"><div class="label">Edge</div><div class="big">Low, fair fee</div></div>
+          <div class="soon-card"><div class="label">Min Bet</div><div class="big">1.00 DL</div></div>
+        </div>
+        <button class="chip" id="backFromCoinflip" style="margin-top:12px">← Back to Games</button>
       </div>
     </div>
 
@@ -1166,28 +1253,48 @@ HTML_TEMPLATE = """
     const HOUSE_EDGE_MINES = __HOUSE_EDGE_MINES__;
     const OWNER_ID = "__OWNER_ID__";
     function qs(id){return document.getElementById(id)}
-    const tabGames = qs('tab-games'), tabRef=qs('tab-ref'), tabPromo=qs('tab-promo');
-    const pgGames=qs('page-games'), pgCrash=qs('page-crash'), pgMines=qs('page-mines'), pgRef=qs('page-ref'), pgPromo=qs('page-promo'), pgProfile=qs('page-profile'), loginCard=qs('loginCard');
+    const tabGames=qs('tab-games'), tabRef=qs('tab-ref'), tabPromo=qs('tab-promo');
+    const pages=['page-games','page-crash','page-mines','page-ref','page-promo','page-profile','page-limbo','page-towers','page-keno','page-plinko','page-blackjack','page-pump','page-coinflip'].map(id=>qs(id));
+    const pgGames=qs('page-games'), pgCrash=qs('page-crash'), pgMines=qs('page-mines'), pgRef=qs('page-ref'), pgPromo=qs('page-promo'), pgProfile=qs('page-profile');
 
     function fmtDL(n){ const v=Number(n||0); return `💎 ${v.toLocaleString(undefined,{minimumFractionDigits:2, maximumFractionDigits:2})} DL`; }
     async function j(u, opt={}){ const r=await fetch(u, Object.assign({credentials:'include'},opt)); if(!r.ok) throw new Error(await r.text()); return r.json(); }
 
-    function setTab(which){
+    function showOnly(id){
+      for(const p of pages) if(p) p.style.display = (p.id===id?'':'none');
       [tabGames,tabRef,tabPromo].forEach(t=>t.classList.remove('active'));
-      [pgGames,pgCrash,pgMines,pgRef,pgPromo,pgProfile].forEach(p=>p.style.display='none');
-      if(which==='games'){ tabGames.classList.add('active'); pgGames.style.display=''; }
-      if(which==='crash'){ pgCrash.style.display=''; }
-      if(which==='mines'){ pgMines.style.display=''; }
-      if(which==='ref'){ tabRef.classList.add('active'); pgRef.style.display=''; }
-      if(which==='promo'){ tabPromo.classList.add('active'); pgPromo.style.display=''; }
-      if(which==='profile'){ pgProfile.style.display=''; }
+      if(id==='page-games') tabGames.classList.add('active');
+      if(id==='page-ref') tabRef.classList.add('active');
+      if(id==='page-promo') tabPromo.classList.add('active');
       window.scrollTo({top:0, behavior:'smooth'});
     }
-    qs('homeLink').onclick=(e)=>{ e.preventDefault(); setTab('games'); };
-    qs('openCrash').onclick=()=>setTab('crash');
-    qs('backToGames').onclick=()=>setTab('games');
-    qs('openMines').onclick=()=>{ setTab('mines'); renderMines(); };
-    qs('backToGames2').onclick=()=>setTab('games');
+
+    // Top nav
+    qs('homeLink').onclick=(e)=>{ e.preventDefault(); showOnly('page-games'); };
+    tabGames.onclick=()=>showOnly('page-games');
+    tabRef.onclick=()=>{ showOnly('page-ref'); renderReferral(); };
+    tabPromo.onclick=()=>{ showOnly('page-promo'); renderPromos(); };
+
+    // Game openers
+    qs('openCrash').onclick=()=>showOnly('page-crash');
+    qs('openMines').onclick=()=>{ showOnly('page-mines'); renderMines(); };
+    // Coming soon openers
+    const openers = [
+      ['openLimbo','page-limbo','backFromLimbo'],
+      ['openTowers','page-towers','backFromTowers'],
+      ['openKeno','page-keno','backFromKeno'],
+      ['openPlinko','page-plinko','backFromPlinko'],
+      ['openBlackjack','page-blackjack','backFromBlackjack'],
+      ['openPump','page-pump','backFromPump'],
+      ['openCoinflip','page-coinflip','backFromCoinflip'],
+    ];
+    for(const [btn,page,back] of openers){
+      const b=qs(btn), p=qs(page), bk=qs(back);
+      if(b){ b.onclick=()=>showOnly(page); }
+      if(bk){ bk.onclick=()=>showOnly('page-games'); }
+    }
+    qs('backToGames').onclick=()=>showOnly('page-games');
+    qs('backToGames2').onclick=()=>showOnly('page-games');
 
     // modal
     function openModal(){ qs('modal').style.display='flex'; }
@@ -1208,13 +1315,13 @@ HTML_TEMPLATE = """
           <span class="chip" id="chatBtn">Chat</span>
           <img class="avatar" id="avatarBtn" src="${safeAvatar(me)}" title="${me.username}" onerror="this.src='https://cdn.discordapp.com/embed/avatars/1.png?size=64'">
         `;
-        loginCard.style.display='none';
         qs('balanceBtn').onclick = openModal;
-        qs('avatarBtn').onclick = ()=>{ setTab('profile'); renderProfile(); };
+        qs('avatarBtn').onclick = ()=>{ showOnly('page-profile'); renderProfile(); };
         qs('chatBtn').onclick = toggleChat;
+        qs('loginCard').style.display='none';
       }catch(e){
         auth.innerHTML = `<a class="btn primary" href="/login">Login with Discord</a>`;
-        loginCard.style.display='';
+        qs('loginCard').style.display='';
       }
     }
 
@@ -1229,7 +1336,7 @@ HTML_TEMPLATE = """
             <div><div class="big">${me.username}</div><div class="muted">ID: ${me.id}</div></div>
             <div style="margin-left:auto; display:flex; gap:8px; align-items:center"><a class="btn" href="/logout">Logout</a></div>
           </div>
-          <div class="grid" style="margin-top:12px">
+          <div class="games-grid" style="grid-template-columns:1fr 1fr; margin-top:12px">
             <div class="card" style="padding:12px">
               <div class="label">Balance</div><div class="big">${fmtDL(prof.balance)}</div>
               <div class="muted" style="margin-top:6px">Click your balance in the header for Deposit/Withdraw instructions.</div>
@@ -1303,7 +1410,7 @@ HTML_TEMPLATE = """
       }catch(e){}
     }
 
-    // -------- Crash (slow & with explosion) --------
+    // -------- Crash (with explosion) --------
     const crNowEl = qs('crNow'), crHint = qs('crHint'), crMsg = qs('crMsg');
     const lastBustsEl = qs('lastBusts'), cashBtn = qs('crCashout'), placeBtn = qs('crPlace');
 
@@ -1338,7 +1445,7 @@ HTML_TEMPLATE = """
     }
     resizeCanvas();
 
-    // Multiplier animation (much slower)
+    // Multiplier animation (slow)
     let clientMult = 0.00;
     let serverTarget = 1.00;
     let rafId = null, runStartTs = 0, lastTs = 0, stepAcc = 0, lastDrawnM = 0.00;
@@ -1389,7 +1496,7 @@ HTML_TEMPLATE = """
       if(!lastTs) lastTs = ts;
       const dt = Math.min(0.1, (ts - lastTs)/1000); lastTs = ts;
       const tSec = Math.max(0, (ts - runStartTs)/1000);
-      // Extra slow curve
+      // Slow accel curve
       const baseRate = 0.008, maxRate = 0.16, tau = 8.0;
       const ratePerSec = baseRate + (maxRate - baseRate) * (1 - Math.exp(-tSec / tau));
       stepAcc += ratePerSec * dt;
@@ -1463,8 +1570,7 @@ HTML_TEMPLATE = """
       }catch(e){}
     }
 
-    const placeBtnEl = qs('crPlace');
-    placeBtnEl.onclick = async ()=>{
+    qs('crPlace').onclick = async ()=>{
       try{
         const bet = parseFloat(document.getElementById('crBet').value);
         const cashVal = document.getElementById('crCash').value.trim();
@@ -1475,19 +1581,19 @@ HTML_TEMPLATE = """
         crMsg.textContent = 'Bet placed for this round.';
         await renderHeader();
         haveActiveBet = true;
-        placeBtn.style.display='none';
-        cashBtn.style.display=''; cashBtn.disabled = (crPhase!=='running');
+        qs('crPlace').style.display='none';
+        qs('crCashout').style.display=''; qs('crCashout').disabled = (crPhase!=='running');
       }catch(e){ crMsg.textContent = 'Error: '+e.message; }
     };
-    cashBtn.onclick = async ()=>{
-      if(cashBtn.disabled) return;
+    qs('crCashout').onclick = async ()=>{
+      if(qs('crCashout').disabled) return;
       try{
         const r = await j('/api/crash/cashout', {method:'POST'});
         crMsg.textContent = 'Cashed out at '+r.multiplier.toFixed(2)+'× • Won '+fmtDL(r.win);
         await renderHeader();
         haveActiveBet = false;
-        cashBtn.style.display = 'none';
-        placeBtn.style.display = '';
+        qs('crCashout').style.display = 'none';
+        qs('crPlace').style.display = '';
       }catch(e){ crMsg.textContent = 'Cashout failed: '+e.message; }
     };
 
@@ -1613,8 +1719,8 @@ HTML_TEMPLATE = """
         renderMinesHistory();
       }catch(err){ mMsg.textContent='Error: '+err.message; }
     }
-    mStart.onclick = minesStart;
-    mCash.onclick = minesCash;
+    qs('mStart').onclick = minesStart;
+    qs('mCash').onclick = minesCash;
 
     async function renderMines(){
       buildGrid(); updateGridReveal(); updateMinesStats();
@@ -1625,12 +1731,12 @@ HTML_TEMPLATE = """
           mMines=s.mines; mBet=s.bet;
           mHash.textContent='Commit: '+s.hash;
           mStatus.textContent='Status: Active';
-          mStart.style.display='none'; mCash.style.display=''; mCash.disabled=(countBits(mPicks)<1);
+          qs('mStart').style.display='none'; qs('mCash').style.display=''; qs('mCash').disabled=(countBits(mPicks)<1);
           updateGridReveal(); updateMinesStats();
         }else{
           mActive=false; mPicks=0; mGameId=null;
           mHash.textContent='Commit: —'; mStatus.textContent='Status: —';
-          mStart.style.display=''; mCash.style.display='none';
+          qs('mStart').style.display=''; qs('mCash').style.display='none';
           mMult.textContent='Multiplier: 1.0000×';
           mPotential.textContent='Potential: —';
           updateGridReveal(); updateMinesStats();
@@ -1638,7 +1744,7 @@ HTML_TEMPLATE = """
       }catch(e){
         mActive=false; mPicks=0; mGameId=null;
         mHash.textContent='Commit: —'; mStatus.textContent='Status: —';
-        mStart.style.display=''; mCash.style.display='none';
+        qs('mStart').style.display=''; qs('mCash').style.display='none';
         mMult.textContent='Multiplier: 1.0000×';
         mPotential.textContent='Potential: —';
       }
@@ -1739,11 +1845,7 @@ HTML_TEMPLATE = """
     setInterval(()=>{ if(pgCrash.style.display!=='none') refreshCrash(); }, 1000);
     setInterval(()=>{ if(pgCrash.style.display!=='none') pollNow(); }, 400);
 
-    // Other tabs & data
-    tabGames.onclick=()=>setTab('games');
-    tabRef.onclick=()=>{ setTab('ref'); renderReferral(); };
-    tabPromo.onclick=()=>{ setTab('promo'); renderPromos(); };
-
+    // Also render supporting pages once
     async function renderOther(){
       await renderReferral();
       await renderPromos();
@@ -1809,7 +1911,8 @@ async def callback(code: str | None = None):
                               )).json()
     resp = RedirectResponse(url="/")
     payload = {"id": str(me["id"]), "username": me.get("username", "#"), "avatar": me.get("avatar")}
-    set_session(resp, payload)
+    signer = URLSafeSerializer(SECRET_KEY, salt="session")
+    resp.set_cookie("session", signer.dumps(payload), httponly=True, samesite="lax", max_age=7*24*3600)
     return resp
 
 @app.get("/logout")
@@ -2061,14 +2164,30 @@ async def health():
     return {"ok": True}
 
 # ---------- Crash loop ----------
+@with_conn
+def maybe_start_running(cur):
+    cur.execute("SELECT id,status,betting_ends_at FROM crash_rounds ORDER BY id DESC LIMIT 1")
+    r = cur.fetchone()
+    if not r: return None
+    rid, st, bet_end = int(r[0]), str(r[1]), r[2]
+    if st != 'betting': return None
+    cur.execute("SELECT NOW() >= %s", (bet_end,))
+    if cur.fetchone()[0]:
+        begin_running(rid)
+        return rid
+    return None
+
 async def crash_loop():
     while True:
         rid, r = ensure_betting_round()
         now = now_utc()
         if r["status"] == "betting":
             wait = (r["betting_ends_at"] - now).total_seconds()
-            if wait > 0: await asyncio.sleep(min(wait, 0.5))
-            else: begin_running(rid)
+            if wait > 0:
+                await asyncio.sleep(min(wait, 0.5))
+                maybe_start_running()
+            else:
+                begin_running(rid)
         elif r["status"] == "running":
             if r["expected_end_at"]:
                 wait = (r["expected_end_at"] - now).total_seconds()

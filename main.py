@@ -1,6 +1,6 @@
 import os, json, asyncio, re, random, string, math, secrets, datetime
 from urllib.parse import urlencode
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, Dict
 
 import httpx
 import psycopg
@@ -102,7 +102,7 @@ def init_db(cur):
     """)
     cur.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS xp INTEGER NOT NULL DEFAULT 0")
 
-    # Multiplayer Crash: rounds + bets
+    # Crash: rounds + bets
     cur.execute("""
         CREATE TABLE IF NOT EXISTS crash_rounds (
             id BIGSERIAL PRIMARY KEY,
@@ -254,12 +254,11 @@ def gen_bust(edge: float = HOUSE_EDGE) -> float:
     return math.floor(B*100)/100.0
 
 def run_duration_for(bust: float) -> float:
-    # ~1.2s .. 7s depending on bust, for client animation
+    # ~1.2s .. 7s depending on bust
     return min(7.0, 1.2 + math.log(bust+1.0)*1.6)
 
 @with_conn
 def ensure_betting_round(cur) -> Tuple[int, dict]:
-    # Return current round (betting/running) or create betting if none
     cur.execute("SELECT id,status,betting_opens_at,betting_ends_at,started_at,expected_end_at,bust FROM crash_rounds ORDER BY id DESC LIMIT 1")
     r = cur.fetchone()
     now = now_utc()
@@ -281,7 +280,6 @@ def ensure_betting_round(cur) -> Tuple[int, dict]:
 
 @with_conn
 def place_bet(cur, user_id: str, bet: int, cashout: float):
-    # validate current betting round
     cur.execute("""SELECT id, betting_ends_at FROM crash_rounds
                    WHERE status='betting'
                    ORDER BY id DESC LIMIT 1""")
@@ -292,7 +290,7 @@ def place_bet(cur, user_id: str, bet: int, cashout: float):
     if not cur.fetchone()[0]:
         raise ValueError("Betting just closed")
 
-    # ensure balance & debit
+    # balance & debit
     cur.execute("INSERT INTO balances(user_id,balance) VALUES (%s,0) ON CONFLICT(user_id) DO NOTHING", (user_id,))
     cur.execute("SELECT balance FROM balances WHERE user_id=%s FOR UPDATE", (user_id,))
     bal = int(cur.fetchone()[0])
@@ -307,7 +305,6 @@ def place_bet(cur, user_id: str, bet: int, cashout: float):
                        VALUES(%s,%s,%s,%s)""",
                     (round_id, user_id, bet, float(cashout)))
     except Exception:
-        # refund if duplicate
         cur.execute("UPDATE balances SET balance=balance+%s WHERE user_id=%s", (bet, user_id))
         raise ValueError("You already placed a bet this round")
 
@@ -329,11 +326,9 @@ def load_round(cur):
 
 @with_conn
 def begin_running(cur, round_id: int):
-    # if already running/ended, no-op
     cur.execute("SELECT status FROM crash_rounds WHERE id=%s FOR UPDATE", (round_id,))
     st = cur.fetchone()
-    if not st: return None
-    if st[0] != 'betting': return None
+    if not st or st[0] != 'betting': return None
 
     bust = gen_bust(HOUSE_EDGE)
     dur = run_duration_for(bust)
@@ -347,7 +342,6 @@ def begin_running(cur, round_id: int):
 
 @with_conn
 def resolve_bets(cur, round_id: int, bust: float):
-    # credit winners, log results, add XP
     cur.execute("""SELECT user_id, bet, cashout FROM crash_bets
                    WHERE round_id=%s AND resolved=FALSE""", (round_id,))
     bets = cur.fetchall()
@@ -399,7 +393,7 @@ def your_history(cur, user_id: str, limit: int = 10):
                    ORDER BY id DESC LIMIT %s""", (user_id, limit))
     return [{"bet":int(r[0]),"cashout":float(r[1]),"bust":float(r[2]),"win":int(r[3]),"xp_gain":int(r[4]),"created_at":str(r[5])} for r in cur.fetchall()]
 
-# ---------- Global Chat (DB + helpers) ----------
+# ---------- Global Chat ----------
 @with_conn
 def chat_send(cur, user_id: str, username: str, text: str):
     text = (text or "").strip()
@@ -428,7 +422,6 @@ def chat_fetch(cur, since_id: int, limit: int = 50):
         cur.execute("""SELECT id, user_id, username, text, created_at
                        FROM chat_messages WHERE id > %s ORDER BY id ASC LIMIT %s""", (since_id, limit))
         rows = cur.fetchall()
-    # gather levels
     uids = list({r[1] for r in rows})
     levels: Dict[str, int] = {}
     if uids:
@@ -514,8 +507,8 @@ def read_session(request: Request) -> Optional[dict]:
     try: return signer.loads(raw)
     except BadSignature: return None
 
-# ---------- Frontend HTML ----------
-INDEX_HTML = f"""
+# ---------- Frontend HTML (plain string; no f-string!) ----------
+HTML_TEMPLATE = """
 <!doctype html>
 <html>
 <head>
@@ -523,66 +516,66 @@ INDEX_HTML = f"""
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>💎 DL Bank</title>
   <style>
-    :root{{ --bg:#0b1220; --card:#121a2b; --muted:#8aa0c7; --text:#e8efff; --accent:#60a5fa; --ok:#34d399; --warn:#f59e0b; --err:#ef4444; --border:#23304c; }}
-    *{{box-sizing:border-box}}
-    body{{background:linear-gradient(180deg,#0a1020,#0e1530); color:var(--text); font-family:system-ui,Segoe UI,Roboto,Arial; margin:0; min-height:100vh;}}
-    a{{color:inherit; text-decoration:none}}
-    .container{{max-width:1100px; margin:0 auto; padding:16px}}
-    .header{{position:sticky; top:0; z-index:20; background:linear-gradient(135deg,#0e1630 0%,#0a1124 100%); border-bottom:1px solid var(--border);}}
-    .header-inner{{display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 16px;}}
-    .brand{{display:flex; align-items:center; gap:10px; font-weight:800; letter-spacing:.2px}}
-    .nav{{display:flex; gap:10px; align-items:center}}
-    .tab{{padding:8px 12px; border:1px solid var(--border); border-radius:10px; background:#0f1a33; cursor:pointer}}
-    .tab.active{{background:linear-gradient(135deg,#3b82f6,#22c1dc); border-color:transparent}}
-    .right{{display:flex; gap:10px; align-items:center}}
-    .chip{{background:#0c1631; border:1px solid var(--border); color:#dce7ff; padding:6px 10px; border-radius:999px; font-size:12px; white-space:nowrap; cursor:pointer}}
-    .avatar{{width:28px;height:28px;border-radius:50%;object-fit:cover;border:1px solid var(--border); cursor:pointer}}
-    .btn{{display:inline-flex; align-items:center; gap:8px; padding:8px 12px; border-radius:10px; border:1px solid var(--border); background:#0f1a33; cursor:pointer}}
-    .btn.primary{{background:linear-gradient(135deg,#3b82f6,#22c1dc); border-color:transparent}}
-    .grid{{display:grid; gap:16px; grid-template-columns:1fr}}
-    @media(min-width:1000px){{.grid{{grid-template-columns:1fr 1fr}}}}
-    .card{{background:var(--card); border:1px solid var(--border); border-radius:16px; padding:16px}}
-    .label{{color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.1em}}
-    .big{{font-size:28px; font-weight:800}}
-    .muted{{color:var(--muted)}}
-    input{{width:100%; background:#0e1833; color:#e8efff; border:1px solid var(--border); border-radius:10px; padding:10px}}
-    .game-card{{background:#0f1a33;border:1px solid var(--border);border-radius:16px;padding:14px;cursor:pointer;transition:transform .08s ease}}
-    .game-card:hover{{transform:translateY(-2px)}}
-    .owner{{margin-top:16px; border-top:1px dashed var(--border); padding-top:12px}}
+    :root{ --bg:#0b1220; --card:#121a2b; --muted:#8aa0c7; --text:#e8efff; --accent:#60a5fa; --ok:#34d399; --warn:#f59e0b; --err:#ef4444; --border:#23304c; }
+    *{box-sizing:border-box}
+    body{background:linear-gradient(180deg,#0a1020,#0e1530); color:var(--text); font-family:system-ui,Segoe UI,Roboto,Arial; margin:0; min-height:100vh;}
+    a{color:inherit; text-decoration:none}
+    .container{max-width:1100px; margin:0 auto; padding:16px}
+    .header{position:sticky; top:0; z-index:20; background:linear-gradient(135deg,#0e1630 0%,#0a1124 100%); border-bottom:1px solid var(--border);}
+    .header-inner{display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 16px;}
+    .brand{display:flex; align-items:center; gap:10px; font-weight:800; letter-spacing:.2px}
+    .nav{display:flex; gap:10px; align-items:center}
+    .tab{padding:8px 12px; border:1px solid var(--border); border-radius:10px; background:#0f1a33; cursor:pointer}
+    .tab.active{background:linear-gradient(135deg,#3b82f6,#22c1dc); border-color:transparent}
+    .right{display:flex; gap:10px; align-items:center}
+    .chip{background:#0c1631; border:1px solid var(--border); color:#dce7ff; padding:6px 10px; border-radius:999px; font-size:12px; white-space:nowrap; cursor:pointer}
+    .avatar{width:28px;height:28px;border-radius:50%;object-fit:cover;border:1px solid var(--border); cursor:pointer}
+    .btn{display:inline-flex; align-items:center; gap:8px; padding:8px 12px; border-radius:10px; border:1px solid var(--border); background:#0f1a33; cursor:pointer}
+    .btn.primary{background:linear-gradient(135deg,#3b82f6,#22c1dc); border-color:transparent}
+    .grid{display:grid; gap:16px; grid-template-columns:1fr}
+    @media(min-width:1000px){.grid{grid-template-columns:1fr 1fr}}
+    .card{background:var(--card); border:1px solid var(--border); border-radius:16px; padding:16px}
+    .label{color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.1em}
+    .big{font-size:28px; font-weight:800}
+    .muted{color:var(--muted)}
+    input{width:100%; background:#0e1833; color:#e8efff; border:1px solid var(--border); border-radius:10px; padding:10px}
+    .game-card{background:#0f1a33;border:1px solid var(--border);border-radius:16px;padding:14px;cursor:pointer;transition:transform .08s ease}
+    .game-card:hover{transform:translateY(-2px)}
+    .owner{margin-top:16px; border-top:1px dashed var(--border); padding-top:12px}
 
     /* Crash page */
-    .crash-wrap{{display:flex; flex-direction:column; gap:10px}}
-    .cr-row{{display:grid; grid-template-columns:1fr 1fr; gap:12px}}
-    .cr-line{{position:relative; height:18px; background:#0e1833; border:1px solid var(--border); border-radius:999px; overflow:hidden}}
-    .cr-fill{{position:absolute; left:0; top:0; bottom:0; width:0%; background:linear-gradient(90deg,#22c1dc,#3b82f6)}}
-    .cr-marker{{position:absolute; top:-6px; width:2px; height:30px; background:#f59e0b; opacity:.9}}
-    .cr-marker.bust{{background:#ef4444}}
-    .cr-head{{display:flex; align-items:center; gap:10px}}
-    .cr-multi{{font-size:28px; font-weight:900}}
-    .cr-small{{font-size:12px; color:var(--muted)}}
-    table{{width:100%; border-collapse:collapse; margin-top:10px}}
-    th,td{{border-bottom:1px solid var(--border); padding:8px 6px; text-align:left}}
-    .win{{color:#34d399}}
-    .lose{{color:#ef4444}}
-    .bust-bad{{color:#ef4444; font-weight:700}}
-    .bust-good{{color:#34d399; font-weight:700}}
+    .crash-wrap{display:flex; flex-direction:column; gap:10px}
+    .cr-row{display:grid; grid-template-columns:1fr 1fr; gap:12px}
+    .cr-line{position:relative; height:18px; background:#0e1833; border:1px solid var(--border); border-radius:999px; overflow:hidden}
+    .cr-fill{position:absolute; left:0; top:0; bottom:0; width:0%; background:linear-gradient(90deg,#22c1dc,#3b82f6)}
+    .cr-marker{position:absolute; top:-6px; width:2px; height:30px; background:#f59e0b; opacity:.9}
+    .cr-marker.bust{background:#ef4444}
+    .cr-head{display:flex; align-items:center; gap:10px}
+    .cr-multi{font-size:28px; font-weight:900}
+    .cr-small{font-size:12px; color:var(--muted)}
+    table{width:100%; border-collapse:collapse; margin-top:10px}
+    th,td{border-bottom:1px solid var(--border); padding:8px 6px; text-align:left}
+    .win{color:#34d399}
+    .lose{color:#ef4444}
+    .bust-bad{color:#ef4444; font-weight:700}
+    .bust-good{color:#34d399; font-weight:700}
 
     /* Modal */
-    .modal{{position:fixed; inset:0; background:rgba(0,0,0,.6); display:none; align-items:center; justify-content:center; padding:20px; z-index:30}}
-    .modal .box{{background:#0f1a33; border:1px solid var(--border); border-radius:16px; padding:16px; max-width:520px; width:100%}}
+    .modal{position:fixed; inset:0; background:rgba(0,0,0,.6); display:none; align-items:center; justify-content:center; padding:20px; z-index:30}
+    .modal .box{background:#0f1a33; border:1px solid var(--border); border-radius:16px; padding:16px; max-width:520px; width:100%}
 
     /* Chat drawer */
-    .chat-drawer{{position:fixed; top:64px; right:0; width:340px; max-width:90vw; bottom:0; background:#0f1a33; border-left:1px solid var(--border); transform:translateX(100%); transition:transform .18s ease; z-index:25; display:flex; flex-direction:column}}
-    .chat-drawer.open{{transform:translateX(0)}}
-    .chat-head{{display:flex; align-items:center; justify-content:space-between; padding:10px 12px; border-bottom:1px solid var(--border)}}
-    .chat-body{{flex:1; overflow-y:auto; padding:10px 12px; display:flex; flex-direction:column; gap:8px}}
-    .chat-input{{padding:10px 12px; border-top:1px solid var(--border); display:flex; gap:8px}}
-    .msg{{background:#0e1833; border:1px solid var(--border); border-radius:12px; padding:8px}}
-    .msghead{{display:flex; gap:6px; align-items:center; font-size:13px}}
-    .lvl{{font-size:12px; color:#8aa0c7}}
-    .time{{margin-left:auto; font-size:11px; color:#8aa0c7}}
-    .txt{{margin-top:4px; font-size:14px; white-space:pre-wrap; word-break:break-word}}
-    .disabled-note{{font-size:12px; color:#8aa0c7; padding:0 12px 10px}}
+    .chat-drawer{position:fixed; top:64px; right:0; width:340px; max-width:90vw; bottom:0; background:#0f1a33; border-left:1px solid var(--border); transform:translateX(100%); transition:transform .18s ease; z-index:25; display:flex; flex-direction:column}
+    .chat-drawer.open{transform:translateX(0)}
+    .chat-head{display:flex; align-items:center; justify-content:space-between; padding:10px 12px; border-bottom:1px solid var(--border)}
+    .chat-body{flex:1; overflow-y:auto; padding:10px 12px; display:flex; flex-direction:column; gap:8px}
+    .chat-input{padding:10px 12px; border-top:1px solid var(--border); display:flex; gap:8px}
+    .msg{background:#0e1833; border:1px solid var(--border); border-radius:12px; padding:8px}
+    .msghead{display:flex; gap:6px; align-items:center; font-size:13px}
+    .lvl{font-size:12px; color:#8aa0c7}
+    .time{margin-left:auto; font-size:11px; color:#8aa0c7}
+    .txt{margin-top:4px; font-size:14px; white-space:pre-wrap; word-break:break-word}
+    .disabled-note{font-size:12px; color:#8aa0c7; padding:0 12px 10px}
   </style>
 </head>
 <body>
@@ -734,7 +727,7 @@ INDEX_HTML = f"""
     </div>
   </div>
 
-  <!-- Modal (deposit/withdraw info) -->
+  <!-- Modal -->
   <div class="modal" id="modal">
     <div class="box">
       <div style="display:flex; justify-content:space-between; align-items:center; gap:10px">
@@ -772,7 +765,7 @@ INDEX_HTML = f"""
 
     function fmtDL(n){ return `💎 ${Number(n).toLocaleString()} DL`; }
     async function j(u, opt={}){ const r=await fetch(u, Object.assign({credentials:'include'},opt)); if(!r.ok) throw new Error(await r.text()); return r.json(); }
-    function esc(s){ return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+    function esc(s){ return s.replace(/[&<>\"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
     function setTab(which){
       [tabGames,tabRef,tabPromo].forEach(t=>t.classList.remove('active'));
@@ -848,7 +841,7 @@ INDEX_HTML = f"""
           </div>
         `;
         const ownerPanel = qs('ownerPanel');
-        if(me.id === '{OWNER_ID}'){ ownerPanel.style.display=''; }
+        if(me.id === '__OWNER_ID__'){ ownerPanel.style.display=''; }
         else ownerPanel.style.display='none';
       }catch(e){}
     }
@@ -918,11 +911,9 @@ INDEX_HTML = f"""
     async function refreshCrash(){
       try{
         const s = await j('/api/crash/state');
-        // last 15 busts
         lastBustsEl().innerHTML = s.last_busts.length
           ? s.last_busts.map(v=>`<span class="chip2 ${v<2?'bust-bad':'bust-good'}">${v.toFixed(2)}×</span>`).join('')
           : 'No history yet.';
-        // your bet info
         if(s.your_bet){ crMsgEl().textContent = `Your bet: ${fmtDL(s.your_bet.bet)} @ ${s.your_bet.cashout.toFixed(2)}×`; }
         else crMsgEl().textContent = '';
 
@@ -931,7 +922,7 @@ INDEX_HTML = f"""
           crNow().textContent = '1.00×';
           const left = Math.max(0, Math.round((Date.parse(s.betting_ends_at) - Date.now())/1000));
           crHint().textContent = `Betting open — closes in ${left}s`;
-          setMarkers(parseFloat(document.getElementById('crCash').value||'2'), 2); // temp markers
+          setMarkers(parseFloat(document.getElementById('crCash').value||'2'), 2);
         } else if(s.phase==='running'){
           resetLine();
           crHint().textContent = 'Round running…';
@@ -956,7 +947,7 @@ INDEX_HTML = f"""
         if(Number.isNaN(cash) || cash < 1.01) throw new Error('Cashout goal must be at least 1.01×.');
         await j('/api/crash/bet', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({bet, cashout: cash})});
         crMsgEl().textContent = 'Bet placed for this round.';
-        renderHeader(); // update header balance
+        renderHeader();
       }catch(e){ crMsgEl().textContent = 'Error: '+e.message; }
     };
 
@@ -965,7 +956,6 @@ INDEX_HTML = f"""
       await renderReferral();
       await renderPromos();
       await renderProfile();
-      // My crash history
       try{
         const h = await j('/api/game/crash/history');
         document.getElementById('crLast').innerHTML = h.rows.length
@@ -1024,14 +1014,17 @@ INDEX_HTML = f"""
     }
 
     async function updateChatGate(){
-      // determine login + level
       try{
         await j('/api/me');
-        isLogged = true;
+        isLogged = True;
+      }catch(e){
+        isLogged = false;
+      }
+      if(isLogged){
         const prof = await j('/api/profile');
         myLevel = prof.level || 1;
-      }catch(e){
-        isLogged = false; myLevel = 0;
+      }else{
+        myLevel = 0;
       }
       const canSend = isLogged && myLevel >= 5;
       chatText.disabled = !canSend;
@@ -1085,7 +1078,10 @@ INDEX_HTML = f"""
   </script>
 </body>
 </html>
-""".replace("{OWNER_ID}", str(OWNER_ID))
+"""
+
+# Build final HTML (inject owner id)
+INDEX_HTML = HTML_TEMPLATE.replace("__OWNER_ID__", str(OWNER_ID))
 
 # ----- Routes -----
 @app.get("/", response_class=HTMLResponse)
@@ -1307,24 +1303,19 @@ async def health():
 
 # ---------- Crash round loop ----------
 async def crash_loop():
-    # Keep shared rounds going forever
     while True:
         rid, r = ensure_betting_round()
         now = now_utc()
 
         if r["status"] == "betting":
-            # wait until betting end or trigger start if past
             wait = (r["betting_ends_at"] - now).total_seconds()
             if wait > 0:
-                await asyncio.sleep(min(wait, 1.0))  # small ticks to re-check
+                await asyncio.sleep(min(wait, 1.0))
             else:
-                # move to running
                 begin = begin_running(rid)
                 if begin:
-                    # resolve immediately (credit winners), but keep UI "running" until expected_end_at
                     resolve_bets(rid, begin["bust"])
         elif r["status"] == "running":
-            # sleep until expected_end_at, then mark ended and create next round
             if r["expected_end_at"]:
                 wait = (r["expected_end_at"] - now).total_seconds()
                 if wait > 0:
@@ -1334,11 +1325,10 @@ async def crash_loop():
                     create_next_betting()
                     await asyncio.sleep(0.5)
             else:
-                # safety: if expected_end_at missing, end immediately
                 finish_round(rid)
                 create_next_betting()
                 await asyncio.sleep(0.5)
-        else:  # ended
+        else:
             create_next_betting()
             await asyncio.sleep(0.5)
 

@@ -1360,7 +1360,6 @@ HTML_TEMPLATE = """
       }catch(e){}
     }
 
-    const placeBtn = qs('crPlace'); const cashBtn = qs('crCashout');
     placeBtn.onclick = async ()=>{
       try{
         const bet = parseFloat(document.getElementById('crBet').value);
@@ -1567,7 +1566,7 @@ HTML_TEMPLATE = """
       }catch(e){}
     }
     async function updateChatGate(){
-      try{ await j('/api/me'); isLogged = true; }catch(e){ isLogged = false; }
+      try{ await j('/api/me'); isLogged = True; }catch(e){ isLogged = false; }
       if(isLogged){
         const prof = await j('/api/profile'); myLevel = prof.level || 1;
       }else{ myLevel = 0; }

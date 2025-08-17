@@ -1,4 +1,4 @@
-import os, json, asyncio, re, random, string
+import os, json, asyncio, re, random, string, math
 from urllib.parse import urlencode
 from typing import Optional
 
@@ -80,15 +80,18 @@ def init_db(cur):
             PRIMARY KEY(user_id, code)
         )
     """)
-    # profiles (unique referral name)
+    # profiles (unique referral name + XP)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS profiles (
             user_id TEXT PRIMARY KEY,
             display_name TEXT NOT NULL,
             name_lower TEXT NOT NULL UNIQUE,
+            xp INTEGER NOT NULL DEFAULT 0,
             created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    # in case an older table exists without xp, add it
+    cur.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS xp INTEGER NOT NULL DEFAULT 0")
 
 @with_conn
 def get_balance(cur, user_id: str) -> int:
@@ -180,11 +183,17 @@ def create_promo(cur, actor_id: str, code: Optional[str], amount: int, max_uses:
     """, (code, amount, max_uses, expires_at, actor_id))
     return {"ok": True, "code": code}
 
-# ---- Profiles (referral name) ----
+# ---- Profiles (referral name + XP/level) ----
 NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{3,20}$")
 
 @with_conn
 def get_profile(cur, user_id: str):
+    cur.execute("SELECT display_name, xp FROM profiles WHERE user_id = %s", (user_id,))
+    row = cur.fetchone()
+    return {"display_name": row[0], "xp": int(row[1])} if row else None
+
+@with_conn
+def get_profile_name(cur, user_id: str):
     cur.execute("SELECT display_name FROM profiles WHERE user_id = %s", (user_id,))
     row = cur.fetchone()
     return row[0] if row else None
@@ -205,6 +214,25 @@ def set_profile_name(cur, user_id: str, name: str):
         DO UPDATE SET display_name = EXCLUDED.display_name, name_lower = EXCLUDED.name_lower
     """, (user_id, name, name_lower))
     return {"ok": True, "name": name}
+
+@with_conn
+def ensure_profile_row(cur, user_id: str):
+    # create a minimal row if missing (with placeholder name to avoid nulls)
+    cur.execute("INSERT INTO profiles(user_id, display_name, name_lower) VALUES (%s, %s, %s) ON CONFLICT (user_id) DO NOTHING",
+                (user_id, f"user_{user_id[-4:]}", f"user_{user_id[-4:]}"))
+    cur.execute("SELECT display_name, xp FROM profiles WHERE user_id = %s", (user_id,))
+    r = cur.fetchone()
+    return {"display_name": r[0], "xp": int(r[1])}
+
+def xp_to_level(xp: int):
+    # Simple: every 100 XP = +1 level, starting at level 1
+    level = 1 + (xp // 100)
+    base = (level - 1) * 100
+    next_at = level * 100
+    progress = xp - base
+    needed = next_at - base
+    pct = 0 if needed == 0 else int(progress * 100 / needed)
+    return {"level": int(level), "xp": int(xp), "progress": int(progress), "next_needed": int(needed), "pct": pct}
 
 # ---------- Helpers ----------
 def parse_user_identifier(identifier: str) -> Optional[str]:
@@ -288,7 +316,7 @@ def read_session(request: Request) -> dict | None:
     try: return signer.loads(raw)
     except BadSignature: return None
 
-# ---- HTML (tabs, header with balance+avatar; no escaped backticks) ----
+# ---- HTML (tabs + profile page + modal for balance click) ----
 INDEX_HTML = """
 <!doctype html>
 <html>
@@ -309,8 +337,8 @@ INDEX_HTML = """
     .tab{padding:8px 12px; border:1px solid var(--border); border-radius:10px; background:#0f1a33; cursor:pointer}
     .tab.active{background:linear-gradient(135deg,#3b82f6,#22c1dc); border-color:transparent}
     .right{display:flex; gap:10px; align-items:center}
-    .chip{background:#0c1631; border:1px solid var(--border); color:#dce7ff; padding:6px 10px; border-radius:999px; font-size:12px; white-space:nowrap}
-    .avatar{width:28px;height:28px;border-radius:50%;object-fit:cover;border:1px solid var(--border)}
+    .chip{background:#0c1631; border:1px solid var(--border); color:#dce7ff; padding:6px 10px; border-radius:999px; font-size:12px; white-space:nowrap; cursor:pointer}
+    .avatar{width:28px;height:28px;border-radius:50%;object-fit:cover;border:1px solid var(--border); cursor:pointer}
     .btn{display:inline-flex; align-items:center; gap:8px; padding:8px 12px; border-radius:10px; border:1px solid var(--border); background:#0f1a33; cursor:pointer}
     .btn.primary{background:linear-gradient(135deg,#3b82f6,#22c1dc); border-color:transparent}
     .grid{display:grid; gap:16px; grid-template-columns:1fr}
@@ -321,12 +349,17 @@ INDEX_HTML = """
     table{width:100%; border-collapse:collapse; margin-top:10px}
     th,td{border-bottom:1px solid var(--border); padding:8px 6px; text-align:left}
     .muted{color:var(--muted)}
-    input{width:100%; background:#0e1833; color:var(--text); border:1px solid var(--border); border-radius:10px; padding:10px}
+    input{width:100%; background:#0e1833; color:#e8efff; border:1px solid var(--border); border-radius:10px; padding:10px}
     .games-grid{display:grid; gap:12px; grid-template-columns:1fr; margin-top:16px}
     @media(min-width:800px){.games-grid{grid-template-columns:repeat(3,1fr)}}
     .game{background:#0f1a33;border:1px solid var(--border);border-radius:16px;padding:14px}
     .banner{font-weight:900; font-size:18px}
     .owner{margin-top:16px; border-top:1px dashed var(--border); padding-top:12px}
+    .xpbar{height:10px; background:#0e1833; border:1px solid var(--border); border-radius:999px; overflow:hidden}
+    .xpfill{height:100%; background:linear-gradient(90deg,#22c1dc,#3b82f6)}
+    /* Modal */
+    .modal{position:fixed; inset:0; background:rgba(0,0,0,.6); display:none; align-items:center; justify-content:center; padding:20px}
+    .modal .box{background:#0f1a33; border:1px solid var(--border); border-radius:16px; padding:16px; max-width:520px; width:100%}
   </style>
 </head>
 <body>
@@ -378,9 +411,28 @@ INDEX_HTML = """
             <div id="myCodes" class="muted">—</div>
           </div>
         </div>
+      </div>
+    </div>
 
-        <div id="ownerPromoBox" class="owner" style="display:none">
-          <div class="label">Owner — Create Promo Code</div>
+    <!-- Profile page -->
+    <div id="page-profile" style="display:none">
+      <div class="card">
+        <div class="label">Profile</div>
+        <div id="profileBox">Loading…</div>
+
+        <div id="ownerPanel" class="owner" style="display:none">
+          <div class="label">Owner Panel</div>
+          <!-- Adjust balance -->
+          <div class="grid" style="grid-template-columns:2fr 1fr 2fr auto; gap:8px">
+            <div><div class="label">Discord ID or &lt;@mention&gt;</div><input id="tIdent" placeholder="ID or <@id>"/></div>
+            <div><div class="label">Amount (+/- DL)</div><input id="tAmt" type="number" placeholder="10 or -5"/></div>
+            <div><div class="label">Reason (optional)</div><input id="tReason" placeholder="promo/correction/prize"/></div>
+            <div style="align-self:end"><button class="btn primary" id="tApply">Apply</button></div>
+          </div>
+          <div id="tMsg" class="muted" style="margin-top:8px"></div>
+
+          <!-- Create promo -->
+          <div class="label" style="margin-top:12px">Create Promo Code</div>
           <div class="grid" style="grid-template-columns:1fr 1fr 1fr; gap:8px">
             <div><div class="label">Code (optional)</div><input id="cCode" placeholder="auto-generate if empty"/></div>
             <div><div class="label">Amount (DL)</div><input id="cAmount" type="number" placeholder="e.g. 10"/></div>
@@ -406,20 +458,35 @@ INDEX_HTML = """
     </div>
   </div>
 
+  <!-- Modal -->
+  <div class="modal" id="modal">
+    <div class="box">
+      <div style="display:flex; justify-content:space-between; align-items:center; gap:10px">
+        <div class="big">Balance — How to Deposit / Withdraw</div>
+        <button class="btn" id="mClose">Close</button>
+      </div>
+      <div class="muted" style="margin-top:8px">
+        <p><b>Deposit:</b> Join our Discord and type <code>.deposit</code> in the <i>#deposit</i> channel.</p>
+        <p><b>Withdraw:</b> In Discord type <code>.withdraw</code>. (We’ll wire this up later.)</p>
+      </div>
+    </div>
+  </div>
+
   <script>
     function qs(id){return document.getElementById(id)}
     const tabGames = qs('tab-games'), tabRef=qs('tab-ref'), tabPromo=qs('tab-promo');
-    const pgGames=qs('page-games'), pgRef=qs('page-ref'), pgPromo=qs('page-promo'), loginCard=qs('loginCard');
+    const pgGames=qs('page-games'), pgRef=qs('page-ref'), pgPromo=qs('page-promo'), loginCard=qs('loginCard'), pgProfile=qs('page-profile');
 
     function fmtDL(n){ return `💎 ${Number(n).toLocaleString()} DL`; }
     async function j(u, opt={}){ const r=await fetch(u, Object.assign({credentials:'include'},opt)); if(!r.ok) throw new Error(await r.text()); return r.json(); }
 
     function setTab(which){
       [tabGames,tabRef,tabPromo].forEach(t=>t.classList.remove('active'));
-      [pgGames,pgRef,pgPromo].forEach(p=>p.style.display='none');
+      [pgGames,pgRef,pgPromo,pgProfile].forEach(p=>p.style.display='none');
       if(which==='games'){ tabGames.classList.add('active'); pgGames.style.display=''; }
       if(which==='ref'){ tabRef.classList.add('active'); pgRef.style.display=''; }
       if(which==='promo'){ tabPromo.classList.add('active'); pgPromo.style.display=''; }
+      if(which==='profile'){ pgProfile.style.display=''; }
       window.scrollTo({top:0, behavior:'smooth'});
     }
     tabGames.onclick=()=>setTab('games');
@@ -432,28 +499,38 @@ INDEX_HTML = """
       info.style.display = info.style.display ? '' : 'block';
     });
 
-    function safeAvatar(me){
-      return me.avatar_url || '';
-    }
+    // modal
+    function openModal(){ qs('modal').style.display='flex'; }
+    function closeModal(){ qs('modal').style.display='none'; }
+    qs('mClose').onclick = closeModal;
+    qs('modal').addEventListener('click', (e)=>{ if(e.target.id==='modal') closeModal(); });
+
+    function safeAvatar(me){ return me.avatar_url || ''; }
 
     async function render(){
       const auth = qs('authArea');
       try{
         const me = await j('/api/me');          // includes avatar_url
         const bal = await j('/api/balance');
+
         auth.innerHTML = `
-          <span class="chip">${fmtDL(bal.balance)}</span>
-          <img class="avatar" src="${safeAvatar(me)}" title="${me.username}" onerror="this.style.display='none'">
+          <span class="chip" id="balanceBtn">${fmtDL(bal.balance)}</span>
+          <img class="avatar" id="avatarBtn" src="${safeAvatar(me)}" title="${me.username}" onerror="this.style.display='none'">
         `;
         loginCard.style.display='none';
 
-        // REFERRAL: state + claim
-        const ref = await j('/api/referral/state');
-        if(ref.name){
+        // Balance click → modal
+        qs('balanceBtn').onclick = openModal;
+        // Avatar click → profile tab
+        qs('avatarBtn').onclick = ()=>setTab('profile');
+
+        // ---- REFERRAL tab content ----
+        const refState = await j('/api/referral/state');
+        if(refState.name){
           const base = location.origin;
-          const link = base + '/?ref=' + encodeURIComponent(ref.name);
+          const link = base + '/?ref=' + encodeURIComponent(refState.name);
           qs('refContent').innerHTML = `
-            <p>Your referral name: <b>${ref.name}</b></p>
+            <p>Your referral name: <b>${refState.name}</b></p>
             <p>Share this link:</p>
             <p><code>${link}</code></p>
           `;
@@ -468,25 +545,72 @@ INDEX_HTML = """
           `;
           qs('claimBtn').onclick = async ()=>{
             const name = qs('refName').value.trim();
-            const msg = qs('refMsg');
-            msg.textContent='';
+            const msg = qs('refMsg'); msg.textContent='';
             try{
               const r = await j('/api/profile/set_name', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name})});
               msg.textContent = 'Saved. Your link: ' + location.origin + '/?ref=' + encodeURIComponent(r.name);
-              render();
             }catch(e){ msg.textContent = 'Error: ' + e.message; }
           };
         }
 
-        // PROMO: my redemptions
+        // ---- PROMO tab (my redemptions) ----
         const mine = await j('/api/promo/my');
         qs('myCodes').innerHTML = mine.rows.length
           ? '<ul>' + mine.rows.map(r=>`<li><code>${r.code}</code> — ${new Date(r.redeemed_at).toLocaleString()}</li>`).join('') + '</ul>'
           : 'No redemptions yet.';
 
-        // Owner promo creator
+        // ---- PROFILE page ----
+        const prof = await j('/api/profile');
+        const lvl = prof.level;
+        const pct = Math.max(0, Math.min(100, prof.progress_pct));
+        const avatar = safeAvatar(me);
+        qs('profileBox').innerHTML = `
+          <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap">
+            <img src="${avatar}" class="avatar" style="width:56px; height:56px">
+            <div>
+              <div class="big">${me.username}</div>
+              <div class="muted">ID: ${me.id}</div>
+            </div>
+            <div style="margin-left:auto; display:flex; gap:8px; align-items:center">
+              <a class="btn" href="/logout">Logout</a>
+            </div>
+          </div>
+
+          <div class="grid" style="margin-top:12px">
+            <div class="card" style="padding:12px">
+              <div class="label">Balance</div>
+              <div class="big">${fmtDL(prof.balance)}</div>
+              <div class="muted" style="margin-top:6px">Click your balance in the header for Deposit/Withdraw instructions.</div>
+            </div>
+            <div class="card" style="padding:12px">
+              <div class="label">Level</div>
+              <div><b>Level ${lvl}</b> — XP ${prof.xp} / ${((lvl-1)*100)+100}</div>
+              <div class="xpbar" style="margin-top:8px"><div class="xpfill" style="width:${pct}%;"></div></div>
+              <div class="muted" style="margin-top:6px">${prof.progress}/${prof.next_needed} XP to next level</div>
+            </div>
+          </div>
+        `;
+
+        // Owner panel (on Profile)
         if (me.id === 'OWNER_PLACEHOLDER') {
-          const box = qs('ownerPromoBox'); box.style.display='';
+          const box = qs('ownerPanel'); box.style.display='';
+          // Adjust balance
+          qs('tApply').onclick = async ()=>{
+            const ident = qs('tIdent').value.trim();
+            const amt = parseInt(qs('tAmt').value, 10);
+            const reason = qs('tReason').value.trim();
+            const msg = qs('tMsg'); msg.textContent='';
+            try{
+              if(!ident) throw new Error('Enter a user id or <@mention>');
+              if(Number.isNaN(amt) || amt === 0) throw new Error('Amount must be non-zero');
+              const res = await j('/api/admin/adjust', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({identifier: ident, amount: amt, reason})});
+              msg.textContent = 'OK — new balance: ' + fmtDL(res.new_balance);
+              qs('tAmt').value=''; qs('tReason').value='';
+              // If you adjusted yourself, refresh profile numbers
+              try { render(); } catch(e){}
+            }catch(e){ msg.textContent = 'Error: ' + e.message; }
+          };
+          // Create promo
           qs('cMake').onclick = async ()=>{
             const c = qs('cCode').value.trim();
             const a = parseInt(qs('cAmount').value, 10);
@@ -501,7 +625,26 @@ INDEX_HTML = """
             }catch(e){ msg.textContent = 'Error: ' + e.message; }
           };
         } else {
-          qs('ownerPromoBox').style.display='none';
+          qs('ownerPanel').style.display='none';
+        }
+
+        // Redeem button hookup
+        const redeemBtn = document.getElementById('redeemBtn');
+        if(redeemBtn){
+          redeemBtn.onclick = async ()=>{
+            const code = document.getElementById('promoInput').value.trim();
+            const msg = document.getElementById('promoMsg');
+            msg.textContent = '';
+            if(!code){ msg.textContent = 'Enter a code.'; return; }
+            try{
+              const res = await j('/api/promo/redeem', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({code})});
+              msg.textContent = 'Success! New balance: ' + fmtDL(res.new_balance);
+              document.getElementById('promoInput').value='';
+              render();
+            }catch(e){
+              msg.textContent = 'Error: ' + e.message;
+            }
+          };
         }
 
       }catch(e){
@@ -517,27 +660,6 @@ INDEX_HTML = """
         };
       }
     }
-
-    // redeem promo
-    document.addEventListener('DOMContentLoaded', ()=>{
-      const redeemBtn = document.getElementById('redeemBtn');
-      if(redeemBtn){
-        redeemBtn.onclick = async ()=>{
-          const code = document.getElementById('promoInput').value.trim();
-          const msg = document.getElementById('promoMsg');
-          msg.textContent = '';
-          if(!code){ msg.textContent = 'Enter a code.'; return; }
-          try{
-            const res = await j('/api/promo/redeem', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({code})});
-            msg.textContent = 'Success! New balance: ' + fmtDL(res.new_balance);
-            document.getElementById('promoInput').value='';
-            render();
-          }catch(e){
-            msg.textContent = 'Error: ' + e.message;
-          }
-        };
-      }
-    });
 
     render();
   </script>
@@ -615,7 +737,7 @@ class SetNameBody(BaseModel):
 async def api_ref_state(request: Request):
     user = read_session(request)
     if not user: raise HTTPException(401, "Not logged in")
-    name = get_profile(str(user["id"]))
+    name = get_profile_name(str(user["id"]))
     return {"name": name}
 
 @app.post("/api/profile/set_name")
@@ -627,6 +749,25 @@ async def api_set_name(request: Request, body: SetNameBody):
         return res
     except ValueError as e:
         raise HTTPException(400, str(e))
+
+@app.get("/api/profile")
+async def api_profile(request: Request):
+    user = read_session(request)
+    if not user: raise HTTPException(401, "Not logged in")
+    uid = str(user["id"])
+    # ensure a row so XP exists
+    info = ensure_profile_row(uid)
+    lvl = xp_to_level(info["xp"])
+    return {
+        "user_id": uid,
+        "display_name": info["display_name"],
+        "xp": info["xp"],
+        "level": lvl["level"],
+        "progress": lvl["progress"],
+        "next_needed": lvl["next_needed"],
+        "progress_pct": lvl["pct"],
+        "balance": get_balance(uid),
+    }
 
 # ----- Promo endpoints -----
 class RedeemBody(BaseModel):
@@ -650,7 +791,12 @@ async def api_promo_redeem(request: Request, body: RedeemBody):
     except PromoExpired as e: raise HTTPException(400, str(e))
     except PromoExhausted as e: raise HTTPException(400, str(e))
 
-# ----- Owner: create promo -----
+# ----- Owner: adjust balance & create promo -----
+class AdjustBody(BaseModel):
+    identifier: str
+    amount: int
+    reason: Optional[str] = None
+
 class CreatePromoBody(BaseModel):
     code: Optional[str] = None
     amount: int
@@ -663,36 +809,21 @@ def require_owner(request: Request):
     if str(user["id"]) != str(OWNER_ID): raise HTTPException(403, "Owner only")
     return user
 
+@app.post("/api/admin/adjust")
+async def api_admin_adjust(request: Request, body: AdjustBody):
+    actor = require_owner(request)
+    user_id = parse_user_identifier(body.identifier)
+    if not user_id: raise HTTPException(400, "Invalid identifier (use raw ID or <@mention>)")
+    if body.amount == 0: raise HTTPException(400, "Amount cannot be zero")
+    new_balance = adjust_balance(str(actor["id"]), user_id, int(body.amount), body.reason)
+    return {"user_id": user_id, "new_balance": new_balance}
+
 @app.post("/api/admin/promo/create")
 async def api_admin_promo_create(request: Request, body: CreatePromoBody):
     require_owner(request)
     if body.amount == 0: raise HTTPException(400, "Amount cannot be zero")
     if body.max_uses < 1: raise HTTPException(400, "Max uses must be >= 1")
     return create_promo(str(OWNER_ID), body.code, int(body.amount), int(body.max_uses), body.expires_at)
-
-# (optional) Member search endpoint still available if you need it later
-@app.get("/api/admin/members")
-async def api_admin_members(request: Request, q: str = Query("", description="Search after @ (optional)")):
-    require_owner(request)
-    if not GUILD_ID: raise HTTPException(400, "GUILD_ID not set")
-    guild = bot.get_guild(GUILD_ID)
-    if not guild: raise HTTPException(400, "Guild not found or bot not in guild")
-    members = []
-    try:
-        if q:
-            try:
-                found = await guild.search_members(q, limit=10)
-            except Exception:
-                found = []
-        else:
-            found = list(guild.members)[:10]
-        for m in found:
-            try: avatar = m.display_avatar.url
-            except Exception: avatar = None
-            members.append({"id": str(m.id), "username": m.name, "display_name": m.display_name, "avatar": avatar})
-    except Exception:
-        members = []
-    return {"members": members}
 
 @app.get("/health")
 async def health():

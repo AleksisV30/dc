@@ -128,7 +128,6 @@ def init_db(cur):
             PRIMARY KEY(round_id, user_id)
         )
     """)
-    # ensure new columns exist if migrating
     cur.execute("ALTER TABLE crash_bets ADD COLUMN IF NOT EXISTS cashed_out NUMERIC(8,2)")
     cur.execute("ALTER TABLE crash_bets ADD COLUMN IF NOT EXISTS cashed_out_at TIMESTAMPTZ")
     cur.execute("ALTER TABLE crash_bets ADD COLUMN IF NOT EXISTS resolved BOOLEAN NOT NULL DEFAULT FALSE")
@@ -249,20 +248,16 @@ def create_promo(cur, actor_id: str, code: Optional[str], amount: int, max_uses:
     """, (code, amount, max_uses, expires_at, actor_id))
     return {"ok": True, "code": code}
 
-# ---- Crash math & DB (multiplayer) ----
+# ---- Crash math & DB ----
 def _u(): return (secrets.randbelow(1_000_000_000)+1)/1_000_000_001.0
 def gen_bust(edge: float = HOUSE_EDGE) -> float:
-    # P(B>=x) = (1-edge)/x
     u = _u(); B = max(1.0, (1.0-edge)/u)
     return math.floor(B*100)/100.0
 
 def run_duration_for(bust: float) -> float:
-    # ~1.2s .. 7s depending on bust
     return min(7.0, 1.2 + math.log(bust+1.0)*1.6)
 
 def current_multiplier(started_at: datetime.datetime, expected_end_at: datetime.datetime, bust: float, at: Optional[datetime.datetime] = None) -> float:
-    """Deterministic server multiplier based on time.
-       m(t) grows from 1.00 at start to bust at expected_end."""
     at = at or now_utc()
     if at <= started_at: return 1.0
     if at >= expected_end_at: return bust
@@ -293,7 +288,6 @@ def ensure_betting_round(cur) -> Tuple[int, dict]:
 
 @with_conn
 def place_bet(cur, user_id: str, bet: int, cashout: float):
-    # must be during betting
     cur.execute("""SELECT id, betting_ends_at FROM crash_rounds
                    WHERE status='betting'
                    ORDER BY id DESC LIMIT 1""")
@@ -304,7 +298,6 @@ def place_bet(cur, user_id: str, bet: int, cashout: float):
     if not cur.fetchone()[0]:
         raise ValueError("Betting just closed")
 
-    # balance & debit
     cur.execute("INSERT INTO balances(user_id,balance) VALUES (%s,0) ON CONFLICT(user_id) DO NOTHING", (user_id,))
     cur.execute("SELECT balance FROM balances WHERE user_id=%s FOR UPDATE", (user_id,))
     bal = int(cur.fetchone()[0])
@@ -313,7 +306,6 @@ def place_bet(cur, user_id: str, bet: int, cashout: float):
     if bal < bet: raise ValueError("Insufficient balance")
     cur.execute("UPDATE balances SET balance=balance-%s WHERE user_id=%s", (bet, user_id))
 
-    # one bet per user per round
     try:
         cur.execute("""INSERT INTO crash_bets(round_id,user_id,bet,cashout)
                        VALUES(%s,%s,%s,%s)""",
@@ -356,7 +348,6 @@ def begin_running(cur, round_id: int):
 
 @with_conn
 def cashout_now(cur, user_id: str) -> Dict:
-    # cash out current running round for this user (if possible)
     cur.execute("""SELECT id, started_at, expected_end_at, bust FROM crash_rounds
                    WHERE status='running' ORDER BY id DESC LIMIT 1""")
     r = cur.fetchone()
@@ -374,7 +365,6 @@ def cashout_now(cur, user_id: str) -> Dict:
 
     m = current_multiplier(started_at, exp_end, bust, now)
     if m >= bust: raise ValueError("Too late — crashed")
-    # Credit immediately
     win = int(math.floor(bet * m + 1e-9))
     cur.execute("UPDATE balances SET balance=balance+%s WHERE user_id=%s", (win, user_id))
     cur.execute("""UPDATE crash_bets
@@ -385,15 +375,12 @@ def cashout_now(cur, user_id: str) -> Dict:
 
 @with_conn
 def resolve_round_end(cur, round_id: int, bust: float):
-    # For all bets, finalize results and write history; avoid double-crediting those who already cashed out
     cur.execute("""SELECT user_id, bet, cashout, cashed_out, resolved, win
                    FROM crash_bets WHERE round_id=%s""", (round_id,))
     bets = cur.fetchall()
     for uid, bet, goal, cashed, resolved, win in bets:
         uid = str(uid); bet=int(bet); goal=float(goal); win=int(win); resolved=bool(resolved)
-        # Compute final state:
         if resolved and cashed is not None:
-            # already paid at live cashout; just record history + xp
             xp_gain = max(1, min(bet, 50))
             cur.execute("""INSERT INTO crash_games(user_id,bet,cashout,bust,win,xp_gain)
                            VALUES(%s,%s,%s,%s,%s,%s)""",
@@ -404,18 +391,16 @@ def resolve_round_end(cur, round_id: int, bust: float):
 
         if not resolved:
             if goal <= bust:
-                # auto cashout at goal
                 win = int(math.floor(bet * goal + 1e-9))
                 cur.execute("UPDATE balances SET balance=balance+%s WHERE user_id=%s", (win, uid))
                 cur.execute("""UPDATE crash_bets SET win=%s, resolved=TRUE WHERE round_id=%s AND user_id=%s""",
                             (int(win), round_id, uid))
                 cashed_val = goal
             else:
-                # lost
                 cur.execute("""UPDATE crash_bets SET resolved=TRUE WHERE round_id=%s AND user_id=%s""",
                             (round_id, uid))
                 win = 0
-                cashed_val = goal  # record desired goal
+                cashed_val = goal
 
             xp_gain = max(1, min(bet, 50))
             cur.execute("""INSERT INTO crash_games(user_id,bet,cashout,bust,win,xp_gain)
@@ -576,7 +561,7 @@ def read_session(request: Request) -> Optional[dict]:
     try: return signer.loads(raw)
     except BadSignature: return None
 
-# ---------- Frontend HTML (plain string) ----------
+# ---------- Frontend HTML ----------
 HTML_TEMPLATE = """
 <!doctype html>
 <html>
@@ -617,9 +602,7 @@ HTML_TEMPLATE = """
     .label{color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.1em}
     .big{font-size:28px; font-weight:800}
     .muted{color:var(--muted)}
-    input, .input{
-      width:100%; background:#0e1833; color:#e8efff; border:1px solid var(--border); border-radius:12px; padding:12px; outline:none
-    }
+    input, .input{width:100%; background:#0e1833; color:#e8efff; border:1px solid var(--border); border-radius:12px; padding:12px; outline:none}
     input:focus{border-color:#356adf; box-shadow:0 0 0 2px rgba(53,106,223,.25)}
     .game-card{display:flex; flex-direction:column; gap:4px; background:linear-gradient(180deg,#0f1a33,#0c152a); border:1px solid var(--border); border-radius:16px; padding:16px; cursor:pointer; transition:transform .08s ease, box-shadow .12s ease}
     .game-card:hover{transform:translateY(-2px); box-shadow:0 8px 18px rgba(0,0,0,.25)}
@@ -656,7 +639,6 @@ HTML_TEMPLATE = """
     .txt{margin-top:4px; font-size:14px; white-space:pre-wrap; word-break:break-word}
     .disabled-note{font-size:12px; color:#8aa0c7; padding:0 12px 10px}
 
-    /* Responsive tweaks */
     @media (max-width: 640px){
       .big{font-size:22px}
       .cr-multi{font-size:28px}
@@ -703,12 +685,10 @@ HTML_TEMPLATE = """
       <div class="card">
         <div class="cr-top">
           <div class="cr-metric">
-            <div class="cr-multi" id="crNow">1.00×</div>
+            <div class="cr-multi" id="crNow">0.00×</div>
             <div class="cr-small" id="crHint">Loading…</div>
           </div>
-          <div>
-            <button class="chip" id="backToGames">← Games</button>
-          </div>
+          <div><button class="chip" id="backToGames">← Games</button></div>
         </div>
 
         <div class="cr-graph-wrap">
@@ -932,7 +912,6 @@ HTML_TEMPLATE = """
         if(me.id === '__OWNER_ID__'){ ownerPanel.style.display=''; }
         else ownerPanel.style.display='none';
 
-        // Owner actions
         const tApply = qs('tApply'); if(tApply){
           tApply.onclick = async ()=>{
             const identifier = qs('tIdent').value.trim();
@@ -990,19 +969,117 @@ HTML_TEMPLATE = """
       }catch(e){}
     }
 
-    // -------- Crash state + live now polling (no end leak) --------
+    // -------- Crash state + live now polling (client-stepped animation) --------
     const crNowEl = qs('crNow'), crHint = qs('crHint'), crMsg = qs('crMsg');
     const lastBustsEl = qs('lastBusts'), cashBtn = qs('crCashout');
 
-    let crPhase = 'betting';
+    let crPhase = 'betting', lastPhase = 'betting';
     let roundId = null;
     let haveActiveBet = false;
     let betResolved = false;
+
+    // Canvas + path
+    const canv = qs('crCanvas'); const ctx = canv.getContext('2d');
+    function resizeCanvas(){
+      const dpr = window.devicePixelRatio || 1;
+      const r = canv.getBoundingClientRect();
+      canv.width = Math.floor(r.width*dpr);
+      canv.height = Math.floor(r.height*dpr);
+      ctx.setTransform(dpr,0,0,dpr,0,0);
+      redrawAxis();
+    }
+    window.addEventListener('resize', resizeCanvas);
+    function redrawAxis(){
+      const w = canv.clientWidth, h = canv.clientHeight;
+      ctx.clearRect(0,0,w,h);
+      ctx.globalAlpha = 0.25;
+      ctx.strokeStyle = '#23304c';
+      ctx.lineWidth = 1;
+      for(let i=0;i<=5;i++){
+        const y = h - (i*h/5);
+        ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(w,y); ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+    }
+    resizeCanvas();
+
+    // Multiplier animation (0.01 steps with acceleration)
+    let clientMult = 0.00;        // what we display
+    let serverTarget = 1.00;      // latest from server /api/crash/now
+    let rafId = null;
+    let runStartTs = 0;
+
+    function mapPoint(mult){
+      const w = canv.clientWidth, h = canv.clientHeight;
+      const maxM = 20.0;
+      const yf = Math.min(1, Math.log(Math.max(1.0001, mult)) / Math.log(maxM));
+      const y = h - (h * yf);
+      // slight rightward curve as it rises
+      const xf = Math.pow(yf, 1.35);
+      const x = (w * (0.12 + 0.76 * xf));
+      return [x,y];
+    }
+    let lastDrawnM = 0.00;
+    function resetGraph(){
+      redrawAxis();
+      lastDrawnM = 0.00;
+      clientMult = 0.00;
+    }
+    function drawStep(toMult){
+      // draw from lastDrawnM -> toMult as curved line
+      const [px,py] = mapPoint(lastDrawnM || 1.00);
+      const [x,y] = mapPoint(toMult || 1.00);
+      ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+      const grad = ctx.createLinearGradient(0, canv.clientHeight, 0, 0);
+      grad.addColorStop(0,'#22c1dc'); grad.addColorStop(1,'#3b82f6');
+      ctx.strokeStyle = grad; ctx.lineWidth = 4;
+      ctx.beginPath();
+      // small quadratic curve toward the new point
+      const cx = (px + x) / 2;
+      const cy = Math.min(py, y) - 8;
+      ctx.moveTo(px, py);
+      ctx.quadraticCurveTo(cx, cy, x, y);
+      ctx.stroke();
+      lastDrawnM = toMult;
+    }
+
+    function startRunAnim(){
+      resetGraph();
+      runStartTs = performance.now();
+      clientMult = 0.00;     // visual from 0.00 like you requested
+      serverTarget = 1.00;
+      crNowEl.textContent = '0.00×';
+      if(rafId) cancelAnimationFrame(rafId);
+      rafId = requestAnimationFrame(tick);
+    }
+    function stopRunAnim(){
+      if(rafId){ cancelAnimationFrame(rafId); rafId=null; }
+    }
+    function tick(){
+      // acceleration: step grows over time
+      const tSec = Math.max(0, (performance.now() - runStartTs)/1000);
+      const base = 0.01;                           // 0.01 per tick base
+      const accelFactor = 1 + 2.2*Math.pow(tSec, 1.15); // grows with time
+      const target = serverTarget;
+
+      if(clientMult < target){
+        // advance in exact 0.01 increments up to the current server target
+        const rawNext = clientMult + base*accelFactor;
+        const next = Math.min(target, Math.round(rawNext * 100)/100);
+        // ensure at least +0.01 if below target
+        const stepped = (next <= clientMult && target > clientMult) ? (Math.min(target, clientMult + 0.01)) : next;
+        clientMult = stepped;
+        crNowEl.textContent = clientMult.toFixed(2)+'×';
+        drawStep(clientMult);
+      }
+      rafId = requestAnimationFrame(tick);
+    }
 
     async function refreshCrash(){
       try{
         const s = await j('/api/crash/state');
         roundId = s.round_id; crPhase = s.phase;
+
         // bust history
         lastBustsEl.innerHTML = s.last_busts.length
           ? s.last_busts.map(v=>`<span class="chip2 ${v<2?'bust-bad':'bust-good'}">${v.toFixed(2)}×</span>`).join('')
@@ -1013,41 +1090,49 @@ HTML_TEMPLATE = """
         betResolved = !!(s.your_bet && s.your_bet.resolved);
         cashBtn.style.display = (crPhase==='running' && haveActiveBet) ? '' : 'none';
 
+        // phase transitions
+        if(lastPhase !== 'running' && crPhase === 'running'){
+          crHint.textContent = 'Round running… Tap Cash Out anytime.';
+          startRunAnim();
+        }
+        if(lastPhase === 'running' && crPhase !== 'running'){
+          stopRunAnim();
+          if(s.bust){ crNowEl.textContent = s.bust.toFixed(2)+'×'; }
+          crHint.textContent = 'Preparing next round…';
+        }
         if(crPhase==='betting'){
           const left = Math.max(0, Math.round((Date.parse(s.betting_ends_at) - Date.now())/1000));
-          crHint.textContent = `Betting open — closes in ${left}s`; crNowEl.textContent = '1.00×';
-        } else if(crPhase==='running'){
-          crHint.textContent = 'Round running… Tap Cash Out to take profit.';
-        } else { // ended
-          crHint.textContent = 'Preparing next round…';
-          if(s.bust) crNowEl.textContent = s.bust.toFixed(2)+'×';
+          crHint.textContent = `Betting open — closes in ${left}s`;
+          crNowEl.textContent = '0.00×';
+          resetGraph();
         }
+
+        lastPhase = crPhase;
       }catch(e){
         crHint.textContent = 'Disconnected. Reconnecting…';
       }
     }
 
-    // Live "now" multiplier polling (every 300ms while running)
-    let nowTimer=null;
+    // poll server "now" (no end time) and only raise our target
     async function pollNow(){
-      if(crPhase!=='running'){ crNowEl.textContent = crNowEl.textContent || '1.00×'; return; }
+      if(crPhase!=='running') return;
       try{
         const n = await j('/api/crash/now');
         if(n.phase==='running'){
-          crNowEl.textContent = n.multiplier.toFixed(2)+'×';
-          drawPoint(n.multiplier);
+          serverTarget = Math.max(serverTarget, Math.round(n.multiplier*100)/100);
         }
-      }catch(e){ /* ignore */ }
+      }catch(e){}
     }
 
     // Place bet
     qs('crPlace').onclick = async ()=>{
       try{
         const bet = parseInt(document.getElementById('crBet').value,10);
-        const cash = parseFloat(document.getElementById('crCash').value);
+        const cashVal = document.getElementById('crCash').value.trim();
+        let cash = cashVal==='' ? 1000 : parseFloat(cashVal);
         if(Number.isNaN(bet) || bet < 1) throw new Error('Enter a bet of at least 1 DL.');
-        if(document.getElementById('crCash').value.trim()!=='' && (Number.isNaN(cash) || cash < 1.01)) throw new Error('Auto cashout must be at least 1.01×, or leave empty.');
-        await j('/api/crash/bet', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({bet, cashout: (Number.isNaN(cash)? 1000 : cash)})});
+        if(Number.isNaN(cash) || cash < 1.01) throw new Error('Auto cashout must be at least 1.01×, or leave empty.');
+        await j('/api/crash/bet', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({bet, cashout: cash})});
         crMsg.textContent = 'Bet placed for this round.';
         await renderHeader(); // update balance
         haveActiveBet = true;
@@ -1059,7 +1144,7 @@ HTML_TEMPLATE = """
       try{
         const r = await j('/api/crash/cashout', {method:'POST'});
         crMsg.textContent = 'Cashed out at '+r.multiplier.toFixed(2)+'× • Won '+fmtDL(r.win);
-        await renderHeader(); // update balance
+        await renderHeader();
         haveActiveBet = false;
         cashBtn.style.display = 'none';
       }catch(e){
@@ -1067,66 +1152,7 @@ HTML_TEMPLATE = """
       }
     };
 
-    // Graph (vertical curve)
-    const canv = qs('crCanvas'); const ctx = canv.getContext('2d');
-    function resizeCanvas(){
-      const dpr = window.devicePixelRatio || 1;
-      const r = canv.getBoundingClientRect();
-      canv.width = Math.floor(r.width*dpr);
-      canv.height = Math.floor(r.height*dpr);
-      ctx.setTransform(dpr,0,0,dpr,0,0);
-      redrawAxis();
-    }
-    window.addEventListener('resize', resizeCanvas);
-
-    function redrawAxis(){
-      const w = canv.clientWidth, h = canv.clientHeight;
-      ctx.clearRect(0,0,w,h);
-      // grid
-      ctx.globalAlpha = 0.25;
-      ctx.strokeStyle = '#23304c';
-      ctx.lineWidth = 1;
-      for(let i=0;i<5;i++){
-        const y = h - (i*h/5);
-        ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(w,y); ctx.stroke();
-      }
-      ctx.globalAlpha = 1;
-    }
-
-    let lastMult = 1.0;
-    function drawPoint(mult){
-      const w = canv.clientWidth, h = canv.clientHeight;
-      // y increases upward (1.00x near bottom). Map multiplier to y with soft log.
-      // y_frac = log(mult)/log(20) capped to [0,1]
-      const maxM = 20.0;
-      const yf = Math.min(1, Math.log(Math.max(1.0001,mult)) / Math.log(maxM));
-      const y = h - (h * yf);
-      // x advances slowly with multiplier to create curved "upward" stroke
-      const xf = Math.min(1, Math.log(Math.max(1.0001,mult)) / Math.log(maxM));
-      const x = (w * (0.1 + 0.8*xf)); // keep some left margin
-
-      // draw curve segment from last point to new point (rounded stroke)
-      ctx.lineJoin = 'round'; ctx.lineCap = 'round';
-      ctx.strokeStyle = ctx.createLinearGradient(0,h,0,0);
-      ctx.strokeStyle.addColorStop(0,'#22c1dc'); ctx.strokeStyle.addColorStop(1,'#3b82f6');
-      ctx.lineWidth = 4;
-      // Keep a path: we just draw incremental segment; if mult decreased (new round), reset
-      if(mult < lastMult){ redrawAxis(); }
-      lastMult = mult;
-
-      // Save current point on canvas using a very light approach:
-      // We'll sample many small points by just drawing small line segments.
-      // Compute previous x,y from a slightly smaller multiplier
-      const prevM = Math.max(1.0, mult/1.01);
-      const prevYf = Math.min(1, Math.log(Math.max(1.0001,prevM)) / Math.log(maxM));
-      const py = h - (h * prevYf);
-      const pxf = Math.min(1, Math.log(Math.max(1.0001,prevM)) / Math.log(maxM));
-      const px = (w * (0.1 + 0.8*pxf));
-
-      ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(x, y); ctx.stroke();
-    }
-
-    // Chat (fixed bug: JS booleans)
+    // Chat (login gate fixed)
     const drawer = qs('chatDrawer'), chatBody=qs('chatBody'), chatText=qs('chatText'), chatSend=qs('chatSend');
     const chatNote = qs('chatNote'), chatDisabled = qs('chatDisabled');
     let chatOpen=false, chatPoll=null, lastChatId=0, myLevel=0, isLogged=false;
@@ -1185,9 +1211,8 @@ HTML_TEMPLATE = """
     chatText.addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ e.preventDefault(); chatSend.click(); } });
 
     // Periodic
-    setInterval(()=>{ if(pgCrash.style.display!=='none') refreshCrash(); }, 1000);
-    resizeCanvas();
-    setInterval(()=>{ if(pgCrash.style.display!=='none') pollNow(); }, 300);
+    setInterval(()=>{ if(pgCrash.style.display!=='none') refreshCrash(); }, 800);
+    setInterval(()=>{ if(pgCrash.style.display!=='none') pollNow(); }, 250);
 
     // Other tabs & data
     tabGames.onclick=()=>setTab('games');
@@ -1392,9 +1417,8 @@ async def api_crash_state(request: Request):
         "round_id": rid,
         "betting_opens_at": iso(r["betting_opens_at"]) if r else None,
         "betting_ends_at":  iso(r["betting_ends_at"])  if r else None,
-        # intentionally NOT sending expected_end_at to avoid revealing crash timing
         "started_at":       iso(r["started_at"])       if r else None,
-        "bust": r["bust"] if (r and phase=='ended') else None,   # reveal bust only after end
+        "bust": r["bust"] if (r and phase=='ended') else None,
         "your_bet": yb,
         "min_bet": MIN_BET,
         "last_busts": last_busts(15)
@@ -1402,7 +1426,6 @@ async def api_crash_state(request: Request):
 
 @app.get("/api/crash/now")
 async def api_crash_now():
-    # returns current multiplier only while running (no bust / no end time)
     r = load_round()
     if not r or r["status"] != "running":
         return {"phase": r["status"] if r else "betting", "multiplier": 1.0}
@@ -1416,7 +1439,7 @@ async def api_crash_bet(request: Request, body: BetBody):
     bet = int(body.bet); cash = float(body.cashout)
     if bet < MIN_BET: raise HTTPException(400, f"Min bet is {MIN_BET} DL")
     if bet > MAX_BET: raise HTTPException(400, f"Max bet is {MAX_BET} DL")
-    if cash < 1.01: cash = 1000.0  # treat empty/invalid as very high (no auto cash)
+    if cash < 1.01: cash = 1000.0
     try:
         res = place_bet(user["id"], bet, cash)
         return {"ok": True, "round_id": res["round_id"]}
@@ -1478,7 +1501,6 @@ async def crash_loop():
                 await asyncio.sleep(min(wait, 0.5))
             else:
                 begin = begin_running(rid)
-                # do not resolve here; allow live cashouts; we'll resolve at end
         elif r["status"] == "running":
             if r["expected_end_at"]:
                 wait = (r["expected_end_at"] - now).total_seconds()
@@ -1492,7 +1514,7 @@ async def crash_loop():
                 finish_round(rid)
                 create_next_betting()
                 await asyncio.sleep(0.3)
-        else:  # ended
+        else:
             create_next_betting()
             await asyncio.sleep(0.3)
 

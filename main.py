@@ -1,6 +1,6 @@
 import os, json, asyncio, re, random, string, math, secrets, datetime
 from urllib.parse import urlencode
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Dict
 
 import httpx
 import psycopg
@@ -126,8 +126,6 @@ def init_db(cur):
             PRIMARY KEY(round_id, user_id)
         )
     """)
-
-    # Per-player game log
     cur.execute("""
         CREATE TABLE IF NOT EXISTS crash_games (
             id BIGSERIAL PRIMARY KEY,
@@ -137,6 +135,16 @@ def init_db(cur):
             bust NUMERIC(10,2) NOT NULL,
             win INTEGER NOT NULL,
             xp_gain INTEGER NOT NULL,
+            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    # Global chat
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS chat_messages (
+            id BIGSERIAL PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            username TEXT NOT NULL,
+            text TEXT NOT NULL,
             created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -391,6 +399,48 @@ def your_history(cur, user_id: str, limit: int = 10):
                    ORDER BY id DESC LIMIT %s""", (user_id, limit))
     return [{"bet":int(r[0]),"cashout":float(r[1]),"bust":float(r[2]),"win":int(r[3]),"xp_gain":int(r[4]),"created_at":str(r[5])} for r in cur.fetchall()]
 
+# ---------- Global Chat (DB + helpers) ----------
+@with_conn
+def chat_send(cur, user_id: str, username: str, text: str):
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("Message is empty")
+    if len(text) > 300:
+        raise ValueError("Message is too long (max 300)")
+    ensure_profile_row(user_id)
+    cur.execute("SELECT xp FROM profiles WHERE user_id=%s", (user_id,))
+    xp = int(cur.fetchone()[0])
+    lvl = 1 + xp // 100
+    if lvl < 5:
+        raise PermissionError("You must be level 5 to chat")
+    cur.execute("INSERT INTO chat_messages(user_id, username, text) VALUES (%s,%s,%s) RETURNING id, created_at",
+                (user_id, username, text))
+    row = cur.fetchone()
+    return {"id": int(row[0]), "created_at": str(row[1])}
+
+@with_conn
+def chat_fetch(cur, since_id: int, limit: int = 50):
+    if since_id <= 0:
+        cur.execute("""SELECT id, user_id, username, text, created_at
+                       FROM chat_messages ORDER BY id DESC LIMIT %s""", (limit,))
+        rows = list(reversed(cur.fetchall()))
+    else:
+        cur.execute("""SELECT id, user_id, username, text, created_at
+                       FROM chat_messages WHERE id > %s ORDER BY id ASC LIMIT %s""", (since_id, limit))
+        rows = cur.fetchall()
+    # gather levels
+    uids = list({r[1] for r in rows})
+    levels: Dict[str, int] = {}
+    if uids:
+        cur.execute("SELECT user_id, xp FROM profiles WHERE user_id = ANY(%s)", (uids,))
+        for uid, xp in cur.fetchall():
+            levels[str(uid)] = 1 + int(xp) // 100
+    out = []
+    for mid, uid, uname, txt, ts in rows:
+        lvl = levels.get(str(uid), 1)
+        out.append({"id": int(mid), "user_id": str(uid), "username": uname, "level": int(lvl), "text": txt, "created_at": str(ts)})
+    return out
+
 # ---------- Discord bot ----------
 def fmt_dl(n: int) -> str: return f"{GEM} {n:,} DL"
 def embed(title: str, desc: Optional[str] = None, color: int = 0x00C2FF) -> discord.Embed:
@@ -478,7 +528,7 @@ INDEX_HTML = f"""
     body{{background:linear-gradient(180deg,#0a1020,#0e1530); color:var(--text); font-family:system-ui,Segoe UI,Roboto,Arial; margin:0; min-height:100vh;}}
     a{{color:inherit; text-decoration:none}}
     .container{{max-width:1100px; margin:0 auto; padding:16px}}
-    .header{{position:sticky; top:0; z-index:10; background:linear-gradient(135deg,#0e1630 0%,#0a1124 100%); border-bottom:1px solid var(--border);}}
+    .header{{position:sticky; top:0; z-index:20; background:linear-gradient(135deg,#0e1630 0%,#0a1124 100%); border-bottom:1px solid var(--border);}}
     .header-inner{{display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 16px;}}
     .brand{{display:flex; align-items:center; gap:10px; font-weight:800; letter-spacing:.2px}}
     .nav{{display:flex; gap:10px; align-items:center}}
@@ -518,10 +568,21 @@ INDEX_HTML = f"""
     .bust-good{{color:#34d399; font-weight:700}}
 
     /* Modal */
-    .modal{{position:fixed; inset:0; background:rgba(0,0,0,.6); display:none; align-items:center; justify-content:center; padding:20px}}
+    .modal{{position:fixed; inset:0; background:rgba(0,0,0,.6); display:none; align-items:center; justify-content:center; padding:20px; z-index:30}}
     .modal .box{{background:#0f1a33; border:1px solid var(--border); border-radius:16px; padding:16px; max-width:520px; width:100%}}
-    .chips{{display:flex; flex-wrap:wrap; gap:6px; margin-top:8px}}
-    .chip2{{padding:4px 8px; border-radius:999px; border:1px solid var(--border); background:#0c1631}}
+
+    /* Chat drawer */
+    .chat-drawer{{position:fixed; top:64px; right:0; width:340px; max-width:90vw; bottom:0; background:#0f1a33; border-left:1px solid var(--border); transform:translateX(100%); transition:transform .18s ease; z-index:25; display:flex; flex-direction:column}}
+    .chat-drawer.open{{transform:translateX(0)}}
+    .chat-head{{display:flex; align-items:center; justify-content:space-between; padding:10px 12px; border-bottom:1px solid var(--border)}}
+    .chat-body{{flex:1; overflow-y:auto; padding:10px 12px; display:flex; flex-direction:column; gap:8px}}
+    .chat-input{{padding:10px 12px; border-top:1px solid var(--border); display:flex; gap:8px}}
+    .msg{{background:#0e1833; border:1px solid var(--border); border-radius:12px; padding:8px}}
+    .msghead{{display:flex; gap:6px; align-items:center; font-size:13px}}
+    .lvl{{font-size:12px; color:#8aa0c7}}
+    .time{{margin-left:auto; font-size:11px; color:#8aa0c7}}
+    .txt{{margin-top:4px; font-size:14px; white-space:pre-wrap; word-break:break-word}}
+    .disabled-note{{font-size:12px; color:#8aa0c7; padding:0 12px 10px}}
   </style>
 </head>
 <body>
@@ -533,7 +594,7 @@ INDEX_HTML = f"""
         <a class="tab" id="tab-ref">Referral</a>
         <a class="tab" id="tab-promo">Promo Codes</a>
       </div>
-      <div class="right" id="authArea"><!-- balance + avatar OR login/register --></div>
+      <div class="right" id="authArea"><!-- balance + chat + avatar OR login/register --></div>
     </div>
   </div>
 
@@ -687,97 +748,117 @@ INDEX_HTML = f"""
     </div>
   </div>
 
+  <!-- Global Chat Drawer -->
+  <div class="chat-drawer" id="chatDrawer">
+    <div class="chat-head">
+      <div><b>Global Chat</b></div>
+      <div style="display:flex; gap:8px; align-items:center">
+        <span id="chatNote" class="lvl"></span>
+        <button class="btn" id="chatClose">Close</button>
+      </div>
+    </div>
+    <div class="disabled-note" id="chatDisabled" style="display:none"></div>
+    <div class="chat-body" id="chatBody"></div>
+    <div class="chat-input">
+      <input id="chatText" placeholder="Type a message (Lv 5+)" maxlength="300"/>
+      <button class="btn primary" id="chatSend">Send</button>
+    </div>
+  </div>
+
   <script>
-    function qs(id){{return document.getElementById(id)}}
+    function qs(id){return document.getElementById(id)}
     const tabGames = qs('tab-games'), tabRef=qs('tab-ref'), tabPromo=qs('tab-promo');
     const pgGames=qs('page-games'), pgCrash=qs('page-crash'), pgRef=qs('page-ref'), pgPromo=qs('page-promo'), pgProfile=qs('page-profile'), loginCard=qs('loginCard');
 
-    function fmtDL(n){{ return `💎 ${Number(n).toLocaleString()} DL`; }}
-    async function j(u, opt={{}}){{ const r=await fetch(u, Object.assign({{credentials:'include'}},opt)); if(!r.ok) throw new Error(await r.text()); return r.json(); }}
+    function fmtDL(n){ return `💎 ${Number(n).toLocaleString()} DL`; }
+    async function j(u, opt={}){ const r=await fetch(u, Object.assign({credentials:'include'},opt)); if(!r.ok) throw new Error(await r.text()); return r.json(); }
+    function esc(s){ return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
-    function setTab(which){{
+    function setTab(which){
       [tabGames,tabRef,tabPromo].forEach(t=>t.classList.remove('active'));
       [pgGames,pgCrash,pgRef,pgPromo,pgProfile].forEach(p=>p.style.display='none');
-      if(which==='games'){{ tabGames.classList.add('active'); pgGames.style.display=''; }}
-      if(which==='crash'){{ pgCrash.style.display=''; }}
-      if(which==='ref'){{ tabRef.classList.add('active'); pgRef.style.display=''; }}
-      if(which==='promo'){{ tabPromo.classList.add('active'); pgPromo.style.display=''; }}
-      if(which==='profile'){{ pgProfile.style.display=''; }}
-      window.scrollTo({{top:0, behavior:'smooth'}});
-    }}
-    qs('homeLink').onclick=(e)=>{{ e.preventDefault(); setTab('games'); }};
+      if(which==='games'){ tabGames.classList.add('active'); pgGames.style.display=''; }
+      if(which==='crash'){ pgCrash.style.display=''; }
+      if(which==='ref'){ tabRef.classList.add('active'); pgRef.style.display=''; }
+      if(which==='promo'){ tabPromo.classList.add('active'); pgPromo.style.display=''; }
+      if(which==='profile'){ pgProfile.style.display=''; }
+      window.scrollTo({top:0, behavior:'smooth'});
+    }
+    qs('homeLink').onclick=(e)=>{ e.preventDefault(); setTab('games'); };
     qs('openCrash').onclick=()=>setTab('crash');
 
     // modal
-    function openModal(){{ qs('modal').style.display='flex'; }}
-    function closeModal(){{ qs('modal').style.display='none'; }}
+    function openModal(){ qs('modal').style.display='flex'; }
+    function closeModal(){ qs('modal').style.display='none'; }
     qs('mClose').onclick = closeModal;
-    qs('modal').addEventListener('click', (e)=>{{ if(e.target.id==='modal') closeModal(); }});
+    qs('modal').addEventListener('click', (e)=>{ if(e.target.id==='modal') closeModal(); });
 
-    function safeAvatar(me){{ return me.avatar_url || ''; }}
+    function safeAvatar(me){ return me.avatar_url || ''; }
 
     // Global header/auth render
-    async function renderHeader(){{
+    async function renderHeader(){
       const auth = qs('authArea');
-      try{{
+      try{
         const me = await j('/api/me');
         const bal = await j('/api/balance');
         auth.innerHTML = `
-          <span class="chip" id="balanceBtn">${{fmtDL(bal.balance)}}</span>
-          <img class="avatar" id="avatarBtn" src="${{safeAvatar(me)}}" title="${{me.username}}" onerror="this.style.display='none'">
+          <span class="chip" id="balanceBtn">${fmtDL(bal.balance)}</span>
+          <span class="chip" id="chatBtn">Chat</span>
+          <img class="avatar" id="avatarBtn" src="${safeAvatar(me)}" title="${me.username}" onerror="this.style.display='none'">
         `;
         loginCard.style.display='none';
         qs('balanceBtn').onclick = openModal;
         qs('avatarBtn').onclick = ()=>setTab('profile');
-      }}catch(e){{
+        qs('chatBtn').onclick = toggleChat;
+      }catch(e){
         auth.innerHTML = `
           <a class="btn primary" href="/login">Login</a>
           <button class="btn" id="registerBtn2">Register</button>
         `;
         loginCard.style.display='';
-        document.getElementById('registerBtn2').onclick = ()=> {{
+        document.getElementById('registerBtn2').onclick = ()=> {
           const info = qs('registerInfo'); info.style.display = 'block';
-          window.scrollTo({{top: document.body.scrollHeight, behavior:'smooth'}});
-        }};
-      }}
-    }}
+          window.scrollTo({top: document.body.scrollHeight, behavior:'smooth'});
+        };
+      }
+    }
 
     // Profile / Referral / Promo helpers
-    async function renderProfile(){{
-      try{{
+    async function renderProfile(){
+      try{
         const me = await j('/api/me'); const prof = await j('/api/profile');
         const lvl=prof.level, pct=Math.max(0,Math.min(100,prof.progress_pct));
         qs('profileBox').innerHTML = `
           <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap">
-            <img src="${{safeAvatar(me)}}" class="avatar" style="width:56px; height:56px">
-            <div><div class="big">${{me.username}}</div><div class="muted">ID: ${{me.id}}</div></div>
+            <img src="${safeAvatar(me)}" class="avatar" style="width:56px; height:56px">
+            <div><div class="big">${me.username}</div><div class="muted">ID: ${me.id}</div></div>
             <div style="margin-left:auto; display:flex; gap:8px; align-items:center"><a class="btn" href="/logout">Logout</a></div>
           </div>
           <div class="grid" style="margin-top:12px">
             <div class="card" style="padding:12px">
-              <div class="label">Balance</div><div class="big">${{fmtDL(prof.balance)}}</div>
+              <div class="label">Balance</div><div class="big">${fmtDL(prof.balance)}</div>
               <div class="muted" style="margin-top:6px">Click your balance in the header for Deposit/Withdraw instructions.</div>
             </div>
             <div class="card" style="padding:12px">
-              <div class="label">Level</div><div><b>Level ${{lvl}}</b> — XP ${{prof.xp}} / ${{((lvl-1)*100)+100}}</div>
+              <div class="label">Level</div><div><b>Level ${lvl}</b> — XP ${prof.xp} / ${((lvl-1)*100)+100}</div>
               <div style="height:10px; background:#0e1833; border:1px solid var(--border); border-radius:999px; overflow:hidden; margin-top:8px">
-                <div style="height:100%; width:${{pct}}%; background:linear-gradient(90deg,#22c1dc,#3b82f6)"></div>
-              </div><div class="muted" style="margin-top:6px">${{prof.progress}}/${{prof.next_needed}} XP to next level</div>
+                <div style="height:100%; width:${pct}%; background:linear-gradient(90deg,#22c1dc,#3b82f6)"></div>
+              </div><div class="muted" style="margin-top:6px">${prof.progress}/${prof.next_needed} XP to next level</div>
             </div>
           </div>
         `;
         const ownerPanel = qs('ownerPanel');
-        if(me.id === '{OWNER_ID}'){{ ownerPanel.style.display=''; }}
+        if(me.id === '{OWNER_ID}'){ ownerPanel.style.display=''; }
         else ownerPanel.style.display='none';
-      }}catch(e){{}}
-    }}
-    async function renderReferral(){{
-      try{{
+      }catch(e){}
+    }
+    async function renderReferral(){
+      try{
         const ref = await j('/api/referral/state');
-        if(ref.name){{
+        if(ref.name){
           const link = location.origin + '/?ref=' + encodeURIComponent(ref.name);
-          qs('refContent').innerHTML = `<p>Your referral name: <b>${{ref.name}}</b></p><p>Share this link:</p><p><code>${{link}}</code></p>`;
-        }}else{{
+          qs('refContent').innerHTML = `<p>Your referral name: <b>${ref.name}</b></p><p>Share this link:</p><p><code>${link}</code></p>`;
+        }else{
           qs('refContent').innerHTML = `
             <p>Claim a referral name to get your link.</p>
             <div style="display:flex; gap:8px; align-items:center; max-width:420px">
@@ -786,21 +867,21 @@ INDEX_HTML = f"""
             </div><div id="refMsg" class="muted" style="margin-top:8px"></div>`;
           qs('claimBtn').onclick = async ()=>{
             const name = document.getElementById('refName').value.trim(), msg=qs('refMsg'); msg.textContent='';
-            try{{ const r=await j('/api/profile/set_name',{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{name}})});
-                 msg.textContent='Saved. Your link: '+location.origin+'/?ref='+encodeURIComponent(r.name); }}
-            catch(e){{ msg.textContent='Error: '+e.message; }}
+            try{ const r=await j('/api/profile/set_name',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});
+                 msg.textContent='Saved. Your link: '+location.origin+'/?ref='+encodeURIComponent(r.name); }
+            catch(e){ msg.textContent='Error: '+e.message; }
           };
-        }}
-      }}catch(e){{}}
-    }}
-    async function renderPromos(){{
-      try{{
+        }
+      }catch(e){}
+    }
+    async function renderPromos(){
+      try{
         const mine = await j('/api/promo/my');
         document.getElementById('myCodes').innerHTML = mine.rows.length
-          ? '<ul>' + mine.rows.map(r=>`<li><code>${{r.code}}</code> — ${{new Date(r.redeemed_at).toLocaleString()}}</li>`).join('') + '</ul>'
+          ? '<ul>' + mine.rows.map(r=>`<li><code>${r.code}</code> — ${new Date(r.redeemed_at).toLocaleString()}</li>`).join('') + '</ul>'
           : 'No redemptions yet.';
-      }}catch(e){{}}
-    }}
+      }catch(e){}
+    }
 
     // Crash LIVE state polling + UI
     const crNow = ()=>document.getElementById('crNow');
@@ -812,59 +893,59 @@ INDEX_HTML = f"""
     const crMsgEl = ()=>document.getElementById('crMsg');
 
     let animRAF = null;
-    function resetLine(){{ if(animRAF) cancelAnimationFrame(animRAF); crFill().style.width='0%'; crNow().textContent='—'; cashMarker().style.display='none'; bustMarker().style.display='none'; }}
+    function resetLine(){ if(animRAF) cancelAnimationFrame(animRAF); crFill().style.width='0%'; crNow().textContent='—'; cashMarker().style.display='none'; bustMarker().style.display='none'; }
 
-    function setMarkers(target, bust){{
-      if(!bust || bust<=1){{ cashMarker().style.display='none'; bustMarker().style.display='none'; return; }}
+    function setMarkers(target, bust){
+      if(!bust || bust<=1){ cashMarker().style.display='none'; bustMarker().style.display='none'; return; }
       const lnB = Math.log(bust);
       const tFrac = Math.min(1, Math.log(Math.max(1.0001,target)) / lnB);
       cashMarker().style.left = (tFrac*100)+'%'; cashMarker().style.display='block';
       bustMarker().style.left = '100%'; bustMarker().style.display='block';
-    }}
+    }
 
-    function animateRunning(startISO, endISO, bust){{
+    function animateRunning(startISO, endISO, bust){
       const start = Date.parse(startISO), end = Date.parse(endISO); const lnB = Math.log(bust);
-      function frame(){{
+      function frame(){
         const now = Date.now(); const t = Math.min(1, (now-start)/(end-start));
         const m = Math.exp(lnB * t); crNow().textContent=m.toFixed(2)+'×';
         crFill().style.width = (Math.log(m)/lnB*100) + '%';
         if(t<1) animRAF=requestAnimationFrame(frame);
-        else {{ crNow().textContent=bust.toFixed(2)+'×'; }}
-      }}
+        else { crNow().textContent=bust.toFixed(2)+'×'; }
+      }
       frame();
-    }}
+    }
 
-    async function refreshCrash(){{
-      try{{
+    async function refreshCrash(){
+      try{
         const s = await j('/api/crash/state');
         // last 15 busts
         lastBustsEl().innerHTML = s.last_busts.length
-          ? s.last_busts.map(v=>`<span class="chip2 ${{v<2?'bust-bad':'bust-good'}}">${{v.toFixed(2)}}×</span>`).join('')
+          ? s.last_busts.map(v=>`<span class="chip2 ${v<2?'bust-bad':'bust-good'}">${v.toFixed(2)}×</span>`).join('')
           : 'No history yet.';
         // your bet info
-        if(s.your_bet){{ crMsgEl().textContent = `Your bet: ${{fmtDL(s.your_bet.bet)}} @ ${{s.your_bet.cashout.toFixed(2)}}×`; }}
+        if(s.your_bet){ crMsgEl().textContent = `Your bet: ${fmtDL(s.your_bet.bet)} @ ${s.your_bet.cashout.toFixed(2)}×`; }
         else crMsgEl().textContent = '';
 
-        if(s.phase==='betting'){{
+        if(s.phase==='betting'){
           resetLine();
           crNow().textContent = '1.00×';
           const left = Math.max(0, Math.round((Date.parse(s.betting_ends_at) - Date.now())/1000));
-          crHint().textContent = `Betting open — closes in ${{left}}s`;
+          crHint().textContent = `Betting open — closes in ${left}s`;
           setMarkers(parseFloat(document.getElementById('crCash').value||'2'), 2); // temp markers
-        }} else if(s.phase==='running'){{
+        } else if(s.phase==='running'){
           resetLine();
           crHint().textContent = 'Round running…';
           setMarkers(parseFloat(document.getElementById('crCash').value||'2'), s.bust);
           animateRunning(s.started_at, s.expected_end_at, s.bust);
-        }} else {{
+        } else {
           resetLine();
           crNow().textContent = s.bust ? s.bust.toFixed(2)+'×' : '—';
           crHint().textContent = 'Preparing next round…';
-        }}
-      }}catch(e){{
+        }
+      }catch(e){
         crHint().textContent = 'Disconnected. Reconnecting…';
-      }}
-    }}
+      }
+    }
 
     // Place bet
     document.getElementById('crPlace').onclick = async ()=>{
@@ -873,7 +954,7 @@ INDEX_HTML = f"""
         const cash = parseFloat(document.getElementById('crCash').value);
         if(Number.isNaN(bet) || bet < 1) throw new Error('Enter a bet of at least 1 DL.');
         if(Number.isNaN(cash) || cash < 1.01) throw new Error('Cashout goal must be at least 1.01×.');
-        const res = await j('/api/crash/bet', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({bet, cashout: cash})});
+        await j('/api/crash/bet', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({bet, cashout: cash})});
         crMsgEl().textContent = 'Bet placed for this round.';
         renderHeader(); // update header balance
       }catch(e){ crMsgEl().textContent = 'Error: '+e.message; }
@@ -910,50 +991,89 @@ INDEX_HTML = f"""
     tabPromo.onclick=()=>{ setTab('promo'); renderPromos(); };
     document.getElementById('openCrash').onclick=()=>{ setTab('crash'); };
 
-    // Owner panel actions
-    document.addEventListener('click', (e)=>{
-      if(e.target && e.target.id==='tApply'){
-        (async ()=>{
-          const ident = document.getElementById('tIdent').value.trim();
-          const amt = parseInt(document.getElementById('tAmt').value, 10);
-          const reason = document.getElementById('tReason').value.trim();
-          const msg = document.getElementById('tMsg'); msg.textContent='';
-          try{
-            if(!ident) throw new Error('Enter a user id or <@mention>');
-            if(Number.isNaN(amt) || amt === 0) throw new Error('Amount must be non-zero');
-            const res = await j('/api/admin/adjust', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({identifier: ident, amount: amt, reason})});
-            msg.textContent = 'OK — new balance: ' + fmtDL(res.new_balance);
-            renderHeader();
-          }catch(err){ msg.textContent = 'Error: ' + err.message; }
-        })();
-      }
-      if(e.target && e.target.id==='cMake'){
-        (async ()=>{
-          const c = document.getElementById('cCode').value.trim();
-          const a = parseInt(document.getElementById('cAmount').value, 10);
-          const m = parseInt(document.getElementById('cMax').value, 10);
-          const msg = document.getElementById('cMsg'); msg.textContent='';
-          try{
-            if(Number.isNaN(a) || a==0) throw new Error('Amount must be non-zero');
-            if(Number.isNaN(m) || m<1) throw new Error('Max uses must be >= 1');
-            const res = await j('/api/admin/promo/create', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({code:c||null, amount:a, max_uses:m})});
-            msg.textContent = 'Created code: ' + res.code;
-          }catch(err){ msg.textContent = 'Error: ' + err.message; }
-        })();
-      }
-    });
+    // ---------- Global Chat ----------
+    const drawer = qs('chatDrawer'), chatBody=qs('chatBody'), chatText=qs('chatText'), chatSend=qs('chatSend');
+    const chatNote = qs('chatNote'), chatDisabled = qs('chatDisabled');
+    let chatOpen=false, chatPoll=null, lastChatId=0, myLevel=0, isLogged=false;
 
-    // Promo redeem button
-    document.getElementById('redeemBtn').onclick = async ()=>{
-      const code = document.getElementById('promoInput').value.trim();
-      const msg = document.getElementById('promoMsg'); msg.textContent='';
-      if(!code){ msg.textContent='Enter a code.'; return; }
+    function scrollChatToBottom(){ chatBody.scrollTop = chatBody.scrollHeight; }
+
+    function renderMsg(m){
+      const wrap = document.createElement('div'); wrap.className='msg';
+      const head = document.createElement('div'); head.className='msghead';
+      const name = document.createElement('b'); name.textContent = m.username;
+      const lvl = document.createElement('span'); lvl.className='lvl'; lvl.textContent = `[Lv ${m.level}]`;
+      const ts = document.createElement('span'); ts.className='time'; ts.textContent = new Date(m.created_at).toLocaleTimeString();
+      head.appendChild(name); head.appendChild(lvl); head.appendChild(ts);
+      const txt = document.createElement('div'); txt.className='txt'; txt.textContent = m.text;
+      wrap.appendChild(head); wrap.appendChild(txt);
+      chatBody.appendChild(wrap);
+    }
+
+    async function fetchChat(initial=false){
       try{
-        const res = await j('/api/promo/redeem', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({code})});
-        msg.textContent = 'Success! New balance: ' + fmtDL(res.new_balance);
-        renderHeader();
-      }catch(e){ msg.textContent = 'Error: ' + e.message; }
+        const data = await j('/api/chat/fetch?since_id='+(initial?0:lastChatId));
+        if(initial){ chatBody.innerHTML=''; }
+        if(data.messages && data.messages.length){
+          data.messages.forEach(m => { renderMsg(m); lastChatId = Math.max(lastChatId, m.id); });
+          scrollChatToBottom();
+        }
+      }catch(e){
+        // ignore
+      }
+    }
+
+    async function updateChatGate(){
+      // determine login + level
+      try{
+        await j('/api/me');
+        isLogged = true;
+        const prof = await j('/api/profile');
+        myLevel = prof.level || 1;
+      }catch(e){
+        isLogged = false; myLevel = 0;
+      }
+      const canSend = isLogged && myLevel >= 5;
+      chatText.disabled = !canSend;
+      chatSend.disabled = !canSend;
+      if(!isLogged){
+        chatDisabled.style.display='';
+        chatDisabled.textContent = 'Login with Discord to view and chat.';
+      }else if(myLevel < 5){
+        chatDisabled.style.display='';
+        chatDisabled.textContent = `Reach Level 5 to chat (your level: ${myLevel}). You can still read.`;
+      }else{
+        chatDisabled.style.display='none';
+        chatDisabled.textContent = '';
+      }
+      chatNote.textContent = isLogged ? `You are Lv ${myLevel}` : 'Not logged in';
+    }
+
+    async function openChat(){
+      drawer.classList.add('open'); chatOpen=true;
+      await updateChatGate();
+      await fetchChat(true);
+      if(chatPoll) clearInterval(chatPoll);
+      chatPoll = setInterval(()=>{ if(chatOpen) fetchChat(false); }, 2000);
+    }
+    function closeChat(){ drawer.classList.remove('open'); chatOpen=false; if(chatPoll) {clearInterval(chatPoll); chatPoll=null;} }
+    function toggleChat(){ if(chatOpen) closeChat(); else openChat(); }
+
+    qs('chatClose').onclick = closeChat;
+
+    chatSend.onclick = async ()=>{
+      const t = chatText.value.trim();
+      if(!t) return;
+      try{
+        await j('/api/chat/send', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text:t})});
+        chatText.value='';
+        await fetchChat(false);
+      }catch(e){
+        alert(e.message);
+        await updateChatGate();
+      }
     };
+    chatText.addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ e.preventDefault(); chatSend.click(); } });
 
     // Poll Crash state every 1s while on crash tab
     setInterval(()=>{ if(pgCrash.style.display!=='none') refreshCrash(); }, 1000);
@@ -1157,6 +1277,29 @@ async def api_game_crash_history(request: Request, limit: int = Query(10, ge=1, 
     user = read_session(request)
     if not user: raise HTTPException(401, "Not logged in")
     return {"rows": your_history(user["id"], limit)}
+
+# ----- Global Chat API -----
+class ChatSendBody(BaseModel):
+    text: str
+
+@app.get("/api/chat/fetch")
+async def api_chat_fetch(request: Request, since_id: int = Query(0, ge=0), limit: int = Query(50, ge=1, le=200)):
+    user = read_session(request)
+    if not user: raise HTTPException(401, "Not logged in")
+    msgs = chat_fetch(since_id, min(limit, 200))
+    return {"messages": msgs}
+
+@app.post("/api/chat/send")
+async def api_chat_send(request: Request, body: ChatSendBody):
+    user = read_session(request)
+    if not user: raise HTTPException(401, "Not logged in")
+    try:
+        res = chat_send(str(user["id"]), user.get("username","user"), body.text)
+        return {"ok": True, "id": res["id"], "created_at": res["created_at"]}
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 @app.get("/health")
 async def health():

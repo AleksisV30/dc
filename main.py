@@ -1,4 +1,4 @@
-import os, json, asyncio, re, random, string, math
+import os, json, asyncio, re, random, string, math, secrets
 from urllib.parse import urlencode
 from typing import Optional
 
@@ -26,8 +26,11 @@ GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 GEM = "💎"
+HOUSE_EDGE = 0.01  # 1% house edge for Crash
+MIN_BET = 1       # DL
+MAX_BET = 1_000_000
 
-# ---------- DB (Postgres helpers) ----------
+# ---------- DB helpers ----------
 def with_conn(fn):
     def wrapper(*args, **kwargs):
         if not DATABASE_URL:
@@ -80,7 +83,7 @@ def init_db(cur):
             PRIMARY KEY(user_id, code)
         )
     """)
-    # profiles (unique referral name + XP)
+    # profiles (referral name + XP)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS profiles (
             user_id TEXT PRIMARY KEY,
@@ -90,8 +93,21 @@ def init_db(cur):
             created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # in case an older table exists without xp, add it
     cur.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS xp INTEGER NOT NULL DEFAULT 0")
+
+    # crash game history
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS crash_games (
+            id BIGSERIAL PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            bet INTEGER NOT NULL,
+            cashout NUMERIC(8,2) NOT NULL,
+            bust NUMERIC(10,2) NOT NULL,
+            win INTEGER NOT NULL,
+            xp_gain INTEGER NOT NULL,
+            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
 
 @with_conn
 def get_balance(cur, user_id: str) -> int:
@@ -203,7 +219,6 @@ def set_profile_name(cur, user_id: str, name: str):
     if not NAME_RE.match(name):
         raise ValueError("Name must be 3-20 chars [a-zA-Z0-9_-]")
     name_lower = name.lower()
-    # unique (case-insensitive)
     cur.execute("SELECT user_id FROM profiles WHERE name_lower = %s AND user_id <> %s", (name_lower, user_id))
     if cur.fetchone():
         raise ValueError("Name is already taken")
@@ -217,15 +232,18 @@ def set_profile_name(cur, user_id: str, name: str):
 
 @with_conn
 def ensure_profile_row(cur, user_id: str):
-    # create a minimal row if missing (with placeholder name to avoid nulls)
     cur.execute("INSERT INTO profiles(user_id, display_name, name_lower) VALUES (%s, %s, %s) ON CONFLICT (user_id) DO NOTHING",
                 (user_id, f"user_{user_id[-4:]}", f"user_{user_id[-4:]}"))
     cur.execute("SELECT display_name, xp FROM profiles WHERE user_id = %s", (user_id,))
     r = cur.fetchone()
     return {"display_name": r[0], "xp": int(r[1])}
 
+@with_conn
+def add_xp(cur, user_id: str, amount: int):
+    ensure_profile_row(user_id)
+    cur.execute("UPDATE profiles SET xp = xp + %s WHERE user_id = %s", (amount, user_id))
+
 def xp_to_level(xp: int):
-    # Simple: every 100 XP = +1 level, starting at level 1
     level = 1 + (xp // 100)
     base = (level - 1) * 100
     next_at = level * 100
@@ -233,6 +251,92 @@ def xp_to_level(xp: int):
     needed = next_at - base
     pct = 0 if needed == 0 else int(progress * 100 / needed)
     return {"level": int(level), "xp": int(xp), "progress": int(progress), "next_needed": int(needed), "pct": pct}
+
+# ---- Crash game logic ----
+def _rand_unit():
+    # uniform (0,1), never 0
+    n = secrets.randbelow(1_000_000_000) + 1  # 1..1e9
+    return n / 1_000_000_001.0
+
+def gen_crash_bust(edge: float = HOUSE_EDGE) -> float:
+    # Provably-fair style: P(B >= x) = (1 - edge) / x, x >= 1
+    u = _rand_unit()  # (0,1)
+    B = max(1.0, (1.0 - edge) / u)
+    # floor to 2 decimals
+    return math.floor(B * 100.0) / 100.0
+
+@with_conn
+def crash_play_db(cur, user_id: str, bet: int, cashout: float, edge: float = HOUSE_EDGE):
+    # Ensure balance row exists and lock it
+    cur.execute("INSERT INTO balances (user_id, balance) VALUES (%s, 0) ON CONFLICT (user_id) DO NOTHING", (user_id,))
+    cur.execute("SELECT balance FROM balances WHERE user_id=%s FOR UPDATE", (user_id,))
+    row = cur.fetchone()
+    bal = int(row[0]) if row else 0
+    if bet < MIN_BET:
+        raise ValueError(f"Min bet is {MIN_BET} DL")
+    if bet > MAX_BET:
+        raise ValueError(f"Max bet is {MAX_BET} DL")
+    if bal < bet:
+        raise ValueError("Insufficient balance")
+
+    # Deduct bet
+    cur.execute("UPDATE balances SET balance = balance - %s WHERE user_id = %s", (bet, user_id))
+
+    # Generate bust and resolve
+    bust = gen_crash_bust(edge)
+    win = 0
+    if cashout <= bust:
+        win = int(math.floor(bet * cashout + 1e-9))  # integer DL payout
+
+    # Credit win if any
+    if win > 0:
+        cur.execute("UPDATE balances SET balance = balance + %s WHERE user_id = %s", (win, user_id))
+
+    # XP gain: at least 1, capped
+    xp_gain = max(1, min(bet, 50))
+    ensure_profile_row(user_id)
+    cur.execute("UPDATE profiles SET xp = xp + %s WHERE user_id = %s", (xp_gain, user_id))
+
+    # Record game
+    cur.execute("""
+        INSERT INTO crash_games(user_id, bet, cashout, bust, win, xp_gain)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        RETURNING id
+    """, (user_id, bet, float(cashout), float(bust), win, xp_gain))
+    game_id = cur.fetchone()[0]
+
+    # Get new balance
+    cur.execute("SELECT balance FROM balances WHERE user_id=%s", (user_id,))
+    new_bal = int(cur.fetchone()[0])
+
+    return {
+        "id": int(game_id),
+        "bust": float(bust),
+        "win": int(win),
+        "net": int(win - bet),
+        "new_balance": new_bal,
+        "xp_gain": int(xp_gain),
+    }
+
+@with_conn
+def crash_history(cur, user_id: str, limit: int = 10):
+    cur.execute("""
+        SELECT id, bet, cashout, bust, win, xp_gain, created_at
+        FROM crash_games
+        WHERE user_id=%s
+        ORDER BY id DESC
+        LIMIT %s
+    """, (user_id, limit))
+    rows = cur.fetchall()
+    return [{
+        "id": int(r[0]),
+        "bet": int(r[1]),
+        "cashout": float(r[2]),
+        "bust": float(r[3]),
+        "win": int(r[4]),
+        "xp_gain": int(r[5]),
+        "created_at": str(r[6]),
+    } for r in rows]
 
 # ---------- Helpers ----------
 def parse_user_identifier(identifier: str) -> Optional[str]:
@@ -303,7 +407,7 @@ async def addbal(ctx: commands.Context, user: discord.User | None = None, amount
     e.set_footer(text="Currency: Growtopia Diamond Locks (DL)")
     await ctx.reply(embed=e, mention_author=False)
 
-# ---------- Web (FastAPI) ----------
+# ---------- Web (FastAPI + Frontend) ----------
 app = FastAPI()
 signer = URLSafeSerializer(SECRET_KEY, salt="session")
 
@@ -316,7 +420,6 @@ def read_session(request: Request) -> dict | None:
     try: return signer.loads(raw)
     except BadSignature: return None
 
-# ---- HTML (tabs + profile page + modal for balance click) ----
 INDEX_HTML = """
 <!doctype html>
 <html>
@@ -351,15 +454,17 @@ INDEX_HTML = """
     .muted{color:var(--muted)}
     input{width:100%; background:#0e1833; color:#e8efff; border:1px solid var(--border); border-radius:10px; padding:10px}
     .games-grid{display:grid; gap:12px; grid-template-columns:1fr; margin-top:16px}
-    @media(min-width:800px){.games-grid{grid-template-columns:repeat(3,1fr)}}
+    @media(min-width:1000px){.games-grid{grid-template-columns:repeat(2,1fr)}}
     .game{background:#0f1a33;border:1px solid var(--border);border-radius:16px;padding:14px}
     .banner{font-weight:900; font-size:18px}
     .owner{margin-top:16px; border-top:1px dashed var(--border); padding-top:12px}
     .xpbar{height:10px; background:#0e1833; border:1px solid var(--border); border-radius:999px; overflow:hidden}
     .xpfill{height:100%; background:linear-gradient(90deg,#22c1dc,#3b82f6)}
-    /* Modal */
     .modal{position:fixed; inset:0; background:rgba(0,0,0,.6); display:none; align-items:center; justify-content:center; padding:20px}
     .modal .box{background:#0f1a33; border:1px solid var(--border); border-radius:16px; padding:16px; max-width:520px; width:100%}
+    .bust{font-weight:800}
+    .win{color:#34d399}
+    .lose{color:#ef4444}
   </style>
 </head>
 <body>
@@ -378,9 +483,28 @@ INDEX_HTML = """
   <div class="container" style="padding-top:16px">
     <div id="page-games">
       <div class="card">
+        <div class="label">Crash — House edge 1%</div>
+        <div class="grid" style="grid-template-columns:1fr 1fr; gap:12px">
+          <div>
+            <div class="label">Bet (DL)</div>
+            <input id="crBet" type="number" min="1" step="1" placeholder="min 1" />
+          </div>
+          <div>
+            <div class="label">Cashout goal (×)</div>
+            <input id="crCash" type="number" min="1.01" step="0.01" value="2.00" />
+          </div>
+        </div>
+        <div style="margin-top:10px; display:flex; gap:8px; align-items:center">
+          <button class="btn primary" id="crPlay">Play</button>
+          <span class="muted">You can set any goal (e.g., 1.10×, 2×, 5×...). Min bet is 1 DL.</span>
+        </div>
+        <div id="crMsg" class="muted" style="margin-top:8px"></div>
+        <div id="crLast" style="margin-top:12px"></div>
+      </div>
+
+      <div class="card">
         <div class="label">Games</div>
         <div class="games-grid">
-          <div class="game"><div class="big">🎰 Lucky Spin</div><div class="muted">Coming soon.</div></div>
           <div class="game"><div class="big">🎯 Coin Flip</div><div class="muted">Coming soon.</div></div>
           <div class="game"><div class="big">🃏 Blackjack</div><div class="muted">Coming soon.</div></div>
         </div>
@@ -519,12 +643,11 @@ INDEX_HTML = """
         `;
         loginCard.style.display='none';
 
-        // Balance click → modal
+        // Balance click → modal, Avatar click → profile
         qs('balanceBtn').onclick = openModal;
-        // Avatar click → profile tab
         qs('avatarBtn').onclick = ()=>setTab('profile');
 
-        // ---- REFERRAL tab content ----
+        // ---- REFERRAL tab ----
         const refState = await j('/api/referral/state');
         if(refState.name){
           const base = location.origin;
@@ -591,10 +714,9 @@ INDEX_HTML = """
           </div>
         `;
 
-        // Owner panel (on Profile)
+        // Owner panel on profile
         if (me.id === 'OWNER_PLACEHOLDER') {
           const box = qs('ownerPanel'); box.style.display='';
-          // Adjust balance
           qs('tApply').onclick = async ()=>{
             const ident = qs('tIdent').value.trim();
             const amt = parseInt(qs('tAmt').value, 10);
@@ -606,11 +728,9 @@ INDEX_HTML = """
               const res = await j('/api/admin/adjust', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({identifier: ident, amount: amt, reason})});
               msg.textContent = 'OK — new balance: ' + fmtDL(res.new_balance);
               qs('tAmt').value=''; qs('tReason').value='';
-              // If you adjusted yourself, refresh profile numbers
               try { render(); } catch(e){}
             }catch(e){ msg.textContent = 'Error: ' + e.message; }
           };
-          // Create promo
           qs('cMake').onclick = async ()=>{
             const c = qs('cCode').value.trim();
             const a = parseInt(qs('cAmount').value, 10);
@@ -628,27 +748,57 @@ INDEX_HTML = """
           qs('ownerPanel').style.display='none';
         }
 
-        // Redeem button hookup
-        const redeemBtn = document.getElementById('redeemBtn');
-        if(redeemBtn){
-          redeemBtn.onclick = async ()=>{
-            const code = document.getElementById('promoInput').value.trim();
-            const msg = document.getElementById('promoMsg');
-            msg.textContent = '';
-            if(!code){ msg.textContent = 'Enter a code.'; return; }
-            try{
-              const res = await j('/api/promo/redeem', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({code})});
-              msg.textContent = 'Success! New balance: ' + fmtDL(res.new_balance);
-              document.getElementById('promoInput').value='';
-              render();
-            }catch(e){
-              msg.textContent = 'Error: ' + e.message;
-            }
-          };
+        // Hook up CRASH play button + load last plays
+        const crPlayBtn = document.getElementById('crPlay');
+        const crMsg = document.getElementById('crMsg');
+        const crLast = document.getElementById('crLast');
+
+        async function loadCrashHistory(){
+          try{
+            const h = await j('/api/game/crash/history');
+            if (!h.rows.length){ crLast.innerHTML = '<div class="muted">No recent rounds.</div>'; return; }
+            crLast.innerHTML = `
+              <div class="label">Your recent rounds</div>
+              <table><thead><tr><th>When</th><th>Bet</th><th>Goal</th><th>Bust</th><th>Win</th><th>XP</th></tr></thead>
+              <tbody>
+                ${h.rows.map(r=>`
+                  <tr>
+                    <td>${new Date(r.created_at).toLocaleString()}</td>
+                    <td>${fmtDL(r.bet)}</td>
+                    <td>${r.cashout.toFixed(2)}×</td>
+                    <td class="bust">${r.bust.toFixed(2)}×</td>
+                    <td class="${r.win>0?'win':'lose'}">${r.win>0?fmtDL(r.win):'-'}</td>
+                    <td>${r.xp_gain}</td>
+                  </tr>
+                `).join('')}
+              </tbody></table>
+            `;
+          }catch(e){ crLast.innerHTML = '<div class="muted">Unable to load history.</div>'; }
         }
+
+        crPlayBtn.onclick = async ()=>{
+          crMsg.textContent='';
+          const bet = parseInt(document.getElementById('crBet').value, 10);
+          const cash = parseFloat(document.getElementById('crCash').value);
+          if(Number.isNaN(bet) || bet < 1){ crMsg.textContent = 'Enter a bet of at least 1 DL.'; return; }
+          if(Number.isNaN(cash) || cash < 1.01){ crMsg.textContent = 'Cashout goal must be at least 1.01×.'; return; }
+          try{
+            const res = await j('/api/game/crash/play', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({bet, cashout: cash})});
+            const outcome = res.win > 0 ? `<span class="win">You won ${fmtDL(res.win)}!</span>` : `<span class="lose">Busted at ${res.bust.toFixed(2)}× — you lost.</span>`;
+            crMsg.innerHTML = `${outcome} New balance: <b>${fmtDL(res.new_balance)}</b> (+${res.xp_gain} XP)`;
+            // refresh header balance & profile stats
+            try{ render(); }catch(e){}
+            loadCrashHistory();
+          }catch(e){
+            crMsg.textContent = 'Error: ' + e.message;
+          }
+        };
+
+        loadCrashHistory();
 
       }catch(e){
         // not logged in
+        const auth = qs('authArea');
         auth.innerHTML = `
           <a class="btn primary" href="/login">Login</a>
           <button class="btn" id="registerBtn2">Register</button>
@@ -755,7 +905,6 @@ async def api_profile(request: Request):
     user = read_session(request)
     if not user: raise HTTPException(401, "Not logged in")
     uid = str(user["id"])
-    # ensure a row so XP exists
     info = ensure_profile_row(uid)
     lvl = xp_to_level(info["xp"])
     return {
@@ -825,11 +974,37 @@ async def api_admin_promo_create(request: Request, body: CreatePromoBody):
     if body.max_uses < 1: raise HTTPException(400, "Max uses must be >= 1")
     return create_promo(str(OWNER_ID), body.code, int(body.amount), int(body.max_uses), body.expires_at)
 
+# ----- Crash endpoints -----
+class CrashPlayBody(BaseModel):
+    bet: int
+    cashout: float
+
+@app.post("/api/game/crash/play")
+async def api_game_crash_play(request: Request, body: CrashPlayBody):
+    user = read_session(request)
+    if not user: raise HTTPException(401, "Not logged in")
+    bet = int(body.bet)
+    cash = float(body.cashout)
+    if bet < MIN_BET: raise HTTPException(400, f"Min bet is {MIN_BET} DL")
+    if bet > MAX_BET: raise HTTPException(400, f"Max bet is {MAX_BET} DL")
+    if cash < 1.01: raise HTTPException(400, "Cashout must be at least 1.01×")
+    try:
+        res = crash_play_db(str(user["id"]), bet, cash, HOUSE_EDGE)
+        return res
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+@app.get("/api/game/crash/history")
+async def api_game_crash_history(request: Request, limit: int = Query(10, ge=1, le=50)):
+    user = read_session(request)
+    if not user: raise HTTPException(401, "Not logged in")
+    return {"rows": crash_history(str(user["id"]), limit)}
+
 @app.get("/health")
 async def health():
     return {"ok": True}
 
-# ---------- Runner (resilient) ----------
+# ---------- Runner ----------
 async def main():
     import traceback, sys
     init_db()

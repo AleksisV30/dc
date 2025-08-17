@@ -1,8 +1,9 @@
-import os, sqlite3, json, asyncio
+import os, json, asyncio
 from urllib.parse import urlencode
 from typing import Optional
 
 import httpx
+import psycopg
 import discord
 from discord.ext import commands
 from fastapi import FastAPI, Request, HTTPException, Query
@@ -20,86 +21,86 @@ OAUTH_REDIRECT = os.getenv("OAUTH_REDIRECT")   # e.g. https://your-app.up.railwa
 SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret")
 PORT = int(os.getenv("PORT", "8080"))
 DISCORD_API = "https://discord.com/api"
-DB_PATH = "balances.db"
-OWNER_ID = 1128658280546320426  # owner
-GUILD_ID = int(os.getenv("GUILD_ID", "0"))     # <<< set this in Railway Variables
+OWNER_ID = 1128658280546320426
+GUILD_ID = int(os.getenv("GUILD_ID", "0"))
+
+DATABASE_URL = os.getenv("DATABASE_URL")  # set by Railway Postgres plugin
+if not DATABASE_URL:
+    print("WARNING: DATABASE_URL is not set. Add Railway Postgres and expose DATABASE_URL.")
 
 GEM = "💎"
 
-# ---------- DB ----------
-def init_db():
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    # balances
+# ---------- DB (Postgres) ----------
+def with_conn(fn):
+    def wrapper(*args, **kwargs):
+        if not DATABASE_URL:
+            raise RuntimeError("DATABASE_URL not set")
+        with psycopg.connect(DATABASE_URL) as con:
+            with con.cursor() as cur:
+                res = fn(cur, *args, **kwargs)
+                con.commit()
+                return res
+    return wrapper
+
+@with_conn
+def init_db(cur):
     cur.execute("""
         CREATE TABLE IF NOT EXISTS balances (
             user_id TEXT PRIMARY KEY,
             balance INTEGER NOT NULL DEFAULT 0
         )
     """)
-    # admin change log
     cur.execute("""
         CREATE TABLE IF NOT EXISTS balance_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id BIGSERIAL PRIMARY KEY,
             actor_id TEXT NOT NULL,
             target_id TEXT NOT NULL,
             amount INTEGER NOT NULL,
             reason TEXT,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    con.commit(); con.close()
 
-def get_balance(user_id: str) -> int:
-    con = sqlite3.connect(DB_PATH); cur = con.cursor()
-    cur.execute("SELECT balance FROM balances WHERE user_id = ?", (user_id,))
-    row = cur.fetchone(); con.close()
+@with_conn
+def get_balance(cur, user_id: str) -> int:
+    cur.execute("SELECT balance FROM balances WHERE user_id = %s", (user_id,))
+    row = cur.fetchone()
     return int(row[0]) if row else 0
 
-def add_balance(user_id: str, amount: int) -> int:
-    con = sqlite3.connect(DB_PATH); cur = con.cursor()
-    cur.execute("INSERT INTO balances (user_id, balance) VALUES (?, 0) "
-                "ON CONFLICT(user_id) DO NOTHING", (user_id,))
-    cur.execute("UPDATE balances SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
-    con.commit()
-    cur.execute("SELECT balance FROM balances WHERE user_id = ?", (user_id,))
-    new_bal = int(cur.fetchone()[0]); con.close()
-    return new_bal
+@with_conn
+def add_balance(cur, user_id: str, amount: int) -> int:
+    cur.execute("INSERT INTO balances (user_id, balance) VALUES (%s, 0) ON CONFLICT (user_id) DO NOTHING", (user_id,))
+    cur.execute("UPDATE balances SET balance = balance + %s WHERE user_id = %s", (amount, user_id))
+    cur.execute("SELECT balance FROM balances WHERE user_id = %s", (user_id,))
+    return int(cur.fetchone()[0])
 
-def adjust_balance(actor_id: str, target_id: str, amount: int, reason: Optional[str]) -> int:
-    con = sqlite3.connect(DB_PATH); cur = con.cursor()
-    cur.execute("INSERT INTO balances (user_id, balance) VALUES (?, 0) "
-                "ON CONFLICT(user_id) DO NOTHING", (target_id,))
-    cur.execute("UPDATE balances SET balance = balance + ? WHERE user_id = ?", (amount, target_id))
-    cur.execute("INSERT INTO balance_log(actor_id, target_id, amount, reason) VALUES (?, ?, ?, ?)",
+@with_conn
+def adjust_balance(cur, actor_id: str, target_id: str, amount: int, reason: Optional[str]) -> int:
+    cur.execute("INSERT INTO balances (user_id, balance) VALUES (%s, 0) ON CONFLICT (user_id) DO NOTHING", (target_id,))
+    cur.execute("UPDATE balances SET balance = balance + %s WHERE user_id = %s", (amount, target_id))
+    cur.execute("INSERT INTO balance_log(actor_id, target_id, amount, reason) VALUES (%s, %s, %s, %s)",
                 (actor_id, target_id, amount, reason))
-    con.commit()
-    cur.execute("SELECT balance FROM balances WHERE user_id = ?", (target_id,))
-    new_bal = int(cur.fetchone()[0]); con.close()
-    return new_bal
+    cur.execute("SELECT balance FROM balances WHERE user_id = %s", (target_id,))
+    return int(cur.fetchone()[0])
 
-def get_top_balances(limit: int = 20):
-    con = sqlite3.connect(DB_PATH); cur = con.cursor()
-    cur.execute("SELECT user_id, balance FROM balances ORDER BY balance DESC LIMIT ?", (limit,))
-    rows = [{"user_id": r[0], "balance": int(r[1])} for r in cur.fetchall()]
-    con.close()
-    return rows
+@with_conn
+def get_top_balances(cur, limit: int = 20):
+    cur.execute("SELECT user_id, balance FROM balances ORDER BY balance DESC LIMIT %s", (limit,))
+    return [{"user_id": r[0], "balance": int(r[1])} for r in cur.fetchall()]
 
-def get_recent_logs(limit: int = 20):
-    con = sqlite3.connect(DB_PATH); cur = con.cursor()
+@with_conn
+def get_recent_logs(cur, limit: int = 20):
     cur.execute("""
         SELECT actor_id, target_id, amount, reason, created_at
         FROM balance_log
         ORDER BY id DESC
-        LIMIT ?
+        LIMIT %s
     """, (limit,))
-    rows = [{"actor_id":r[0], "target_id":r[1], "amount":int(r[2]), "reason":r[3], "created_at":r[4]} for r in cur.fetchall()]
-    con.close()
-    return rows
+    rows = cur.fetchall()
+    return [{"actor_id":r[0], "target_id":r[1], "amount":int(r[2]), "reason":r[3], "created_at":str(r[4])} for r in rows]
 
 # ---------- Helpers ----------
 def parse_user_identifier(identifier: str) -> Optional[str]:
-    """Accepts raw ID or mention <@...>/<@!...>; returns raw numeric ID or None."""
     if not identifier: return None
     cleaned = identifier.strip().replace("<@!", "").replace("<@", "").replace(">", "")
     if cleaned.isdigit() and len(cleaned) >= 17:
@@ -116,7 +117,7 @@ def embed(title: str, desc: Optional[str] = None, color: int = 0x00C2FF) -> disc
 # ---------- Discord bot ----------
 intents = discord.Intents.default()
 intents.message_content = True
-intents.members = True  # REQUIRED for member search/autocomplete
+intents.members = True  # for owner panel autocomplete
 bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
 @bot.event
@@ -124,8 +125,7 @@ async def on_ready():
     g = bot.get_guild(GUILD_ID) if GUILD_ID else None
     print(f"Logged in as {bot.user} (id={bot.user.id}). Guild set: {bool(g)}")
     if g:
-        # Lazy info only; Discord will chunk members over time.
-        print(f"Guild: {g.name} ({g.id}) — member cache size: {len(g.members)}")
+        print(f"Guild: {g.name} ({g.id}) — cached members: {len(g.members)}")
 
 @bot.command(name="help")
 async def help_command(ctx: commands.Context):
@@ -154,11 +154,7 @@ async def help_command(ctx: commands.Context):
 async def bal(ctx: commands.Context, user: discord.User | None = None):
     target = user or ctx.author
     bal_value = get_balance(str(target.id))
-    e = embed(
-        title="Balance",
-        desc=f"{target.mention}\n**{fmt_dl(bal_value)}**",
-        color=0x34D399
-    )
+    e = embed(title="Balance", desc=f"{target.mention}\n**{fmt_dl(bal_value)}**", color=0x34D399)
     e.set_footer(text="Currency: Growtopia Diamond Locks (DL)")
     await ctx.reply(embed=e, mention_author=False)
 
@@ -167,15 +163,12 @@ async def addbal(ctx: commands.Context, user: discord.User | None = None, amount
     if ctx.author.id != OWNER_ID:
         e = embed("Not allowed", "Only the owner can adjust balances.", color=0xEF4444)
         return await ctx.reply(embed=e, mention_author=False)
-
     if user is None or amount is None:
         e = embed("Usage", f"`{PREFIX}addbal @User <amount>`", color=0xF59E0B)
         return await ctx.reply(embed=e, mention_author=False)
-
     if amount == 0:
         e = embed("Invalid amount", "Amount cannot be zero.", color=0xEF4444)
         return await ctx.reply(embed=e, mention_author=False)
-
     new_balance = adjust_balance(str(ctx.author.id), str(user.id), amount, reason="bot addbal")
     sign = "+" if amount > 0 else ""
     e = embed(
@@ -186,26 +179,18 @@ async def addbal(ctx: commands.Context, user: discord.User | None = None, amount
     e.set_footer(text="Currency: Growtopia Diamond Locks (DL)")
     await ctx.reply(embed=e, mention_author=False)
 
-# ---------- Web (FastAPI + OAuth) ----------
+# ---------- Web (FastAPI + OAuth + owner panel with autocomplete) ----------
 app = FastAPI()
 signer = URLSafeSerializer(SECRET_KEY, salt="session")
 
 def set_session(resp: RedirectResponse, payload: dict):
-    resp.set_cookie(
-        "session",
-        signer.dumps(payload),
-        httponly=True,
-        samesite="lax",
-        max_age=7*24*3600,
-    )
+    resp.set_cookie("session", signer.dumps(payload), httponly=True, samesite="lax", max_age=7*24*3600)
 
 def read_session(request: Request) -> dict | None:
     raw = request.cookies.get("session")
     if not raw: return None
-    try:
-        return signer.loads(raw)
-    except BadSignature:
-        return None
+    try: return signer.loads(raw)
+    except BadSignature: return None
 
 INDEX_HTML = """
 <!doctype html>
@@ -215,21 +200,13 @@ INDEX_HTML = """
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>💎 DL Bank</title>
   <style>
-    :root{
-      --bg:#0b1220; --card:#121a2b; --muted:#8aa0c7; --text:#e8efff;
-      --accent:#60a5fa; --ok:#34d399; --warn:#f59e0b; --err:#ef4444; --border:#23304c;
-    }
+    :root{ --bg:#0b1220; --card:#121a2b; --muted:#8aa0c7; --text:#e8efff; --accent:#60a5fa; --ok:#34d399; --warn:#f59e0b; --err:#ef4444; --border:#23304c; }
     *{box-sizing:border-box}
-    body{background:linear-gradient(180deg,#0a1020,#0e1530); color:var(--text); font-family:system-ui,Segoe UI,Roboto,Arial;
-         margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center; padding:24px}
+    body{background:linear-gradient(180deg,#0a1020,#0e1530); color:var(--text); font-family:system-ui,Segoe UI,Roboto,Arial; margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center; padding:24px}
     .wrap{width:100%; max-width:860px}
-    .hero{padding:22px 24px; background:linear-gradient(135deg,#0e1630 0%,#0a1124 100%); border:1px solid var(--border);
-          border-radius:18px; box-shadow:0 20px 60px rgba(0,0,0,.35)}
+    .hero{padding:22px 24px; background:linear-gradient(135deg,#0e1630 0%,#0a1124 100%); border:1px solid var(--border); border-radius:18px; box-shadow:0 20px 60px rgba(0,0,0,.35)}
     .row{display:flex; gap:16px; align-items:center; justify-content:space-between; flex-wrap:wrap}
-    .chip{background:#0c1631; border:1px solid var(--border); color:var(--muted); padding:6px 10px; border-radius:999px; font-size:12px}
-    .title{font-size:22px; font-weight:700; letter-spacing:.2px}
-    .btn{display:inline-flex; align-items:center; gap:8px; padding:10px 14px; border-radius:10px; text-decoration:none;
-         border:1px solid var(--border); color:var(--text); background:#0f1a33; cursor:pointer}
+    .btn{display:inline-flex; align-items:center; gap:8px; padding:10px 14px; border-radius:10px; text-decoration:none; border:1px solid var(--border); color:var(--text); background:#0f1a33; cursor:pointer}
     .btn.primary{background:linear-gradient(135deg,#3b82f6,#22c1dc); border-color:transparent}
     .grid{display:grid; gap:16px; grid-template-columns:1fr}
     @media(min-width:900px){.grid{grid-template-columns:1fr 1fr}}
@@ -239,8 +216,7 @@ INDEX_HTML = """
     table{width:100%; border-collapse:collapse; margin-top:10px}
     th,td{border-bottom:1px solid var(--border); padding:8px 6px; text-align:left}
     .muted{color:var(--muted)}
-    input,select{width:100%; background:#0e1833; color:var(--text); border:1px solid var(--border); border-radius:10px; padding:10px}
-    .actions{display:flex; gap:8px; flex-wrap:wrap}
+    input{width:100%; background:#0e1833; color:var(--text); border:1px solid var(--border); border-radius:10px; padding:10px}
     .pill{display:inline-flex; align-items:center; gap:6px; padding:6px 10px; border-radius:999px; background:#0f1a33; border:1px solid var(--border)}
     .suggest{margin-top:6px; border:1px solid var(--border); border-radius:10px; background:#0f1a33; display:none;}
     .sitem{padding:6px 8px; border-bottom:1px solid var(--border); cursor:pointer; display:flex; align-items:center; gap:8px}
@@ -308,7 +284,6 @@ INDEX_HTML = """
     }
     function fmtDL(n){ return `💎 ${Number(n).toLocaleString()} DL`; }
 
-    // --- simple @mention autocomplete for owner ---
     async function loadSuggestions(q){
       const data = await j('/api/admin/members?q='+encodeURIComponent(q||''));
       return data.members || [];
@@ -335,7 +310,6 @@ INDEX_HTML = """
           ownerBox.style.display = '';
           ownerTables.style.display = 'grid';
 
-          // Autocomplete handlers
           async function refreshSuggest(){
             const val = target.value.trim();
             if (!val.startsWith('@')) { suggest.style.display='none'; return; }
@@ -359,7 +333,6 @@ INDEX_HTML = """
             if (!suggest.contains(e.target) && e.target!==target) suggest.style.display='none';
           });
 
-          // Tables + adjust
           const top = await j('/api/admin/top');
           const logs = await j('/api/admin/logs');
           document.getElementById('top').innerHTML = `
@@ -380,7 +353,7 @@ INDEX_HTML = """
               if(Number.isNaN(amount)) throw new Error('Enter a numeric amount.');
               const res = await j('/api/admin/adjust', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({identifier: ident, amount, reason})});
               msg.textContent = 'OK. New balance: ' + fmtDL(res.new_balance);
-              const top = await j('/api/admin/top');  // refresh
+              const top = await j('/api/admin/top');
               const logs = await j('/api/admin/logs');
               document.getElementById('top').innerHTML = `
                 <table><thead><tr><th>User</th><th>Balance</th></tr></thead>
@@ -432,7 +405,6 @@ async def callback(code: str | None = None):
         raise HTTPException(400, "Missing code")
     if not (CLIENT_ID and CLIENT_SECRET and OAUTH_REDIRECT):
         raise HTTPException(500, "OAuth not configured")
-
     async with httpx.AsyncClient() as client:
         token = (await client.post(f"{DISCORD_API}/oauth2/token", data={
             "client_id": CLIENT_ID,
@@ -443,12 +415,10 @@ async def callback(code: str | None = None):
         })).json()
         if "access_token" not in token:
             raise HTTPException(400, f"OAuth token error: {token}")
-
         me = (await client.get(
             f"{DISCORD_API}/users/@me",
             headers={"Authorization": f"{token['token_type']} {token['access_token']}"}
         )).json()
-
     resp = RedirectResponse(url="/")
     set_session(resp, {"id": str(me["id"]), "username": me.get("username", "#")})
     return resp
@@ -462,15 +432,13 @@ async def logout():
 @app.get("/api/me")
 async def api_me(request: Request):
     user = read_session(request)
-    if not user:
-        raise HTTPException(401, "Not logged in")
+    if not user: raise HTTPException(401, "Not logged in")
     return JSONResponse(user)
 
 @app.get("/api/balance")
 async def api_balance(request: Request):
     user = read_session(request)
-    if not user:
-        raise HTTPException(401, "Not logged in")
+    if not user: raise HTTPException(401, "Not logged in")
     return JSONResponse({"balance": get_balance(str(user["id"]))})
 
 # -------- Admin APIs (owner-only) --------
@@ -481,10 +449,8 @@ class AdjustBody(BaseModel):
 
 def require_owner(request: Request):
     user = read_session(request)
-    if not user:
-        raise HTTPException(401, "Not logged in")
-    if str(user["id"]) != str(OWNER_ID):
-        raise HTTPException(403, "Owner only")
+    if not user: raise HTTPException(401, "Not logged in")
+    if str(user["id"]) != str(OWNER_ID): raise HTTPException(403, "Owner only")
     return user
 
 @app.get("/api/admin/top")
@@ -501,46 +467,36 @@ async def api_admin_logs(request: Request, limit: int = Query(20, ge=1, le=100))
 async def api_admin_balance(request: Request, identifier: str = Query(...)):
     require_owner(request)
     user_id = parse_user_identifier(identifier)
-    if not user_id:
-        raise HTTPException(400, "Invalid identifier (use raw ID or <@mention>)")
+    if not user_id: raise HTTPException(400, "Invalid identifier (use raw ID or <@mention>)")
     return {"user_id": user_id, "balance": get_balance(user_id)}
 
 @app.post("/api/admin/adjust")
 async def api_admin_adjust(request: Request, body: AdjustBody):
     actor = require_owner(request)
     user_id = parse_user_identifier(body.identifier)
-    if not user_id:
-        raise HTTPException(400, "Invalid identifier (use raw ID or <@mention>)")
-    if body.amount == 0:
-        raise HTTPException(400, "Amount cannot be zero")
+    if not user_id: raise HTTPException(400, "Invalid identifier (use raw ID or <@mention>)")
+    if body.amount == 0: raise HTTPException(400, "Amount cannot be zero")
     new_balance = adjust_balance(str(actor["id"]), user_id, int(body.amount), body.reason)
     return {"user_id": user_id, "new_balance": new_balance}
 
-# NEW: member search for owner autocomplete
 @app.get("/api/admin/members")
 async def api_admin_members(request: Request, q: str = Query("", description="Search after @ (optional)")):
     require_owner(request)
-    if not GUILD_ID:
-        raise HTTPException(400, "GUILD_ID not set")
+    if not GUILD_ID: raise HTTPException(400, "GUILD_ID not set")
     guild = bot.get_guild(GUILD_ID)
-    if not guild:
-        raise HTTPException(400, "Guild not found or bot not in guild")
-
+    if not guild: raise HTTPException(400, "Guild not found or bot not in guild")
     members = []
     try:
-        # If query text exists, search; otherwise return first few cached members
         if q:
             try:
-                found = await guild.search_members(q, limit=10)  # requires Server Members Intent
+                found = await guild.search_members(q, limit=10)
             except Exception:
                 found = []
         else:
-            found = list(guild.members)[:10]  # cached members if available
+            found = list(guild.members)[:10]
         for m in found:
-            try:
-                avatar = m.display_avatar.url
-            except Exception:
-                avatar = None
+            try: avatar = m.display_avatar.url
+            except Exception: avatar = None
             members.append({
                 "id": str(m.id),
                 "username": m.name,
@@ -548,7 +504,7 @@ async def api_admin_members(request: Request, q: str = Query("", description="Se
                 "mention": m.mention,
                 "avatar": avatar
             })
-    except Exception as e:
+    except Exception:
         members = []
     return {"members": members}
 
@@ -561,7 +517,6 @@ async def main():
     import traceback, sys
     init_db()
 
-    # Start web server
     config = uvicorn.Config(app, host="0.0.0.0", port=PORT, log_level="info")
     server = uvicorn.Server(config)
 
@@ -578,10 +533,7 @@ async def main():
                 traceback.print_exc()
                 await asyncio.sleep(10)
 
-    await asyncio.gather(
-        server.serve(),
-        run_bot_forever(),
-    )
+    await asyncio.gather(server.serve(), run_bot_forever())
 
 if __name__ == "__main__":
     asyncio.run(main())

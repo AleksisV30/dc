@@ -16,12 +16,13 @@ PREFIX = "."
 BOT_TOKEN = os.getenv("DISCORD_TOKEN")
 CLIENT_ID = os.getenv("DISCORD_CLIENT_ID")
 CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
-OAUTH_REDIRECT = os.getenv("OAUTH_REDIRECT")   # e.g. https://your-app.pella.dev/callback
+OAUTH_REDIRECT = os.getenv("OAUTH_REDIRECT")   # e.g. https://your-app.up.railway.app/callback
 SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret")
 PORT = int(os.getenv("PORT", "8080"))
 DISCORD_API = "https://discord.com/api"
 DB_PATH = "balances.db"
 OWNER_ID = 1128658280546320426  # owner
+GUILD_ID = int(os.getenv("GUILD_ID", "0"))     # <<< set this in Railway Variables
 
 GEM = "💎"
 
@@ -114,12 +115,40 @@ def embed(title: str, desc: Optional[str] = None, color: int = 0x00C2FF) -> disc
 
 # ---------- Discord bot ----------
 intents = discord.Intents.default()
-intents.message_content = True  # prefix commands
-bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)  # disable default help
+intents.message_content = True
+intents.members = True  # REQUIRED for member search/autocomplete
+bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user} (id={bot.user.id})")
+    g = bot.get_guild(GUILD_ID) if GUILD_ID else None
+    print(f"Logged in as {bot.user} (id={bot.user.id}). Guild set: {bool(g)}")
+    if g:
+        # Lazy info only; Discord will chunk members over time.
+        print(f"Guild: {g.name} ({g.id}) — member cache size: {len(g.members)}")
+
+@bot.command(name="help")
+async def help_command(ctx: commands.Context):
+    is_owner = (ctx.author.id == OWNER_ID)
+    e = embed(
+        title="💎 DL Bank — Help",
+        desc=f"Prefix: `{PREFIX}`",
+        color=0x60A5FA
+    )
+    e.add_field(
+        name="General",
+        value=(
+            f"**{PREFIX}help** — Show this help\n"
+            f"**{PREFIX}bal** — Show **your** balance\n"
+            f"**{PREFIX}bal @User** — Show **someone else’s** balance"
+        ),
+        inline=False
+    )
+    owner_line = f"**{PREFIX}addbal @User <amount>** — Add/subtract DL *(owner only)*"
+    if is_owner: owner_line += " ✅"
+    e.add_field(name="Admin", value=owner_line, inline=False)
+    e.set_footer(text="Currency: Growtopia Diamond Locks (DL)")
+    await ctx.reply(embed=e, mention_author=False)
 
 @bot.command(name="bal")
 async def bal(ctx: commands.Context, user: discord.User | None = None):
@@ -151,41 +180,8 @@ async def addbal(ctx: commands.Context, user: discord.User | None = None, amount
     sign = "+" if amount > 0 else ""
     e = embed(
         title="Balance Updated",
-        desc=(
-            f"**Target:** {user.mention}\n"
-            f"**Change:** `{sign}{amount}` → {fmt_dl(new_balance)}"
-        ),
+        desc=f"**Target:** {user.mention}\n**Change:** `{sign}{amount}` → {fmt_dl(new_balance)}",
         color=0x60A5FA
-    )
-    e.set_footer(text="Currency: Growtopia Diamond Locks (DL)")
-    await ctx.reply(embed=e, mention_author=False)
-
-@bot.command(name="help")
-async def help_command(ctx: commands.Context):
-    """Show a pretty embed with all commands."""
-    is_owner = (ctx.author.id == OWNER_ID)
-    e = embed(
-        title="💎 DL Bank — Help",
-        desc="Manage and view DL balances. Prefix: `{}`".format(PREFIX),
-        color=0x60A5FA
-    )
-    e.add_field(
-        name="General",
-        value=(
-            f"**{PREFIX}help** — Show this help\n"
-            f"**{PREFIX}bal** — Show **your** balance\n"
-            f"**{PREFIX}bal @User** — Show **someone else’s** balance"
-        ),
-        inline=False
-    )
-    owner_line = f"**{PREFIX}addbal @User <amount>** — Add/subtract DL *(owner only)*"
-    if is_owner:
-        owner_line += " ✅"
-    e.add_field(name="Admin", value=owner_line, inline=False)
-    e.add_field(
-        name="Website",
-        value="Use **Login with Discord** to see your balance and (owner) adjust others.",
-        inline=False
     )
     e.set_footer(text="Currency: Growtopia Diamond Locks (DL)")
     await ctx.reply(embed=e, mention_author=False)
@@ -246,6 +242,10 @@ INDEX_HTML = """
     input,select{width:100%; background:#0e1833; color:var(--text); border:1px solid var(--border); border-radius:10px; padding:10px}
     .actions{display:flex; gap:8px; flex-wrap:wrap}
     .pill{display:inline-flex; align-items:center; gap:6px; padding:6px 10px; border-radius:999px; background:#0f1a33; border:1px solid var(--border)}
+    .suggest{margin-top:6px; border:1px solid var(--border); border-radius:10px; background:#0f1a33; display:none;}
+    .sitem{padding:6px 8px; border-bottom:1px solid var(--border); cursor:pointer; display:flex; align-items:center; gap:8px}
+    .sitem:last-child{border-bottom:none}
+    .sitem img{width:20px; height:20px; border-radius:50%; object-fit:cover}
   </style>
 </head>
 <body>
@@ -266,11 +266,11 @@ INDEX_HTML = """
 
       <div id="ownerBox" class="card" style="display:none">
         <div class="label">Owner Panel</div>
-        <div class="pill" style="margin:8px 0">Adjust balances, view top holders & logs.</div>
         <div class="row" style="gap:8px; align-items:flex-end">
           <div style="flex:2">
             <div class="label">Discord ID or &lt;@mention&gt;</div>
-            <input id="target" placeholder="e.g. 1128658280546320426 or <@1128...>" />
+            <input id="target" placeholder="Type an ID… or start with @ to search members" />
+            <div id="suggest" class="suggest"></div>
           </div>
           <div style="flex:1">
             <div class="label">Amount (+/-)</div>
@@ -306,14 +306,22 @@ INDEX_HTML = """
       if(!r.ok) throw new Error(await r.text());
       return r.json();
     }
-
     function fmtDL(n){ return `💎 ${Number(n).toLocaleString()} DL`; }
+
+    // --- simple @mention autocomplete for owner ---
+    async function loadSuggestions(q){
+      const data = await j('/api/admin/members?q='+encodeURIComponent(q||''));
+      return data.members || [];
+    }
 
     async function render(){
       const auth = document.getElementById('auth');
       const balEl = document.getElementById('bal');
       const ownerBox = document.getElementById('ownerBox');
       const ownerTables = document.getElementById('ownerTables');
+      const target = document.getElementById('target');
+      const suggest = document.getElementById('suggest');
+
       try{
         const me = await j('/api/me');
         auth.innerHTML = `
@@ -327,42 +335,52 @@ INDEX_HTML = """
           ownerBox.style.display = '';
           ownerTables.style.display = 'grid';
 
+          // Autocomplete handlers
+          async function refreshSuggest(){
+            const val = target.value.trim();
+            if (!val.startsWith('@')) { suggest.style.display='none'; return; }
+            const query = val.slice(1);
+            const members = await loadSuggestions(query);
+            if(!members.length){ suggest.style.display='none'; return; }
+            suggest.innerHTML = members.map(m=>`
+              <div class="sitem" data-id="${m.id}">
+                ${m.avatar ? `<img src="${m.avatar}" alt="">` : `<img src="" alt="">`}
+                <span><b>${m.display_name || m.username}</b> <span class="muted">@${m.username}</span> <span class="muted">(${m.id})</span></span>
+              </div>
+            `).join('');
+            [...suggest.querySelectorAll('.sitem')].forEach(el=>{
+              el.onclick = ()=>{ target.value = '<@'+el.dataset.id+'>'; suggest.style.display='none'; };
+            });
+            suggest.style.display='';
+          }
+          target.addEventListener('input', refreshSuggest);
+          target.addEventListener('focus', refreshSuggest);
+          document.addEventListener('click', (e)=>{
+            if (!suggest.contains(e.target) && e.target!==target) suggest.style.display='none';
+          });
+
+          // Tables + adjust
           const top = await j('/api/admin/top');
           const logs = await j('/api/admin/logs');
-
           document.getElementById('top').innerHTML = `
-            <table>
-              <thead><tr><th>User</th><th>Balance</th></tr></thead>
-              <tbody>${top.rows.map(r=>`<tr><td>&lt;@${r.user_id}&gt;</td><td>${fmtDL(r.balance)}</td></tr>`).join('')}</tbody>
-            </table>
-          `;
+            <table><thead><tr><th>User</th><th>Balance</th></tr></thead>
+            <tbody>${top.rows.map(r=>`<tr><td>&lt;@${r.user_id}&gt;</td><td>${fmtDL(r.balance)}</td></tr>`).join('')}</tbody></table>`;
           document.getElementById('logs').innerHTML = `
-            <table>
-              <thead><tr><th>When</th><th>Actor</th><th>Target</th><th>Change</th><th>Reason</th></tr></thead>
-              <tbody>${logs.rows.map(r=>`<tr>
-                <td>${r.created_at}</td>
-                <td>&lt;@${r.actor_id}&gt;</td>
-                <td>&lt;@${r.target_id}&gt;</td>
-                <td>${r.amount>0?'+':''}${r.amount}</td>
-                <td>${r.reason ?? ''}</td>
-              </tr>`).join('')}</tbody>
-            </table>
-          `;
+            <table><thead><tr><th>When</th><th>Actor</th><th>Target</th><th>Change</th><th>Reason</th></tr></thead>
+            <tbody>${logs.rows.map(r=>`<tr><td>${r.created_at}</td><td>&lt;@${r.actor_id}&gt;</td><td>&lt;@${r.target_id}&gt;</td><td>${r.amount>0?'+':''}${r.amount}</td><td>${r.reason ?? ''}</td></tr>`).join('')}</tbody></table>`;
 
           document.getElementById('doAdjust').onclick = async ()=>{
-            const target = document.getElementById('target').value.trim();
             const amount = parseInt(document.getElementById('amount').value, 10);
             const reason = document.getElementById('reason').value.trim();
             const msg = document.getElementById('msg');
             msg.textContent = '';
             try{
-              if(!target || Number.isNaN(amount)) throw new Error('Fill target and amount.');
-              const res = await j('/api/admin/adjust', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({identifier: target, amount, reason})});
+              const ident = target.value.trim();
+              if(!ident) throw new Error('Fill the target field.');
+              if(Number.isNaN(amount)) throw new Error('Enter a numeric amount.');
+              const res = await j('/api/admin/adjust', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({identifier: ident, amount, reason})});
               msg.textContent = 'OK. New balance: ' + fmtDL(res.new_balance);
-              // refresh cards
-              const bal = await j('/api/balance');
-              balEl.textContent = fmtDL(bal.balance);
-              const top = await j('/api/admin/top');
+              const top = await j('/api/admin/top');  // refresh
               const logs = await j('/api/admin/logs');
               document.getElementById('top').innerHTML = `
                 <table><thead><tr><th>User</th><th>Balance</th></tr></thead>
@@ -498,20 +516,71 @@ async def api_admin_adjust(request: Request, body: AdjustBody):
     new_balance = adjust_balance(str(actor["id"]), user_id, int(body.amount), body.reason)
     return {"user_id": user_id, "new_balance": new_balance}
 
+# NEW: member search for owner autocomplete
+@app.get("/api/admin/members")
+async def api_admin_members(request: Request, q: str = Query("", description="Search after @ (optional)")):
+    require_owner(request)
+    if not GUILD_ID:
+        raise HTTPException(400, "GUILD_ID not set")
+    guild = bot.get_guild(GUILD_ID)
+    if not guild:
+        raise HTTPException(400, "Guild not found or bot not in guild")
+
+    members = []
+    try:
+        # If query text exists, search; otherwise return first few cached members
+        if q:
+            try:
+                found = await guild.search_members(q, limit=10)  # requires Server Members Intent
+            except Exception:
+                found = []
+        else:
+            found = list(guild.members)[:10]  # cached members if available
+        for m in found:
+            try:
+                avatar = m.display_avatar.url
+            except Exception:
+                avatar = None
+            members.append({
+                "id": str(m.id),
+                "username": m.name,
+                "display_name": m.display_name,
+                "mention": m.mention,
+                "avatar": avatar
+            })
+    except Exception as e:
+        members = []
+    return {"members": members}
+
 @app.get("/health")
 async def health():
     return {"ok": True}
 
-# ---------- Runner ----------
+# ---------- Runner (resilient) ----------
 async def main():
+    import traceback, sys
     init_db()
-    if not BOT_TOKEN:
-        raise RuntimeError("DISCORD_TOKEN env var not set.")
+
+    # Start web server
     config = uvicorn.Config(app, host="0.0.0.0", port=PORT, log_level="info")
     server = uvicorn.Server(config)
+
+    async def run_bot_forever():
+        while True:
+            try:
+                if not BOT_TOKEN:
+                    raise RuntimeError("DISCORD_TOKEN env var not set.")
+                await bot.start(BOT_TOKEN)
+            except discord.errors.LoginFailure:
+                print("[bot] LoginFailure: bad token. Fix DISCORD_TOKEN in Railway.", file=sys.stderr)
+                await asyncio.sleep(3600)
+            except Exception:
+                traceback.print_exc()
+                await asyncio.sleep(10)
+
     await asyncio.gather(
-        bot.start(BOT_TOKEN),
-        server.serve()
+        server.serve(),
+        run_bot_forever(),
     )
 
 if __name__ == "__main__":

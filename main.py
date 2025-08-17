@@ -56,20 +56,13 @@ def iso(dt: Optional[str|datetime.datetime]) -> Optional[str]:
     return dt.astimezone(UTC).isoformat()
 
 # ---------- FastAPI ----------
-from fastapi.staticfiles import StaticFiles
-import os
-
 app = FastAPI()
 
-# Ensure the folder exists so StaticFiles won't crash
-BASE_DIR = os.path.dirname(__file__)
+# Ensure /static exists so StaticFiles won't crash
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 os.makedirs(STATIC_DIR, exist_ok=True)
-
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-
-# serve /static for your future images
-app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # ---------- DB helpers ----------
 def with_conn(fn):
@@ -823,7 +816,7 @@ HTML_TEMPLATE = """
     .boom{ position:absolute; inset:0; pointer-events:none; opacity:0; }
     .boom.bang{ animation: bang .6s ease-out; }
     @keyframes bang{
-      0%{ opacity:.95; background: radial-gradient(350px 350px at var(--x,50%) var(--y,50%), rgba(255,255,255,.9), rgba(239,68,68,.6) 40%, transparent 70%); }
+      0%{ opacity=.95; background: radial-gradient(350px 350px at var(--x,50%) var(--y,50%), rgba(255,255,255,.9), rgba(239,68,68,.6) 40%, transparent 70%); }
       100%{ opacity:0; background: radial-gradient(800px 800px at var(--x,50%) var(--y,50%), rgba(255,255,255,.0), rgba(239,68,68,.0) 40%, transparent 75%); }
     }
 
@@ -2238,4 +2231,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-

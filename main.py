@@ -1,6 +1,6 @@
-import os, json, asyncio, re, random, string, math, secrets, datetime
+import os, json, asyncio, re, random, string, math, secrets, datetime, hashlib
 from urllib.parse import urlencode
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, List
 
 import httpx
 import psycopg
@@ -26,10 +26,10 @@ GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 GEM = "💎"
-HOUSE_EDGE = 0.01      # 1% house edge
+HOUSE_EDGE = 0.01      # 1% per action
 MIN_BET = 1            # DL
 MAX_BET = 1_000_000
-BETTING_SECONDS = 10   # time to place bets between rounds
+BETTING_SECONDS = 10   # Crash betting window
 
 # ---------- Time helpers ----------
 UTC = datetime.timezone.utc
@@ -102,7 +102,7 @@ def init_db(cur):
         )
     """)
 
-    # crash (multiplayer)
+    # crash
     cur.execute("""
         CREATE TABLE IF NOT EXISTS crash_rounds (
             id BIGSERIAL PRIMARY KEY,
@@ -120,8 +120,8 @@ def init_db(cur):
             round_id BIGINT NOT NULL,
             user_id TEXT NOT NULL,
             bet INTEGER NOT NULL,
-            cashout NUMERIC(8,2) NOT NULL, -- auto cashout goal
-            cashed_out NUMERIC(8,2),       -- live cashout multiplier (optional)
+            cashout NUMERIC(8,2) NOT NULL,
+            cashed_out NUMERIC(8,2),
             cashed_out_at TIMESTAMPTZ,
             win INTEGER NOT NULL DEFAULT 0,
             resolved BOOLEAN NOT NULL DEFAULT FALSE,
@@ -153,6 +153,24 @@ def init_db(cur):
             username TEXT NOT NULL,
             text TEXT NOT NULL,
             created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # MINES
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS mines_games (
+            id BIGSERIAL PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            bet INTEGER NOT NULL,
+            mines INTEGER NOT NULL,
+            board TEXT NOT NULL,               -- 25 chars '0'/'1'
+            picks BIGINT NOT NULL DEFAULT 0,   -- bitmask of revealed tiles
+            started_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+            ended_at TIMESTAMPTZ,
+            status TEXT NOT NULL DEFAULT 'active',  -- active|lost|cashed
+            seed TEXT NOT NULL,
+            commit_hash TEXT NOT NULL,
+            win INTEGER NOT NULL DEFAULT 0
         )
     """)
 
@@ -450,42 +468,136 @@ def your_history(cur, user_id: str, limit: int = 10):
                    ORDER BY id DESC LIMIT %s""", (user_id, limit))
     return [{"bet":int(r[0]),"cashout":float(r[1]),"bust":float(r[2]),"win":int(r[3]),"xp_gain":int(r[4]),"created_at":str(r[5])} for r in cur.fetchall()]
 
-# ---------- Global Chat ----------
-@with_conn
-def chat_send(cur, user_id: str, username: str, text: str):
-    text = (text or "").strip()
-    if not text: raise ValueError("Message is empty")
-    if len(text) > 300: raise ValueError("Message is too long (max 300)")
-    ensure_profile_row(user_id)
-    cur.execute("SELECT xp FROM profiles WHERE user_id=%s", (user_id,))
-    xp = int(cur.fetchone()[0])
-    lvl = 1 + xp // 100
-    if lvl < 5: raise PermissionError("You must be level 5 to chat")
-    cur.execute("INSERT INTO chat_messages(user_id, username, text) VALUES (%s,%s,%s) RETURNING id, created_at",
-                (user_id, username, text))
-    row = cur.fetchone()
-    return {"id": int(row[0]), "created_at": str(row[1])}
+# ---------- MINES helpers ----------
+def mines_random_board(mines: int) -> str:
+    idxs = list(range(25))
+    random.shuffle(idxs)
+    mines_set = set(idxs[:mines])
+    return ''.join('1' if i in mines_set else '0' for i in range(25))
+
+def sha256(s: str) -> str:
+    return hashlib.sha256(s.encode('utf-8')).hexdigest()
+
+def picks_count_from_bitmask(mask: int) -> int:
+    return mask.bit_count()
+
+def mines_multiplier(mines: int, picks_count: int) -> float:
+    # Fair multiplier (no edge): Π (25 - i)/(25 - mines - i), i=0..picks-1
+    # Apply house edge per safe pick.
+    if picks_count <= 0: return 1.0
+    total = 1.0
+    for i in range(picks_count):
+        total *= (25.0 - i) / max(1.0, (25.0 - mines - i))
+        total *= (1.0 - HOUSE_EDGE)
+    return total
 
 @with_conn
-def chat_fetch(cur, since_id: int, limit: int = 50):
-    if since_id <= 0:
-        cur.execute("""SELECT id, user_id, username, text, created_at
-                       FROM chat_messages ORDER BY id DESC LIMIT %s""", (limit,))
-        rows = list(reversed(cur.fetchall()))
+def mines_active_for(cur, user_id: str):
+    cur.execute("""SELECT id, bet, mines, board, picks, seed, commit_hash, status
+                   FROM mines_games
+                   WHERE user_id=%s AND status='active'
+                   ORDER BY id DESC LIMIT 1""", (user_id,))
+    r = cur.fetchone()
+    if not r: return None
+    return {
+        "id": int(r[0]), "bet": int(r[1]), "mines": int(r[2]),
+        "board": str(r[3]), "picks": int(r[4]),
+        "seed": str(r[5]), "hash": str(r[6]), "status": str(r[7])
+    }
+
+@with_conn
+def mines_start(cur, user_id: str, bet: int, mines: int):
+    if bet < MIN_BET or bet > MAX_BET: raise ValueError(f"Bet must be between {MIN_BET} and {MAX_BET}")
+    if mines < 1 or mines > 24: raise ValueError("Mines must be between 1 and 24")
+    cur.execute("SELECT 1 FROM mines_games WHERE user_id=%s AND status='active'", (user_id,))
+    if cur.fetchone(): raise ValueError("You already have an active Mines game")
+
+    # balance
+    cur.execute("INSERT INTO balances(user_id,balance) VALUES (%s,0) ON CONFLICT(user_id) DO NOTHING", (user_id,))
+    cur.execute("SELECT balance FROM balances WHERE user_id=%s FOR UPDATE", (user_id,))
+    bal = int(cur.fetchone()[0])
+    if bal < bet: raise ValueError("Insufficient balance")
+    cur.execute("UPDATE balances SET balance=balance-%s WHERE user_id=%s", (bet, user_id))
+
+    board = mines_random_board(mines)
+    seed = secrets.token_hex(16)
+    commit_hash = sha256(f"{seed}:{board}")
+    cur.execute("""INSERT INTO mines_games(user_id, bet, mines, board, seed, commit_hash)
+                   VALUES (%s,%s,%s,%s,%s,%s) RETURNING id""",
+                (user_id, bet, mines, board, seed, commit_hash))
+    gid = int(cur.fetchone()[0])
+    return {"id": gid, "hash": commit_hash}
+
+@with_conn
+def mines_pick(cur, user_id: str, index: int):
+    if index < 0 or index >= 25: raise ValueError("Invalid tile")
+    cur.execute("""SELECT id, bet, mines, board, picks, status
+                   FROM mines_games WHERE user_id=%s AND status='active'
+                   ORDER BY id DESC LIMIT 1 FOR UPDATE""", (user_id,))
+    r = cur.fetchone()
+    if not r: raise ValueError("No active Mines game")
+    gid, bet, mines, board, picks, status = int(r[0]), int(r[1]), int(r[2]), str(r[3]), int(r[4]), str(r[5])
+    bit = 1 << index
+    if picks & bit: raise ValueError("Tile already revealed")
+
+    # reveal
+    is_mine = (board[index] == '1')
+    new_picks = picks | bit
+    if is_mine:
+        # lost
+        cur.execute("""UPDATE mines_games
+                       SET picks=%s, status='lost', ended_at=NOW()
+                       WHERE id=%s""", (new_picks, gid))
+        return {"status": "lost", "board": board, "index": index}
     else:
-        cur.execute("""SELECT id, user_id, username, text, created_at
-                       FROM chat_messages WHERE id > %s ORDER BY id ASC LIMIT %s""", (since_id, limit))
-        rows = cur.fetchall()
-    uids = list({r[1] for r in rows})
-    levels: Dict[str, int] = {}
-    if uids:
-        cur.execute("SELECT user_id, xp FROM profiles WHERE user_id = ANY(%s)", (uids,))
-        for uid, xp in cur.fetchall():
-            levels[str(uid)] = 1 + int(xp) // 100
+        # safe
+        cur.execute("""UPDATE mines_games SET picks=%s WHERE id=%s""", (new_picks, gid))
+        pcount = picks_count_from_bitmask(new_picks)
+        mult = mines_multiplier(mines, pcount)
+        win = int(math.floor(bet * mult))
+        return {"status": "active", "picks": new_picks, "multiplier": round(mult, 4), "potential_win": win}
+
+@with_conn
+def mines_cashout(cur, user_id: str):
+    cur.execute("""SELECT id, bet, mines, board, picks, status
+                   FROM mines_games WHERE user_id=%s AND status='active'
+                   ORDER BY id DESC LIMIT 1 FOR UPDATE""", (user_id,))
+    r = cur.fetchone()
+    if not r: raise ValueError("No active Mines game")
+    gid, bet, mines, board, picks, status = int(r[0]), int(r[1]), int(r[2]), str(r[3]), int(r[4]), str(r[5])
+    pcount = picks_count_from_bitmask(picks)
+    if pcount < 1: raise ValueError("Reveal at least one tile before cashing out")
+    mult = mines_multiplier(mines, pcount)
+    win = int(math.floor(bet * mult))
+    cur.execute("UPDATE balances SET balance=balance+%s WHERE user_id=%s", (win, user_id))
+    cur.execute("""UPDATE mines_games
+                   SET status='cashed', win=%s, ended_at=NOW()
+                   WHERE id=%s""", (win, gid))
+    return {"win": win, "board": board}
+
+@with_conn
+def mines_state(cur, user_id: str):
+    cur.execute("""SELECT id, bet, mines, picks, commit_hash, status
+                   FROM mines_games WHERE user_id=%s AND status<>'lost'
+                   ORDER BY id DESC LIMIT 1""", (user_id,))
+    r = cur.fetchone()
+    if not r: return None
+    return {"id": int(r[0]), "bet": int(r[1]), "mines": int(r[2]),
+            "picks": int(r[3]), "hash": str(r[4]), "status": str(r[5])}
+
+@with_conn
+def mines_history(cur, user_id: str, limit: int = 15):
+    cur.execute("""SELECT id, bet, mines, win, status, started_at, ended_at, commit_hash, seed, board
+                   FROM mines_games WHERE user_id=%s AND status<>'active'
+                   ORDER BY id DESC LIMIT %s""", (user_id, limit))
+    rows = cur.fetchall()
     out = []
-    for mid, uid, uname, txt, ts in rows:
-        lvl = levels.get(str(uid), 1)
-        out.append({"id": int(mid), "user_id": str(uid), "username": uname, "level": int(lvl), "text": txt, "created_at": str(ts)})
+    for r in rows:
+        out.append({
+            "id": int(r[0]), "bet": int(r[1]), "mines": int(r[2]), "win": int(r[3]),
+            "status": str(r[4]), "started_at": str(r[5]), "ended_at": str(r[6]),
+            "hash": str(r[7]), "seed": str(r[8]), "board": str(r[9])
+        })
     return out
 
 # ---------- Discord bot ----------
@@ -595,12 +707,17 @@ HTML_TEMPLATE = """
     .avatar{width:34px;height:34px;border-radius:50%;object-fit:cover;border:1px solid var(--border); cursor:pointer}
     .btn{display:inline-flex; align-items:center; gap:8px; padding:10px 14px; border-radius:12px; border:1px solid var(--border); background:linear-gradient(180deg,#0e1833,#0b1326); cursor:pointer; font-weight:600}
     .btn.primary{background:linear-gradient(135deg,#3b82f6,#22c1dc); border-color:transparent}
-    .btn.ghost{
-      background:#162a52;
-      border:1px solid var(--border);
-      color:#eaf2ff;
-    }
+    .btn.ghost{ background:#162a52; border:1px solid var(--border); color:#eaf2ff; }
     .btn.ghost:hover{ filter:brightness(1.1) }
+    .btn.cashout{
+      background: linear-gradient(135deg,#22c55e,#16a34a);
+      border-color: transparent;
+      box-shadow: 0 6px 14px rgba(34,197,94,.25);
+      font-weight:800;
+    }
+    .btn.cashout:hover{ filter:brightness(1.05) }
+    .btn.cashout[disabled]{ filter:grayscale(.5) brightness(.8); opacity:.8; cursor:not-allowed }
+
     .grid{display:grid; gap:16px; grid-template-columns:1fr}
     @media(min-width:980px){.grid{grid-template-columns:1fr 1fr}}
     .card{background:linear-gradient(180deg,var(--bg2),#0b1428); border:1px solid var(--border); border-radius:18px; padding:16px; box-shadow: 0 6px 20px rgba(0,0,0,.25)}
@@ -623,7 +740,7 @@ HTML_TEMPLATE = """
     .bust-bad{color:#ef6a6a}
     .bust-good{color:#4bd3a8}
 
-    /* Vertical graph */
+    /* Crash graph */
     .cr-graph-wrap{position:relative; height:240px; background:#0e1833; border:1px solid var(--border); border-radius:16px; overflow:hidden}
     canvas{display:block; width:100%; height:100%}
 
@@ -643,6 +760,22 @@ HTML_TEMPLATE = """
     .time{margin-left:auto; font-size:11px; color:#8aa0c7}
     .txt{margin-top:4px; font-size:14px; white-space:pre-wrap; word-break:break-word}
     .disabled-note{font-size:12px; color:#8aa0c7; padding:0 12px 10px}
+
+    /* Mines */
+    .mines-top{display:flex; gap:12px; align-items:center; flex-wrap:wrap; justify-content:space-between}
+    .mines-grid{display:grid; grid-template-columns:repeat(5, 1fr); gap:8px; margin-top:12px}
+    .tile{
+      aspect-ratio:1/1; border-radius:12px; border:1px solid var(--border);
+      background:linear-gradient(180deg,#0f1936,#0c152a); display:flex; align-items:center; justify-content:center;
+      font-weight:800; font-size:18px; cursor:pointer; user-select:none;
+      transition:transform .06s ease, box-shadow .12s ease, background .12s ease;
+    }
+    .tile:hover{ transform:translateY(-1px); box-shadow:0 6px 12px rgba(0,0,0,.25) }
+    .tile.safe{ background:linear-gradient(135deg,#16a34a,#22c55e); border-color:transparent }
+    .tile.mine{ background:linear-gradient(135deg,#ef4444,#b91c1c); border-color:transparent }
+    .tile.revealed{ cursor:default }
+    .meta{display:flex; gap:8px; align-items:center; flex-wrap:wrap}
+    .tag{padding:6px 8px; border-radius:999px; border:1px solid var(--border); background:#0c1631; color:#cfe6ff; font-size:12px}
 
     @media (max-width: 640px){
       .big{font-size:22px}
@@ -677,9 +810,9 @@ HTML_TEMPLATE = """
             <div class="big">🚀 Crash</div>
             <div class="muted">Shared rounds • 10s betting • Live cashout</div>
           </div>
-          <div class="game-card">
-            <div class="big">🎯 Coin Flip</div>
-            <div class="muted">Coming soon.</div>
+          <div class="game-card" id="openMines">
+            <div class="big">💣 Mines</div>
+            <div class="muted">5×5 board • Choose mines • Cash out anytime</div>
           </div>
         </div>
       </div>
@@ -693,7 +826,9 @@ HTML_TEMPLATE = """
             <div class="cr-multi" id="crNow">0.00×</div>
             <div class="cr-small" id="crHint">Loading…</div>
           </div>
-          <div><button class="chip" id="backToGames">← Games</button></div>
+          <div class="meta">
+            <button class="chip" id="backToGames">← Games</button>
+          </div>
         </div>
 
         <div class="cr-graph-wrap">
@@ -716,7 +851,7 @@ HTML_TEMPLATE = """
 
           <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap">
             <button class="btn primary" id="crPlace">Place Bet</button>
-            <button class="btn" id="crCashout" style="display:none">💸 Cash Out</button>
+            <button class="btn cashout" id="crCashout" style="display:none">💸 Cash Out</button>
             <span id="crMsg" class="muted"></span>
           </div>
         </div>
@@ -725,6 +860,49 @@ HTML_TEMPLATE = """
       <div class="card">
         <div class="label">Your recent rounds</div>
         <div id="crLast" class="muted">—</div>
+      </div>
+    </div>
+
+    <!-- Mines -->
+    <div id="page-mines" style="display:none">
+      <div class="card">
+        <div class="mines-top">
+          <div>
+            <div class="big">💣 Mines</div>
+            <div class="muted">Choose mines, reveal safes, and cash out anytime.</div>
+          </div>
+          <div><button class="chip" id="backToGames2">← Games</button></div>
+        </div>
+
+        <div class="grid" style="grid-template-columns:1fr 1fr; gap:12px; margin-top:10px">
+          <div>
+            <div class="label">Bet (DL)</div>
+            <input id="mBet" type="number" min="1" step="1" placeholder="min 1"/>
+          </div>
+          <div>
+            <div class="label">Mines (1–24)</div>
+            <input id="mMines" type="number" min="1" max="24" step="1" value="3"/>
+          </div>
+        </div>
+
+        <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:10px 0 6px">
+          <button class="btn primary" id="mStart">Start Game</button>
+          <button class="btn cashout" id="mCash" style="display:none">💸 Cash Out</button>
+          <span id="mMsg" class="muted"></span>
+        </div>
+
+        <div class="meta">
+          <span class="tag" id="mHash">Commit: —</span>
+          <span class="tag" id="mStatus">Status: —</span>
+          <span class="tag" id="mPotential">Potential: —</span>
+        </div>
+
+        <div class="mines-grid" id="mGrid"></div>
+
+        <div class="card" style="margin-top:14px">
+          <div class="label">Recent Mines Games</div>
+          <div id="mHist" class="muted">—</div>
+        </div>
       </div>
     </div>
 
@@ -784,7 +962,7 @@ HTML_TEMPLATE = """
       </div>
     </div>
 
-    <!-- Login card (Discord only) -->
+    <!-- Login card -->
     <div id="loginCard" class="card" style="display:none">
       <div class="label">Get Started</div>
       <p>Use Discord to log in and see your balance, play games, and chat.</p>
@@ -828,16 +1006,17 @@ HTML_TEMPLATE = """
   <script>
     function qs(id){return document.getElementById(id)}
     const tabGames = qs('tab-games'), tabRef=qs('tab-ref'), tabPromo=qs('tab-promo');
-    const pgGames=qs('page-games'), pgCrash=qs('page-crash'), pgRef=qs('page-ref'), pgPromo=qs('page-promo'), pgProfile=qs('page-profile'), loginCard=qs('loginCard');
+    const pgGames=qs('page-games'), pgCrash=qs('page-crash'), pgMines=qs('page-mines'), pgRef=qs('page-ref'), pgPromo=qs('page-promo'), pgProfile=qs('page-profile'), loginCard=qs('loginCard');
 
     function fmtDL(n){ return `💎 ${Number(n).toLocaleString()} DL`; }
     async function j(u, opt={}){ const r=await fetch(u, Object.assign({credentials:'include'},opt)); if(!r.ok) throw new Error(await r.text()); return r.json(); }
 
     function setTab(which){
       [tabGames,tabRef,tabPromo].forEach(t=>t.classList.remove('active'));
-      [pgGames,pgCrash,pgRef,pgPromo,pgProfile].forEach(p=>p.style.display='none');
+      [pgGames,pgCrash,pgMines,pgRef,pgPromo,pgProfile].forEach(p=>p.style.display='none');
       if(which==='games'){ tabGames.classList.add('active'); pgGames.style.display=''; }
       if(which==='crash'){ pgCrash.style.display=''; }
+      if(which==='mines'){ pgMines.style.display=''; }
       if(which==='ref'){ tabRef.classList.add('active'); pgRef.style.display=''; }
       if(which==='promo'){ tabPromo.classList.add('active'); pgPromo.style.display=''; }
       if(which==='profile'){ pgProfile.style.display=''; }
@@ -846,6 +1025,8 @@ HTML_TEMPLATE = """
     qs('homeLink').onclick=(e)=>{ e.preventDefault(); setTab('games'); };
     qs('openCrash').onclick=()=>setTab('crash');
     qs('backToGames').onclick=()=>setTab('games');
+    qs('openMines').onclick=()=>{ setTab('mines'); renderMines(); };
+    qs('backToGames2').onclick=()=>setTab('games');
 
     // modal
     function openModal(){ qs('modal').style.display='flex'; }
@@ -913,6 +1094,7 @@ HTML_TEMPLATE = """
             try{
               const r = await j('/api/admin/adjust', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({identifier, amount, reason})});
               msg.textContent = 'Updated. New balance for ' + identifier + ' = ' + fmtDL(r.new_balance);
+              renderHeader();
             }catch(e){ msg.textContent = 'Error: '+e.message; }
           };
         }
@@ -963,14 +1145,13 @@ HTML_TEMPLATE = """
 
     // -------- Crash state + live now polling (client-stepped animation) --------
     const crNowEl = qs('crNow'), crHint = qs('crHint'), crMsg = qs('crMsg');
-    const lastBustsEl = qs('lastBusts'), cashBtn = qs('crCashout');
+    const lastBustsEl = qs('lastBusts'), cashBtn = qs('crCashout'), placeBtn = qs('crPlace');
 
     let crPhase = 'betting', lastPhase = 'betting';
     let roundId = null;
     let haveActiveBet = false;
-    let betResolved = false;
 
-    // Canvas + path (WHITE line, visible)
+    // Canvas + path (WHITE line)
     const canv = qs('crCanvas'); const ctx = canv.getContext('2d');
     function resizeCanvas(){
       const dpr = window.devicePixelRatio || 1;
@@ -997,13 +1178,9 @@ HTML_TEMPLATE = """
     resizeCanvas();
 
     // Multiplier animation (0.01 steps, starts slow then accelerates)
-    let clientMult = 0.00;        // drawn multiplier
-    let serverTarget = 1.00;      // latest server "now" value
-    let rafId = null;
-    let runStartTs = 0;
-    let lastTs = 0;
-    let stepAcc = 0;              // how much "mult distance" we can move this frame
-    let lastDrawnM = 0.00;
+    let clientMult = 0.00;
+    let serverTarget = 1.00;
+    let rafId = null, runStartTs = 0, lastTs = 0, stepAcc = 0, lastDrawnM = 0.00;
 
     function mapPoint(mult){
       const w = canv.clientWidth, h = canv.clientHeight;
@@ -1014,20 +1191,15 @@ HTML_TEMPLATE = """
       const x = (w * (0.12 + 0.76 * xf));
       return [x,y];
     }
-    function resetGraph(){
-      redrawAxis();
-      lastDrawnM = 0.00;
-      clientMult = 0.00;
-    }
+    function resetGraph(){ redrawAxis(); lastDrawnM = 0.00; clientMult = 0.00; }
     function drawStep(toMult){
       const [px,py] = mapPoint(lastDrawnM || 1.00);
       const [x,y]   = mapPoint(toMult   || 1.00);
       ctx.lineJoin = 'round'; ctx.lineCap = 'round';
-      ctx.strokeStyle = '#ffffff';   // WHITE line
-      ctx.lineWidth = 3.5;
+      ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 3.5;
       ctx.shadowColor = 'rgba(255,255,255,.25)'; ctx.shadowBlur = 6;
       ctx.beginPath();
-      const cx = (px + x) / 2, cy = Math.min(py, y) - 8; // slight bow
+      const cx = (px + x) / 2, cy = Math.min(py, y) - 8;
       ctx.moveTo(px, py);
       ctx.quadraticCurveTo(cx, cy, x, y);
       ctx.stroke();
@@ -1036,30 +1208,19 @@ HTML_TEMPLATE = """
     }
     function startRunAnim(){
       resetGraph();
-      runStartTs = performance.now();
-      lastTs = 0;
-      stepAcc = 0;
-      clientMult = 0.00;
-      serverTarget = 1.00;
+      runStartTs = performance.now(); lastTs = 0; stepAcc = 0;
+      clientMult = 0.00; serverTarget = 1.00;
       crNowEl.textContent = '0.00×';
       if(rafId) cancelAnimationFrame(rafId);
       rafId = requestAnimationFrame(tick);
     }
-    function stopRunAnim(){
-      if(rafId){ cancelAnimationFrame(rafId); rafId=null; }
-    }
+    function stopRunAnim(){ if(rafId){ cancelAnimationFrame(rafId); rafId=null; } }
     function tick(ts){
       if(!lastTs) lastTs = ts;
-      const dt = Math.min(0.1, (ts - lastTs)/1000);
-      lastTs = ts;
-
-      // acceleration curve: begins slow, ramps to ~3.0x/s
+      const dt = Math.min(0.1, (ts - lastTs)/1000); lastTs = ts;
       const tSec = Math.max(0, (ts - runStartTs)/1000);
-      const baseRate = 0.15;     // start speed
-      const maxRate  = 3.00;
-      const tau = 2.6;           // ramp time constant
+      const baseRate = 0.15, maxRate = 3.00, tau = 2.6;
       const ratePerSec = baseRate + (maxRate - baseRate) * (1 - Math.exp(-tSec / tau));
-
       stepAcc += ratePerSec * dt;
       while(stepAcc >= 0.01 && clientMult < serverTarget){
         const next = Math.min(serverTarget, +(clientMult + 0.01).toFixed(2));
@@ -1068,7 +1229,6 @@ HTML_TEMPLATE = """
         drawStep(clientMult);
         stepAcc -= 0.01;
       }
-
       rafId = requestAnimationFrame(tick);
     }
 
@@ -1082,8 +1242,16 @@ HTML_TEMPLATE = """
           : 'No history yet.';
 
         haveActiveBet = !!(s.your_bet && !s.your_bet.resolved);
-        betResolved = !!(s.your_bet && s.your_bet.resolved);
-        cashBtn.style.display = (crPhase==='running' && haveActiveBet) ? '' : 'none';
+
+        // Toggle buttons: replace Place Bet with Cash Out when you have a bet
+        if(haveActiveBet){
+          placeBtn.style.display = 'none';
+          cashBtn.style.display = '';
+          cashBtn.disabled = (crPhase!=='running');
+        }else{
+          placeBtn.style.display = '';
+          cashBtn.style.display = 'none';
+        }
 
         if(lastPhase !== 'running' && crPhase === 'running'){
           crHint.textContent = 'Round running… Tap Cash Out anytime.';
@@ -1093,6 +1261,8 @@ HTML_TEMPLATE = """
           stopRunAnim();
           if(s.bust){ crNowEl.textContent = s.bust.toFixed(2)+'×'; }
           crHint.textContent = 'Preparing next round…';
+          // When round ends, your bet is resolved; reset buttons.
+          cashBtn.disabled = true;
         }
         if(crPhase==='betting'){
           const left = Math.max(0, Math.round((Date.parse(s.betting_ends_at) - Date.now())/1000));
@@ -1107,7 +1277,7 @@ HTML_TEMPLATE = """
       }
     }
 
-    // server "now" polling (never reveals end)
+    // server "now" polling
     async function pollNow(){
       if(crPhase!=='running') return;
       try{
@@ -1119,7 +1289,7 @@ HTML_TEMPLATE = """
     }
 
     // Place bet
-    qs('crPlace').onclick = async ()=>{
+    placeBtn.onclick = async ()=>{
       try{
         const bet = parseInt(document.getElementById('crBet').value,10);
         const cashVal = document.getElementById('crCash').value.trim();
@@ -1130,27 +1300,168 @@ HTML_TEMPLATE = """
         crMsg.textContent = 'Bet placed for this round.';
         await renderHeader(); // update balance
         haveActiveBet = true;
+        // Immediately flip to Cash Out button (disabled until running)
+        placeBtn.style.display='none';
+        cashBtn.style.display=''; cashBtn.disabled = (crPhase!=='running');
       }catch(e){ crMsg.textContent = 'Error: '+e.message; }
     };
 
     // Cash Out
     cashBtn.onclick = async ()=>{
+      if(cashBtn.disabled) return;
       try{
         const r = await j('/api/crash/cashout', {method:'POST'});
         crMsg.textContent = 'Cashed out at '+r.multiplier.toFixed(2)+'× • Won '+fmtDL(r.win);
         await renderHeader();
         haveActiveBet = false;
         cashBtn.style.display = 'none';
+        placeBtn.style.display = '';
       }catch(e){
         crMsg.textContent = 'Cashout failed: '+e.message;
       }
     };
+
+    // ---- MINES ----
+    const mGrid = qs('mGrid'), mStart = qs('mStart'), mCash = qs('mCash'), mMsg = qs('mMsg');
+    const mHash = qs('mHash'), mStatus = qs('mStatus'), mPotential = qs('mPotential');
+    let mActive = false, mPicks = 0, mGameId = null, mMines = 3, mBet = 0;
+
+    function buildGrid(){
+      mGrid.innerHTML = '';
+      for(let i=0;i<25;i++){
+        const b = document.createElement('div');
+        b.className = 'tile';
+        b.textContent = '';
+        b.dataset.idx = i;
+        b.onclick = onTileClick;
+        mGrid.appendChild(b);
+      }
+    }
+    function updateGridReveal(board=null){
+      for(let i=0;i<25;i++){
+        const b = mGrid.children[i];
+        const bit = (mPicks>>i)&1;
+        b.classList.remove('safe','mine','revealed');
+        if(bit){ b.classList.add('safe','revealed'); b.textContent='💎'; }
+        else { b.textContent=''; }
+        if(board){
+          if(board[i]==='1'){ b.classList.add('mine','revealed'); b.textContent='💥'; }
+          else if(((mPicks>>i)&1)===1){ /* already marked safe */ }
+        }
+      }
+    }
+    async function onTileClick(e){
+      if(!mActive) return;
+      const el = e.currentTarget;
+      const idx = parseInt(el.dataset.idx,10);
+      if(((mPicks>>idx)&1)===1) return; // already revealed
+      try{
+        const r = await j('/api/mines/pick',{method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({index: idx})});
+        if(r.status==='lost'){
+          mActive=false; mStatus.textContent='Status: Lost';
+          updateGridReveal(r.board);
+          mMsg.textContent='💥 You hit a mine. Better luck next time.';
+          mStart.style.display=''; mCash.style.display='none';
+          renderHeader();
+          renderMinesHistory();
+        }else{
+          mPicks = r.picks;
+          mPotential.textContent = 'Potential: '+fmtDL(r.potential_win);
+          mStatus.textContent='Status: Active';
+          updateGridReveal();
+          // Allow cash out after at least one safe
+          if(mPicks>0){ mCash.disabled=false; }
+        }
+      }catch(err){ mMsg.textContent='Error: '+err.message; }
+    }
+
+    async function minesStart(){
+      try{
+        const bet = parseInt(document.getElementById('mBet').value,10);
+        const mines = parseInt(document.getElementById('mMines').value,10);
+        if(Number.isNaN(bet) || bet < 1) throw new Error('Enter a bet of at least 1 DL.');
+        if(Number.isNaN(mines) || mines<1 || mines>24) throw new Error('Mines must be 1–24.');
+        const r = await j('/api/mines/start',{method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({bet, mines})});
+        mActive=true; mPicks=0; mGameId=r.id; mMines=mines; mBet=bet;
+        mHash.textContent = 'Commit: '+r.hash;
+        mStatus.textContent = 'Status: Active';
+        mPotential.textContent = 'Potential: '+fmtDL(bet); // starts at ~bet (actually < bet after edge, but we display bet)
+        mMsg.textContent='';
+        buildGrid(); updateGridReveal();
+        mStart.style.display='none'; mCash.style.display='';
+        mCash.disabled=true;
+        renderHeader();
+        renderMinesHistory();
+      }catch(err){ mMsg.textContent='Error: '+err.message; }
+    }
+    async function minesCash(){
+      try{
+        const r = await j('/api/mines/cashout',{method:'POST'});
+        mActive=false;
+        mStatus.textContent='Status: Cashed';
+        mMsg.textContent='✅ Cashed out: '+fmtDL(r.win);
+        updateGridReveal(r.board);
+        mStart.style.display=''; mCash.style.display='none';
+        renderHeader();
+        renderMinesHistory();
+      }catch(err){ mMsg.textContent='Error: '+err.message; }
+    }
+    mStart.onclick = minesStart;
+    mCash.onclick = minesCash;
+
+    async function renderMines(){
+      buildGrid(); updateGridReveal();
+      try{
+        const s = await j('/api/mines/state');
+        if(s && s.status==='active'){
+          mActive=true; mPicks=s.picks; mGameId=s.id;
+          mMines=s.mines; mBet=s.bet;
+          mHash.textContent='Commit: '+s.hash;
+          mStatus.textContent='Status: Active';
+          mStart.style.display='none'; mCash.style.display=''; mCash.disabled=(mPicks<1);
+          updateGridReveal();
+        }else{
+          mActive=false; mPicks=0; mGameId=null;
+          mHash.textContent='Commit: —'; mStatus.textContent='Status: —'; mPotential.textContent='Potential: —';
+          mStart.style.display=''; mCash.style.display='none';
+        }
+      }catch(e){
+        mActive=false; mPicks=0; mGameId=null;
+        mHash.textContent='Commit: —'; mStatus.textContent='Status: —'; mPotential.textContent='Potential: —';
+        mStart.style.display=''; mCash.style.display='none';
+      }
+      renderMinesHistory();
+    }
+
+    async function renderMinesHistory(){
+      try{
+        const h = await j('/api/mines/history');
+        const rows = h.rows;
+        document.getElementById('mHist').innerHTML = rows.length
+          ? `<table><thead><tr><th>ID</th><th>Bet</th><th>Mines</th><th>Result</th><th>Hash</th><th>Seed</th></tr></thead>
+              <tbody>${
+                rows.map(r=>`
+                  <tr>
+                    <td>#${r.id}</td>
+                    <td>${fmtDL(r.bet)}</td>
+                    <td>${r.mines}</td>
+                    <td style="color:${r.win>0?'#34d399':'#ef4444'}">${r.win>0?('Won '+fmtDL(r.win)):'Lost'}</td>
+                    <td><code>${r.hash.slice(0,10)}…</code></td>
+                    <td><code>${(r.seed||'').slice(0,8)}…</code></td>
+                  </tr>`).join('')
+              }</tbody></table>`
+          : 'No games yet.';
+      }catch(e){
+        document.getElementById('mHist').textContent = 'Unable to load history.';
+      }
+    }
 
     // Chat
     const drawer = qs('chatDrawer'), chatBody=qs('chatBody'), chatText=qs('chatText'), chatSend=qs('chatSend');
     const chatNote = qs('chatNote'), chatDisabled = qs('chatDisabled');
     let chatOpen=false, chatPoll=null, lastChatId=0, myLevel=0, isLogged=false;
 
+    function toggleChat(){ if(chatOpen) closeChat(); else openChat(); }
     function scrollChatToBottom(){ chatBody.scrollTop = chatBody.scrollHeight; }
     function renderMsg(m){
       const wrap = document.createElement('div'); wrap.className='msg';
@@ -1192,17 +1503,7 @@ HTML_TEMPLATE = """
       chatPoll = setInterval(()=>{ if(chatOpen) fetchChat(false); }, 2000);
     }
     function closeChat(){ drawer.classList.remove('open'); chatOpen=false; if(chatPoll){clearInterval(chatPoll); chatPoll=null;} }
-    function toggleChat(){ if(chatOpen) closeChat(); else openChat(); }
     qs('chatClose').onclick = closeChat;
-    chatSend.onclick = async ()=>{
-      const t = chatText.value.trim();
-      if(!t) return;
-      try{
-        await j('/api/chat/send', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text:t})});
-        chatText.value=''; await fetchChat(false);
-      }catch(e){ alert(e.message); await updateChatGate(); }
-    };
-    chatText.addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ e.preventDefault(); chatSend.click(); } });
 
     // Periodic
     setInterval(()=>{ if(pgCrash.style.display!=='none') refreshCrash(); }, 800);
@@ -1212,7 +1513,6 @@ HTML_TEMPLATE = """
     tabGames.onclick=()=>setTab('games');
     tabRef.onclick=()=>{ setTab('ref'); renderReferral(); };
     tabPromo.onclick=()=>{ setTab('promo'); renderPromos(); };
-    document.getElementById('openCrash').onclick=()=>{ setTab('crash'); };
 
     async function renderOther(){
       await renderReferral();
@@ -1393,7 +1693,7 @@ async def api_admin_promo_create(request: Request, body: CreatePromoBody):
     if body.max_uses < 1: raise HTTPException(400, "Max uses must be >= 1")
     return create_promo(str(OWNER_ID), body.code, int(body.amount), int(body.max_uses), body.expires_at)
 
-# Crash API (no end leak)
+# Crash API
 class BetBody(BaseModel):
     bet: int
     cashout: float
@@ -1479,6 +1779,58 @@ async def api_chat_send(request: Request, body: ChatSendBody):
     except ValueError as e:
         raise HTTPException(400, str(e))
 
+# MINES API
+class MinesStartBody(BaseModel):
+    bet: int
+    mines: int
+
+class MinesPickBody(BaseModel):
+    index: int
+
+@app.get("/api/mines/state")
+async def api_mines_state(request: Request):
+    user = read_session(request)
+    if not user: raise HTTPException(401, "Not logged in")
+    s = mines_state(user["id"])
+    return s or {}
+
+@app.get("/api/mines/history")
+async def api_mines_history(request: Request, limit: int = Query(15, ge=1, le=50)):
+    user = read_session(request)
+    if not user: raise HTTPException(401, "Not logged in")
+    rows = mines_history(user["id"], limit)
+    return {"rows": rows}
+
+@app.post("/api/mines/start")
+async def api_mines_start(request: Request, body: MinesStartBody):
+    user = read_session(request)
+    if not user: raise HTTPException(401, "Not logged in")
+    try:
+        res = mines_start(user["id"], int(body.bet), int(body.mines))
+        return res
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+@app.post("/api/mines/pick")
+async def api_mines_pick(request: Request, body: MinesPickBody):
+    user = read_session(request)
+    if not user: raise HTTPException(401, "Not logged in")
+    try:
+        res = mines_pick(user["id"], int(body.index))
+        return res
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+@app.post("/api/mines/cashout")
+async def api_mines_cashout(request: Request):
+    user = read_session(request)
+    if not user: raise HTTPException(401, "Not logged in")
+    try:
+        res = mines_cashout(user["id"])
+        return res
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
 @app.get("/health")
 async def health():
     return {"ok": True}
@@ -1488,18 +1840,14 @@ async def crash_loop():
     while True:
         rid, r = ensure_betting_round()
         now = now_utc()
-
         if r["status"] == "betting":
             wait = (r["betting_ends_at"] - now).total_seconds()
-            if wait > 0:
-                await asyncio.sleep(min(wait, 0.5))
-            else:
-                begin = begin_running(rid)
+            if wait > 0: await asyncio.sleep(min(wait, 0.5))
+            else: begin = begin_running(rid)
         elif r["status"] == "running":
             if r["expected_end_at"]:
                 wait = (r["expected_end_at"] - now).total_seconds()
-                if wait > 0:
-                    await asyncio.sleep(min(wait, 0.3))
+                if wait > 0: await asyncio.sleep(min(wait, 0.3))
                 else:
                     finish_round(rid)
                     create_next_betting()

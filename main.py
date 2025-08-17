@@ -31,6 +31,17 @@ MIN_BET = 1            # DL
 MAX_BET = 1_000_000
 BETTING_SECONDS = 10   # time to place bets between rounds
 
+# ---------- Time helpers (timezone-aware UTC) ----------
+UTC = datetime.timezone.utc
+
+def now_utc() -> datetime.datetime:
+    return datetime.datetime.now(UTC)
+
+def iso(dt: Optional[datetime.datetime]) -> Optional[str]:
+    if dt is None:
+        return None
+    return dt.astimezone(UTC).isoformat()
+
 # ---------- DB helpers ----------
 def with_conn(fn):
     def wrapper(*args, **kwargs):
@@ -116,7 +127,7 @@ def init_db(cur):
         )
     """)
 
-    # Per-player game log (reuses from earlier single-player crash)
+    # Per-player game log
     cur.execute("""
         CREATE TABLE IF NOT EXISTS crash_games (
             id BIGSERIAL PRIMARY KEY,
@@ -206,7 +217,7 @@ def redeem_promo(cur, user_id: str, code: str) -> int:
     if uses >= max_uses: raise PromoExhausted("Code maxed out")
     cur.execute("SELECT 1 FROM promo_redemptions WHERE user_id=%s AND code=%s", (user_id, code))
     if cur.fetchone(): raise PromoAlreadyRedeemed("You already redeemed this code")
-    cur.execute("INSERT INTO balances(user_id,balance) VALUES (%s,0) ON CONFLICT (user_id) DO NOTHING", (user_id,))
+    cur.execute("INSERT INTO balances(user_id,balance) VALUES (%s,0) ON CONFLICT(user_id) DO NOTHING", (user_id,))
     cur.execute("UPDATE balances SET balance=balance+%s WHERE user_id=%s", (amount, user_id))
     cur.execute("UPDATE promo_codes SET uses=uses+1 WHERE code=%s", (code,))
     cur.execute("INSERT INTO promo_redemptions(user_id,code) VALUES (%s,%s)", (user_id, code))
@@ -243,7 +254,7 @@ def ensure_betting_round(cur) -> Tuple[int, dict]:
     # Return current round (betting/running) or create betting if none
     cur.execute("SELECT id,status,betting_opens_at,betting_ends_at,started_at,expected_end_at,bust FROM crash_rounds ORDER BY id DESC LIMIT 1")
     r = cur.fetchone()
-    now = datetime.datetime.utcnow()
+    now = now_utc()
     if not r or r[1] == 'ended':
         opens = now
         ends = now + datetime.timedelta(seconds=BETTING_SECONDS)
@@ -318,7 +329,7 @@ def begin_running(cur, round_id: int):
 
     bust = gen_bust(HOUSE_EDGE)
     dur = run_duration_for(bust)
-    now = datetime.datetime.utcnow()
+    now = now_utc()
     exp_end = now + datetime.timedelta(seconds=dur)
     cur.execute("""UPDATE crash_rounds
                    SET status='running', bust=%s, started_at=%s, expected_end_at=%s
@@ -348,14 +359,14 @@ def resolve_bets(cur, round_id: int, bust: float):
 
 @with_conn
 def finish_round(cur, round_id: int):
-    now = datetime.datetime.utcnow()
+    now = now_utc()
     cur.execute("""UPDATE crash_rounds
                    SET status='ended', ended_at=%s
                    WHERE id=%s AND status='running'""", (now, round_id))
 
 @with_conn
 def create_next_betting(cur):
-    now = datetime.datetime.utcnow()
+    now = now_utc()
     opens = now
     ends = now + datetime.timedelta(seconds=BETTING_SECONDS)
     cur.execute("""INSERT INTO crash_rounds(status,betting_opens_at,betting_ends_at)
@@ -454,7 +465,7 @@ def read_session(request: Request) -> Optional[dict]:
     except BadSignature: return None
 
 # ---------- Frontend HTML ----------
-INDEX_HTML = """
+INDEX_HTML = f"""
 <!doctype html>
 <html>
 <head>
@@ -462,56 +473,55 @@ INDEX_HTML = """
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>💎 DL Bank</title>
   <style>
-    :root{ --bg:#0b1220; --card:#121a2b; --muted:#8aa0c7; --text:#e8efff; --accent:#60a5fa; --ok:#34d399; --warn:#f59e0b; --err:#ef4444; --border:#23304c; }
-    *{box-sizing:border-box}
-    body{background:linear-gradient(180deg,#0a1020,#0e1530); color:var(--text); font-family:system-ui,Segoe UI,Roboto,Arial; margin:0; min-height:100vh;}
-    a{color:inherit; text-decoration:none}
-    .container{max-width:1100px; margin:0 auto; padding:16px}
-    .header{position:sticky; top:0; z-index:10; background:linear-gradient(135deg,#0e1630 0%,#0a1124 100%); border-bottom:1px solid var(--border);}
-    .header-inner{display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 16px;}
-    .brand{display:flex; align-items:center; gap:10px; font-weight:800; letter-spacing:.2px}
-    .nav{display:flex; gap:10px; align-items:center}
-    .tab{padding:8px 12px; border:1px solid var(--border); border-radius:10px; background:#0f1a33; cursor:pointer}
-    .tab.active{background:linear-gradient(135deg,#3b82f6,#22c1dc); border-color:transparent}
-    .right{display:flex; gap:10px; align-items:center}
-    .chip{background:#0c1631; border:1px solid var(--border); color:#dce7ff; padding:6px 10px; border-radius:999px; font-size:12px; white-space:nowrap; cursor:pointer}
-    .avatar{width:28px;height:28px;border-radius:50%;object-fit:cover;border:1px solid var(--border); cursor:pointer}
-    .btn{display:inline-flex; align-items:center; gap:8px; padding:8px 12px; border-radius:10px; border:1px solid var(--border); background:#0f1a33; cursor:pointer}
-    .btn.primary{background:linear-gradient(135deg,#3b82f6,#22c1dc); border-color:transparent}
-    .grid{display:grid; gap:16px; grid-template-columns:1fr}
-    @media(min-width:1000px){.grid{grid-template-columns:1fr 1fr}}
-    .card{background:var(--card); border:1px solid var(--border); border-radius:16px; padding:16px}
-    .label{color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.1em}
-    .big{font-size:28px; font-weight:800}
-    .muted{color:var(--muted)}
-    input{width:100%; background:#0e1833; color:#e8efff; border:1px solid var(--border); border-radius:10px; padding:10px}
-    .game-card{background:#0f1a33;border:1px solid var(--border);border-radius:16px;padding:14px;cursor:pointer;transition:transform .08s ease}
-    .game-card:hover{transform:translateY(-2px)}
-    .banner{font-weight:900; font-size:18px}
-    .owner{margin-top:16px; border-top:1px dashed var(--border); padding-top:12px}
+    :root{{ --bg:#0b1220; --card:#121a2b; --muted:#8aa0c7; --text:#e8efff; --accent:#60a5fa; --ok:#34d399; --warn:#f59e0b; --err:#ef4444; --border:#23304c; }}
+    *{{box-sizing:border-box}}
+    body{{background:linear-gradient(180deg,#0a1020,#0e1530); color:var(--text); font-family:system-ui,Segoe UI,Roboto,Arial; margin:0; min-height:100vh;}}
+    a{{color:inherit; text-decoration:none}}
+    .container{{max-width:1100px; margin:0 auto; padding:16px}}
+    .header{{position:sticky; top:0; z-index:10; background:linear-gradient(135deg,#0e1630 0%,#0a1124 100%); border-bottom:1px solid var(--border);}}
+    .header-inner{{display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 16px;}}
+    .brand{{display:flex; align-items:center; gap:10px; font-weight:800; letter-spacing:.2px}}
+    .nav{{display:flex; gap:10px; align-items:center}}
+    .tab{{padding:8px 12px; border:1px solid var(--border); border-radius:10px; background:#0f1a33; cursor:pointer}}
+    .tab.active{{background:linear-gradient(135deg,#3b82f6,#22c1dc); border-color:transparent}}
+    .right{{display:flex; gap:10px; align-items:center}}
+    .chip{{background:#0c1631; border:1px solid var(--border); color:#dce7ff; padding:6px 10px; border-radius:999px; font-size:12px; white-space:nowrap; cursor:pointer}}
+    .avatar{{width:28px;height:28px;border-radius:50%;object-fit:cover;border:1px solid var(--border); cursor:pointer}}
+    .btn{{display:inline-flex; align-items:center; gap:8px; padding:8px 12px; border-radius:10px; border:1px solid var(--border); background:#0f1a33; cursor:pointer}}
+    .btn.primary{{background:linear-gradient(135deg,#3b82f6,#22c1dc); border-color:transparent}}
+    .grid{{display:grid; gap:16px; grid-template-columns:1fr}}
+    @media(min-width:1000px){{.grid{{grid-template-columns:1fr 1fr}}}}
+    .card{{background:var(--card); border:1px solid var(--border); border-radius:16px; padding:16px}}
+    .label{{color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.1em}}
+    .big{{font-size:28px; font-weight:800}}
+    .muted{{color:var(--muted)}}
+    input{{width:100%; background:#0e1833; color:#e8efff; border:1px solid var(--border); border-radius:10px; padding:10px}}
+    .game-card{{background:#0f1a33;border:1px solid var(--border);border-radius:16px;padding:14px;cursor:pointer;transition:transform .08s ease}}
+    .game-card:hover{{transform:translateY(-2px)}}
+    .owner{{margin-top:16px; border-top:1px dashed var(--border); padding-top:12px}}
 
     /* Crash page */
-    .crash-wrap{display:flex; flex-direction:column; gap:10px}
-    .cr-row{display:grid; grid-template-columns:1fr 1fr; gap:12px}
-    .cr-line{position:relative; height:18px; background:#0e1833; border:1px solid var(--border); border-radius:999px; overflow:hidden}
-    .cr-fill{position:absolute; left:0; top:0; bottom:0; width:0%; background:linear-gradient(90deg,#22c1dc,#3b82f6)}
-    .cr-marker{position:absolute; top:-6px; width:2px; height:30px; background:#f59e0b; opacity:.9}
-    .cr-marker.bust{background:#ef4444}
-    .cr-head{display:flex; align-items:center; gap:10px}
-    .cr-multi{font-size:28px; font-weight:900}
-    .cr-small{font-size:12px; color:var(--muted)}
-    table{width:100%; border-collapse:collapse; margin-top:10px}
-    th,td{border-bottom:1px solid var(--border); padding:8px 6px; text-align:left}
-    .win{color:#34d399}
-    .lose{color:#ef4444}
-    .bust-bad{color:#ef4444; font-weight:700}
-    .bust-good{color:#34d399; font-weight:700}
+    .crash-wrap{{display:flex; flex-direction:column; gap:10px}}
+    .cr-row{{display:grid; grid-template-columns:1fr 1fr; gap:12px}}
+    .cr-line{{position:relative; height:18px; background:#0e1833; border:1px solid var(--border); border-radius:999px; overflow:hidden}}
+    .cr-fill{{position:absolute; left:0; top:0; bottom:0; width:0%; background:linear-gradient(90deg,#22c1dc,#3b82f6)}}
+    .cr-marker{{position:absolute; top:-6px; width:2px; height:30px; background:#f59e0b; opacity:.9}}
+    .cr-marker.bust{{background:#ef4444}}
+    .cr-head{{display:flex; align-items:center; gap:10px}}
+    .cr-multi{{font-size:28px; font-weight:900}}
+    .cr-small{{font-size:12px; color:var(--muted)}}
+    table{{width:100%; border-collapse:collapse; margin-top:10px}}
+    th,td{{border-bottom:1px solid var(--border); padding:8px 6px; text-align:left}}
+    .win{{color:#34d399}}
+    .lose{{color:#ef4444}}
+    .bust-bad{{color:#ef4444; font-weight:700}}
+    .bust-good{{color:#34d399; font-weight:700}}
 
     /* Modal */
-    .modal{position:fixed; inset:0; background:rgba(0,0,0,.6); display:none; align-items:center; justify-content:center; padding:20px}
-    .modal .box{background:#0f1a33; border:1px solid var(--border); border-radius:16px; padding:16px; max-width:520px; width:100%}
-    .chips{display:flex; flex-wrap:wrap; gap:6px; margin-top:8px}
-    .chip2{padding:4px 8px; border-radius:999px; border:1px solid var(--border); background:#0c1631}
+    .modal{{position:fixed; inset:0; background:rgba(0,0,0,.6); display:none; align-items:center; justify-content:center; padding:20px}}
+    .modal .box{{background:#0f1a33; border:1px solid var(--border); border-radius:16px; padding:16px; max-width:520px; width:100%}}
+    .chips{{display:flex; flex-wrap:wrap; gap:6px; margin-top:8px}}
+    .chip2{{padding:4px 8px; border-radius:999px; border:1px solid var(--border); background:#0c1631}}
   </style>
 </head>
 <body>
@@ -678,96 +688,96 @@ INDEX_HTML = """
   </div>
 
   <script>
-    function qs(id){return document.getElementById(id)}
+    function qs(id){{return document.getElementById(id)}}
     const tabGames = qs('tab-games'), tabRef=qs('tab-ref'), tabPromo=qs('tab-promo');
     const pgGames=qs('page-games'), pgCrash=qs('page-crash'), pgRef=qs('page-ref'), pgPromo=qs('page-promo'), pgProfile=qs('page-profile'), loginCard=qs('loginCard');
 
-    function fmtDL(n){ return `💎 ${Number(n).toLocaleString()} DL`; }
-    async function j(u, opt={}){ const r=await fetch(u, Object.assign({credentials:'include'},opt)); if(!r.ok) throw new Error(await r.text()); return r.json(); }
+    function fmtDL(n){{ return `💎 ${Number(n).toLocaleString()} DL`; }}
+    async function j(u, opt={{}}){{ const r=await fetch(u, Object.assign({{credentials:'include'}},opt)); if(!r.ok) throw new Error(await r.text()); return r.json(); }}
 
-    function setTab(which){
+    function setTab(which){{
       [tabGames,tabRef,tabPromo].forEach(t=>t.classList.remove('active'));
       [pgGames,pgCrash,pgRef,pgPromo,pgProfile].forEach(p=>p.style.display='none');
-      if(which==='games'){ tabGames.classList.add('active'); pgGames.style.display=''; }
-      if(which==='crash'){ pgCrash.style.display=''; }
-      if(which==='ref'){ tabRef.classList.add('active'); pgRef.style.display=''; }
-      if(which==='promo'){ tabPromo.classList.add('active'); pgPromo.style.display=''; }
-      if(which==='profile'){ pgProfile.style.display=''; }
-      window.scrollTo({top:0, behavior:'smooth'});
-    }
-    qs('homeLink').onclick=(e)=>{ e.preventDefault(); setTab('games'); };
+      if(which==='games'){{ tabGames.classList.add('active'); pgGames.style.display=''; }}
+      if(which==='crash'){{ pgCrash.style.display=''; }}
+      if(which==='ref'){{ tabRef.classList.add('active'); pgRef.style.display=''; }}
+      if(which==='promo'){{ tabPromo.classList.add('active'); pgPromo.style.display=''; }}
+      if(which==='profile'){{ pgProfile.style.display=''; }}
+      window.scrollTo({{top:0, behavior:'smooth'}});
+    }}
+    qs('homeLink').onclick=(e)=>{{ e.preventDefault(); setTab('games'); }};
     qs('openCrash').onclick=()=>setTab('crash');
 
     // modal
-    function openModal(){ qs('modal').style.display='flex'; }
-    function closeModal(){ qs('modal').style.display='none'; }
+    function openModal(){{ qs('modal').style.display='flex'; }}
+    function closeModal(){{ qs('modal').style.display='none'; }}
     qs('mClose').onclick = closeModal;
-    qs('modal').addEventListener('click', (e)=>{ if(e.target.id==='modal') closeModal(); });
+    qs('modal').addEventListener('click', (e)=>{{ if(e.target.id==='modal') closeModal(); }});
 
-    function safeAvatar(me){ return me.avatar_url || ''; }
+    function safeAvatar(me){{ return me.avatar_url || ''; }}
 
     // Global header/auth render
-    async function renderHeader(){
+    async function renderHeader(){{
       const auth = qs('authArea');
-      try{
+      try{{
         const me = await j('/api/me');
         const bal = await j('/api/balance');
         auth.innerHTML = `
-          <span class="chip" id="balanceBtn">${fmtDL(bal.balance)}</span>
-          <img class="avatar" id="avatarBtn" src="${safeAvatar(me)}" title="${me.username}" onerror="this.style.display='none'">
+          <span class="chip" id="balanceBtn">${{fmtDL(bal.balance)}}</span>
+          <img class="avatar" id="avatarBtn" src="${{safeAvatar(me)}}" title="${{me.username}}" onerror="this.style.display='none'">
         `;
         loginCard.style.display='none';
         qs('balanceBtn').onclick = openModal;
         qs('avatarBtn').onclick = ()=>setTab('profile');
-      }catch(e){
+      }}catch(e){{
         auth.innerHTML = `
           <a class="btn primary" href="/login">Login</a>
           <button class="btn" id="registerBtn2">Register</button>
         `;
         loginCard.style.display='';
-        document.getElementById('registerBtn2').onclick = ()=> {
+        document.getElementById('registerBtn2').onclick = ()=> {{
           const info = qs('registerInfo'); info.style.display = 'block';
-          window.scrollTo({top: document.body.scrollHeight, behavior:'smooth'});
-        };
-      }
-    }
+          window.scrollTo({{top: document.body.scrollHeight, behavior:'smooth'}});
+        }};
+      }}
+    }}
 
     // Profile / Referral / Promo helpers
-    async function renderProfile(){
-      try{
+    async function renderProfile(){{
+      try{{
         const me = await j('/api/me'); const prof = await j('/api/profile');
         const lvl=prof.level, pct=Math.max(0,Math.min(100,prof.progress_pct));
         qs('profileBox').innerHTML = `
           <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap">
-            <img src="${safeAvatar(me)}" class="avatar" style="width:56px; height:56px">
-            <div><div class="big">${me.username}</div><div class="muted">ID: ${me.id}</div></div>
+            <img src="${{safeAvatar(me)}}" class="avatar" style="width:56px; height:56px">
+            <div><div class="big">${{me.username}}</div><div class="muted">ID: ${{me.id}}</div></div>
             <div style="margin-left:auto; display:flex; gap:8px; align-items:center"><a class="btn" href="/logout">Logout</a></div>
           </div>
           <div class="grid" style="margin-top:12px">
             <div class="card" style="padding:12px">
-              <div class="label">Balance</div><div class="big">${fmtDL(prof.balance)}</div>
+              <div class="label">Balance</div><div class="big">${{fmtDL(prof.balance)}}</div>
               <div class="muted" style="margin-top:6px">Click your balance in the header for Deposit/Withdraw instructions.</div>
             </div>
             <div class="card" style="padding:12px">
-              <div class="label">Level</div><div><b>Level ${lvl}</b> — XP ${prof.xp} / ${((lvl-1)*100)+100}</div>
+              <div class="label">Level</div><div><b>Level ${{lvl}}</b> — XP ${{prof.xp}} / ${{((lvl-1)*100)+100}}</div>
               <div style="height:10px; background:#0e1833; border:1px solid var(--border); border-radius:999px; overflow:hidden; margin-top:8px">
-                <div style="height:100%; width:${pct}%; background:linear-gradient(90deg,#22c1dc,#3b82f6)"></div>
-              </div><div class="muted" style="margin-top:6px">${prof.progress}/${prof.next_needed} XP to next level</div>
+                <div style="height:100%; width:${{pct}}%; background:linear-gradient(90deg,#22c1dc,#3b82f6)"></div>
+              </div><div class="muted" style="margin-top:6px">${{prof.progress}}/${{prof.next_needed}} XP to next level</div>
             </div>
           </div>
         `;
         const ownerPanel = qs('ownerPanel');
-        if(me.id === '${OWNER_ID}'){ ownerPanel.style.display=''; }
+        if(me.id === '{OWNER_ID}'){{ ownerPanel.style.display=''; }}
         else ownerPanel.style.display='none';
-      }catch(e){}
-    }
-    async function renderReferral(){
-      try{
+      }}catch(e){{}}
+    }}
+    async function renderReferral(){{
+      try{{
         const ref = await j('/api/referral/state');
-        if(ref.name){
+        if(ref.name){{
           const link = location.origin + '/?ref=' + encodeURIComponent(ref.name);
-          qs('refContent').innerHTML = `<p>Your referral name: <b>${ref.name}</b></p><p>Share this link:</p><p><code>${link}</code></p>`;
-        }else{
+          qs('refContent').innerHTML = `<p>Your referral name: <b>${{ref.name}}</b></p><p>Share this link:</p><p><code>${{link}}</code></p>`;
+        }}else{{
           qs('refContent').innerHTML = `
             <p>Claim a referral name to get your link.</p>
             <div style="display:flex; gap:8px; align-items:center; max-width:420px">
@@ -776,21 +786,21 @@ INDEX_HTML = """
             </div><div id="refMsg" class="muted" style="margin-top:8px"></div>`;
           qs('claimBtn').onclick = async ()=>{
             const name = document.getElementById('refName').value.trim(), msg=qs('refMsg'); msg.textContent='';
-            try{ const r=await j('/api/profile/set_name',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});
-                 msg.textContent='Saved. Your link: '+location.origin+'/?ref='+encodeURIComponent(r.name); }
-            catch(e){ msg.textContent='Error: '+e.message; }
+            try{{ const r=await j('/api/profile/set_name',{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{name}})});
+                 msg.textContent='Saved. Your link: '+location.origin+'/?ref='+encodeURIComponent(r.name); }}
+            catch(e){{ msg.textContent='Error: '+e.message; }}
           };
-        }
-      }catch(e){}
-    }
-    async function renderPromos(){
-      try{
+        }}
+      }}catch(e){{}}
+    }}
+    async function renderPromos(){{
+      try{{
         const mine = await j('/api/promo/my');
         document.getElementById('myCodes').innerHTML = mine.rows.length
-          ? '<ul>' + mine.rows.map(r=>`<li><code>${r.code}</code> — ${new Date(r.redeemed_at).toLocaleString()}</li>`).join('') + '</ul>'
+          ? '<ul>' + mine.rows.map(r=>`<li><code>${{r.code}}</code> — ${{new Date(r.redeemed_at).toLocaleString()}}</li>`).join('') + '</ul>'
           : 'No redemptions yet.';
-      }catch(e){}
-    }
+      }}catch(e){{}}
+    }}
 
     // Crash LIVE state polling + UI
     const crNow = ()=>document.getElementById('crNow');
@@ -802,60 +812,59 @@ INDEX_HTML = """
     const crMsgEl = ()=>document.getElementById('crMsg');
 
     let animRAF = null;
-    function resetLine(){ if(animRAF) cancelAnimationFrame(animRAF); crFill().style.width='0%'; crNow().textContent='—'; cashMarker().style.display='none'; bustMarker().style.display='none'; }
+    function resetLine(){{ if(animRAF) cancelAnimationFrame(animRAF); crFill().style.width='0%'; crNow().textContent='—'; cashMarker().style.display='none'; bustMarker().style.display='none'; }}
 
-    function setMarkers(target, bust){
-      if(!bust || bust<=1){ cashMarker().style.display='none'; bustMarker().style.display='none'; return; }
+    function setMarkers(target, bust){{
+      if(!bust || bust<=1){{ cashMarker().style.display='none'; bustMarker().style.display='none'; return; }}
       const lnB = Math.log(bust);
       const tFrac = Math.min(1, Math.log(Math.max(1.0001,target)) / lnB);
       cashMarker().style.left = (tFrac*100)+'%'; cashMarker().style.display='block';
       bustMarker().style.left = '100%'; bustMarker().style.display='block';
-    }
+    }}
 
-    function animateRunning(startISO, endISO, bust){
-      const start = new Date(startISO).getTime(), end = new Date(endISO).getTime(); const lnB = Math.log(bust);
-      function frame(){
+    function animateRunning(startISO, endISO, bust){{
+      const start = Date.parse(startISO), end = Date.parse(endISO); const lnB = Math.log(bust);
+      function frame(){{
         const now = Date.now(); const t = Math.min(1, (now-start)/(end-start));
         const m = Math.exp(lnB * t); crNow().textContent=m.toFixed(2)+'×';
         crFill().style.width = (Math.log(m)/lnB*100) + '%';
         if(t<1) animRAF=requestAnimationFrame(frame);
-        else { crNow().textContent=bust.toFixed(2)+'×'; }
-      }
+        else {{ crNow().textContent=bust.toFixed(2)+'×'; }}
+      }}
       frame();
-    }
+    }}
 
-    async function refreshCrash(){
-      try{
+    async function refreshCrash(){{
+      try{{
         const s = await j('/api/crash/state');
         // last 15 busts
         lastBustsEl().innerHTML = s.last_busts.length
-          ? s.last_busts.map(v=>`<span class="chip2 ${v<2?'bust-bad':'bust-good'}">${v.toFixed(2)}×</span>`).join('')
+          ? s.last_busts.map(v=>`<span class="chip2 ${{v<2?'bust-bad':'bust-good'}}">${{v.toFixed(2)}}×</span>`).join('')
           : 'No history yet.';
         // your bet info
-        if(s.your_bet){ crMsgEl().textContent = `Your bet: ${fmtDL(s.your_bet.bet)} @ ${s.your_bet.cashout.toFixed(2)}×`; }
+        if(s.your_bet){{ crMsgEl().textContent = `Your bet: ${{fmtDL(s.your_bet.bet)}} @ ${{s.your_bet.cashout.toFixed(2)}}×`; }}
         else crMsgEl().textContent = '';
 
-        const now = Date.parse(s.now);
-        if(s.phase==='betting'){
+        if(s.phase==='betting'){{
           resetLine();
           crNow().textContent = '1.00×';
-          const left = Math.max(0, Math.round((Date.parse(s.betting_ends_at) - now)/1000));
-          crHint().textContent = `Betting open — closes in ${left}s`;
+          const left = Math.max(0, Math.round((Date.parse(s.betting_ends_at) - Date.now())/1000));
+          crHint().textContent = `Betting open — closes in ${{left}}s`;
           setMarkers(parseFloat(document.getElementById('crCash').value||'2'), 2); // temp markers
-        } else if(s.phase==='running'){
+        }} else if(s.phase==='running'){{
           resetLine();
           crHint().textContent = 'Round running…';
           setMarkers(parseFloat(document.getElementById('crCash').value||'2'), s.bust);
           animateRunning(s.started_at, s.expected_end_at, s.bust);
-        } else { // ended -> next betting begins immediately
+        }} else {{
           resetLine();
           crNow().textContent = s.bust ? s.bust.toFixed(2)+'×' : '—';
           crHint().textContent = 'Preparing next round…';
-        }
-      }catch(e){
+        }}
+      }}catch(e){{
         crHint().textContent = 'Disconnected. Reconnecting…';
-      }
-    }
+      }}
+    }}
 
     // Place bet
     document.getElementById('crPlace').onclick = async ()=>{
@@ -870,7 +879,7 @@ INDEX_HTML = """
       }catch(e){ crMsgEl().textContent = 'Error: '+e.message; }
     };
 
-    // Render other tabs
+    // Render other tabs & data
     async function renderOther(){
       await renderReferral();
       await renderPromos();
@@ -895,7 +904,7 @@ INDEX_HTML = """
       }catch(e){}
     }
 
-    // Tab handlers
+    // Tabs
     tabGames.onclick=()=>setTab('games');
     tabRef.onclick=()=>{ setTab('ref'); renderReferral(); };
     tabPromo.onclick=()=>{ setTab('promo'); renderPromos(); };
@@ -956,7 +965,7 @@ INDEX_HTML = """
   </script>
 </body>
 </html>
-""".replace("${OWNER_ID}", str(OWNER_ID))
+""".replace("{OWNER_ID}", str(OWNER_ID))
 
 # ----- Routes -----
 @app.get("/", response_class=HTMLResponse)
@@ -1046,7 +1055,7 @@ async def api_promo_my(request: Request):
     user = read_session(request)
     if not user: raise HTTPException(401, "Not logged in")
     @with_conn
-    def _my(cur, uid): 
+    def _my(cur, uid):
         cur.execute("SELECT code, redeemed_at FROM promo_redemptions WHERE user_id=%s ORDER BY redeemed_at DESC LIMIT 50", (uid,))
         return [{"code":r[0],"redeemed_at":str(r[1])} for r in cur.fetchall()]
     return {"rows": _my(user["id"])}
@@ -1113,20 +1122,17 @@ async def api_crash_state(request: Request):
     if not user: raise HTTPException(401, "Not logged in")
 
     r = load_round()
-    rid, phase = None, "betting"
-    now = datetime.datetime.utcnow().isoformat() + "Z"
-    if r:
-        rid = r["id"]; phase = r["status"]
+    rid, phase = (r["id"], r["status"]) if r else (None, "betting")
     yb = your_bet(rid, user["id"]) if rid else None
     return {
         "phase": phase,
         "round_id": rid,
-        "betting_opens_at": r["betting_opens_at"].isoformat()+"Z" if r and r["betting_opens_at"] else None,
-        "betting_ends_at": r["betting_ends_at"].isoformat()+"Z" if r and r["betting_ends_at"] else None,
-        "started_at": r["started_at"].isoformat()+"Z" if r and r["started_at"] else None,
-        "expected_end_at": r["expected_end_at"].isoformat()+"Z" if r and r["expected_end_at"] else None,
+        "betting_opens_at": iso(r["betting_opens_at"]) if r else None,
+        "betting_ends_at":  iso(r["betting_ends_at"])  if r else None,
+        "started_at":       iso(r["started_at"])       if r else None,
+        "expected_end_at":  iso(r["expected_end_at"])  if r else None,
         "bust": r["bust"] if r and r["bust"] is not None else None,
-        "now": now,
+        "now": iso(now_utc()),
         "your_bet": yb,
         "min_bet": MIN_BET,
         "last_busts": last_busts(15)
@@ -1160,9 +1166,8 @@ async def health():
 async def crash_loop():
     # Keep shared rounds going forever
     while True:
-        # ensure a round exists
         rid, r = ensure_betting_round()
-        now = datetime.datetime.utcnow()
+        now = now_utc()
 
         if r["status"] == "betting":
             # wait until betting end or trigger start if past

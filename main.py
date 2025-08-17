@@ -295,7 +295,6 @@ def gen_bust(edge: Decimal = HOUSE_EDGE) -> float:
 
 def run_duration_for(bust: float) -> float:
     # MUCH slower curve than before
-    # Longer base, stronger scaling with bust to keep animation gentle
     return min(22.0, 8.0 + math.log(bust + 1.0) * 6.0)
 
 def current_multiplier(started_at: datetime.datetime, expected_end_at: datetime.datetime, bust: float, at: Optional[datetime.datetime] = None) -> float:
@@ -792,28 +791,50 @@ HTML_TEMPLATE = """
     .cr-graph-wrap{position:relative; height:240px; background:#0e1833; border:1px solid var(--border); border-radius:16px; overflow:hidden}
     canvas{display:block; width:100%; height:100%}
 
-    /* Mines compact sizing */
+    /* ----- MINES layout: centered board that fills remaining space ----- */
+    .mines-right{
+      display:grid;
+      place-items:center;                 /* center both axes */
+      min-height: calc(100vh - 150px);    /* fill vertical space beside settings */
+    }
     .mines-grid{
-      display:grid; gap:6px;
-      grid-template-columns: repeat(5, minmax(44px, 58px));
-      justify-content:flex-start;
-      max-width: 320px;
+      --cell: clamp(
+        44px,
+        min( calc((100vw - 380px)/5), calc((100vh - 220px)/5) ),
+        110px
+      );
+      display:grid;
+      gap:8px;
+      grid-template-columns: repeat(5, var(--cell));
+      justify-content:center;             /* center horizontally */
     }
     .tile{
-      aspect-ratio:1/1; border-radius:10px; border:1px solid var(--border);
-      background:linear-gradient(180deg,#0f1936,#0c152a); display:flex; align-items:center; justify-content:center;
-      font-weight:800; font-size:16px; cursor:pointer; user-select:none;
+      width: var(--cell);
+      aspect-ratio: 1/1;
+      border-radius: clamp(8px, calc(var(--cell)*0.18), 14px);
+      border:1px solid var(--border);
+      background:linear-gradient(180deg,#0f1936,#0c152a);
+      display:flex; align-items:center; justify-content:center;
+      font-weight:800;
+      font-size: clamp(12px, calc(var(--cell)*0.32), 20px);
+      cursor:pointer; user-select:none;
       transition:transform .06s ease, box-shadow .12s ease, background .12s ease;
     }
     .tile:hover{ transform:translateY(-1px); box-shadow:0 6px 12px rgba(0,0,0,.25) }
     .tile.safe{ background:linear-gradient(135deg,#16a34a,#22c55e); border-color:transparent }
     .tile.mine{ background:linear-gradient(135deg,#ef4444,#b91c1c); border-color:transparent }
     .tile.revealed{ cursor:default }
-    .tag{padding:6px 8px; border-radius:999px; border:1px solid var(--border); background:#0c1631; color:#cfe6ff; font-size:12px}
-
     @media (max-width: 900px){
-      .mines-two{grid-template-columns: 1fr !important}
-      .mines-grid{ grid-template-columns: repeat(5, minmax(40px, 1fr)); max-width: none; }
+      .mines-two{ grid-template-columns: 1fr !important; }
+      .mines-right{ min-height:auto; }
+      .mines-grid{
+        --cell: clamp(
+          48px,
+          min( calc((100vw - 64px)/5), calc((100vh - 280px)/5) ),
+          96px
+        );
+        justify-content:center;
+      }
     }
 
     /* Modal */
@@ -953,8 +974,8 @@ HTML_TEMPLATE = """
             </div>
           </div>
 
-          <!-- RIGHT: board -->
-          <div>
+          <!-- RIGHT: centered, fills space -->
+          <div class="mines-right">
             <div class="mines-grid" id="mGrid"></div>
           </div>
         </div>
@@ -1339,6 +1360,7 @@ HTML_TEMPLATE = """
       }catch(e){}
     }
 
+    const placeBtn = qs('crPlace'); const cashBtn = qs('crCashout');
     placeBtn.onclick = async ()=>{
       try{
         const bet = parseFloat(document.getElementById('crBet').value);
@@ -1573,7 +1595,6 @@ HTML_TEMPLATE = """
         await j('/api/chat/send',{method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text})});
         chatText.value=''; await fetchChat(false);
       }catch(e){
-        // Show gate messages via updateChatGate
         await updateChatGate();
       }
     }

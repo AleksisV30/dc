@@ -294,13 +294,11 @@ def create_promo(cur, actor_id: str, code: Optional[str], amount, max_uses: int 
 def _u(): return (secrets.randbelow(1_000_000_000)+1)/1_000_000_001.0
 
 def gen_bust(edge: Decimal) -> float:
-    # Inverse CDF with edge: higher edge lowers expected bust
     u = _u()
     B = max(1.0, float((Decimal("1.0") - edge) / Decimal(str(u))))
     return math.floor(B*100)/100.0
 
 def run_duration_for(bust: float) -> float:
-    # Slow curve
     return min(22.0, 8.0 + math.log(bust + 1.0) * 6.0)
 
 def current_multiplier(started_at: datetime.datetime, expected_end_at: datetime.datetime, bust: float, at: Optional[datetime.datetime] = None) -> float:
@@ -548,7 +546,6 @@ def picks_count_from_bitmask(mask: int) -> int:
     return mask.bit_count()
 
 def mines_multiplier(mines: int, picks_count: int) -> float:
-    # Fair multiplier Π (25 - i)/(25 - mines - i); apply env-based edge per safe pick
     if picks_count <= 0: return 1.0
     total = Decimal("1.0")
     for i in range(picks_count):
@@ -574,7 +571,6 @@ def mines_start(cur, user_id: str, bet: Decimal, mines: int):
     cur.execute("SELECT 1 FROM mines_games WHERE user_id=%s AND status='active'", (user_id,))
     if cur.fetchone(): raise ValueError("You already have an active Mines game")
 
-    # balance
     cur.execute("INSERT INTO balances(user_id,balance) VALUES (%s,0) ON CONFLICT(user_id) DO NOTHING", (user_id,))
     cur.execute("SELECT balance FROM balances WHERE user_id=%s FOR UPDATE", (user_id,))
     bal = D(cur.fetchone()[0])
@@ -796,22 +792,29 @@ HTML_TEMPLATE = """
     /* Crash graph */
     .cr-graph-wrap{position:relative; height:240px; background:#0e1833; border:1px solid var(--border); border-radius:16px; overflow:hidden}
     canvas{display:block; width:100%; height:100%}
+    .boom{ position:absolute; inset:0; pointer-events:none; opacity:0; }
+    .boom.bang{ animation: bang .6s ease-out; }
+    @keyframes bang{
+      0%{ opacity:.95; background: radial-gradient(350px 350px at var(--x,50%) var(--y,50%), rgba(255,255,255,.9), rgba(239,68,68,.6) 40%, transparent 70%); }
+      100%{ opacity:0; background: radial-gradient(800px 800px at var(--x,50%) var(--y,50%), rgba(255,255,255,.0), rgba(239,68,68,.0) 40%, transparent 75%); }
+    }
 
-    /* ----- MINES layout: centered, responsive, glossy tiles ----- */
+    /* ----- MINES layout ----- */
     .mines-two{
-      grid-template-columns: 340px 1fr !important;
-      align-items: start;
+      grid-template-columns: 360px 1fr !important;
+      align-items: stretch;
     }
     .mines-wrap{
       display:grid;
       place-items:center;
-      min-height: calc(100vh - 160px);
+      height: calc(100vh - 180px);
+      min-height: 420px;
       padding: 6px;
     }
     .mines-grid{
       --cell: clamp(
         48px,
-        min( calc((100vw - 420px)/5), calc((100vh - 260px)/5) ),
+        min( calc((100vw - 440px)/5), calc((100vh - 320px)/5) ),
         110px
       );
       display:grid;
@@ -820,6 +823,7 @@ HTML_TEMPLATE = """
       justify-content:center;
       align-content:center;
       padding: 6px;
+      width: 100%;
     }
     .tile{
       position:relative;
@@ -869,6 +873,27 @@ HTML_TEMPLATE = """
       from{ transform: scale(.92); opacity:.7 }
       to  { transform: scale(1);   opacity:1 }
     }
+    /* Explosions on mine reveal */
+    .tile.explode{ animation: shake .4s ease-in-out; }
+    .tile.explode::before{
+      content:"";
+      position:absolute; inset:-2px;
+      border-radius: inherit;
+      background: radial-gradient(circle, rgba(255,255,255,.85), rgba(239,68,68,.6) 40%, transparent 70%);
+      opacity:0; animation: exflash .6s ease-out;
+    }
+    @keyframes exflash{
+      0%{ opacity:.95; transform: scale(.9); }
+      80%{ opacity:.15; transform: scale(1.05); }
+      100%{ opacity:0; transform: scale(1); }
+    }
+    @keyframes shake{
+      0%,100%{ transform: translate(0,0) }
+      20%{ transform: translate(-2px,-1px) }
+      40%{ transform: translate(3px,1px) }
+      60%{ transform: translate(-2px,2px) }
+      80%{ transform: translate(1px,-2px) }
+    }
 
     .mines-stats{
       display:flex; gap:8px; flex-wrap:wrap; margin-top:10px
@@ -880,7 +905,7 @@ HTML_TEMPLATE = """
 
     @media (max-width: 980px){
       .mines-two{ grid-template-columns: 1fr !important; }
-      .mines-wrap{ min-height:auto; }
+      .mines-wrap{ height:auto; min-height: 360px; }
       .mines-grid{
         --cell: clamp(
           52px,
@@ -911,6 +936,7 @@ HTML_TEMPLATE = """
     .msghead{ display:flex; gap:8px; align-items:center; }
     .msghead .time{ margin-left:auto; color:var(--muted); font-size:12px }
     .lvl{ color:#cfe6ff; font-size:12px; border:1px solid var(--border); padding:2px 6px; border-radius:999px; background:#0c1631 }
+    .owner-badge{ color:#fff; background:#3b82f6; border-color:transparent }
     .disabled-note{ padding:8px 12px; font-size:13px; color:#dbe6ff; background:#0c1631; border-bottom:1px solid var(--border) }
   </style>
 </head>
@@ -958,9 +984,11 @@ HTML_TEMPLATE = """
 
         <div class="cr-graph-wrap" style="margin-top:10px">
           <canvas id="crCanvas"></canvas>
+          <div id="crBoom" class="boom"></div>
         </div>
 
         <div style="margin-top:12px">
+          <div class="label" style="margin-bottom:4px">Previous Busts</div>
           <div id="lastBusts" class="muted">Loading last rounds…</div>
         </div>
 
@@ -997,7 +1025,7 @@ HTML_TEMPLATE = """
         </div>
 
         <div class="grid mines-two" style="margin-top:12px; gap:16px">
-          <!-- LEFT: settings & stats -->
+          <!-- LEFT: settings & stats + recent games under -->
           <div>
             <div class="label">Bet (DL)</div>
             <input id="mBet" type="number" min="1" step="0.01" placeholder="min 1.00"/>
@@ -1029,7 +1057,7 @@ HTML_TEMPLATE = """
             </div>
           </div>
 
-          <!-- RIGHT: centered, fills remaining space -->
+          <!-- RIGHT: board fills remaining space -->
           <div class="mines-wrap">
             <div class="mines-grid" id="mGrid"></div>
           </div>
@@ -1136,6 +1164,7 @@ HTML_TEMPLATE = """
 
   <script>
     const HOUSE_EDGE_MINES = __HOUSE_EDGE_MINES__;
+    const OWNER_ID = "__OWNER_ID__";
     function qs(id){return document.getElementById(id)}
     const tabGames = qs('tab-games'), tabRef=qs('tab-ref'), tabPromo=qs('tab-promo');
     const pgGames=qs('page-games'), pgCrash=qs('page-crash'), pgMines=qs('page-mines'), pgRef=qs('page-ref'), pgPromo=qs('page-promo'), pgProfile=qs('page-profile'), loginCard=qs('loginCard');
@@ -1214,7 +1243,7 @@ HTML_TEMPLATE = """
           </div>
         `;
         const ownerPanel = qs('ownerPanel');
-        if(me.id === '__OWNER_ID__'){ ownerPanel.style.display=''; } else ownerPanel.style.display='none';
+        if(me.id === OWNER_ID){ ownerPanel.style.display=''; } else ownerPanel.style.display='none';
 
         const tApply = qs('tApply'); if(tApply){
           tApply.onclick = async ()=>{
@@ -1274,7 +1303,7 @@ HTML_TEMPLATE = """
       }catch(e){}
     }
 
-    // -------- Crash (extra slow) --------
+    // -------- Crash (slow & with explosion) --------
     const crNowEl = qs('crNow'), crHint = qs('crHint'), crMsg = qs('crMsg');
     const lastBustsEl = qs('lastBusts'), cashBtn = qs('crCashout'), placeBtn = qs('crPlace');
 
@@ -1284,6 +1313,7 @@ HTML_TEMPLATE = """
 
     // Canvas
     const canv = qs('crCanvas'); const ctx = canv.getContext('2d');
+    const crBoom = qs('crBoom');
     function resizeCanvas(){
       const dpr = window.devicePixelRatio || 1;
       const r = canv.getBoundingClientRect();
@@ -1346,6 +1376,15 @@ HTML_TEMPLATE = """
       rafId = requestAnimationFrame(tick);
     }
     function stopRunAnim(){ if(rafId){ cancelAnimationFrame(rafId); rafId=null; } }
+    function triggerCrashExplosion(bust){
+      const w = canv.clientWidth, h = canv.clientHeight;
+      const p = mapPoint(Math.max(1.0, bust));
+      const rx = (p[0]/w*100).toFixed(2)+'%';
+      const ry = (p[1]/h*100).toFixed(2)+'%';
+      crBoom.style.setProperty('--x', rx);
+      crBoom.style.setProperty('--y', ry);
+      crBoom.classList.remove('bang'); void crBoom.offsetWidth; crBoom.classList.add('bang');
+    }
     function tick(ts){
       if(!lastTs) lastTs = ts;
       const dt = Math.min(0.1, (ts - lastTs)/1000); lastTs = ts;
@@ -1364,13 +1403,21 @@ HTML_TEMPLATE = """
       rafId = requestAnimationFrame(tick);
     }
 
+    function bustChipColor(v){
+      if(v < 1.5) return 'linear-gradient(180deg,#3a1020,#2a0b18)';
+      if(v < 2.0) return 'linear-gradient(180deg,#3a2d10,#2a200b)';
+      if(v < 3.0) return 'linear-gradient(180deg,#0f2f16,#0b2110)';
+      return 'linear-gradient(180deg,#0f2b38,#0b1f2a)';
+    }
+
     async function refreshCrash(){
       try{
         const s = await j('/api/crash/state');
         roundId = s.round_id; crPhase = s.phase;
 
-        lastBustsEl.innerHTML = s.last_busts.length
-          ? s.last_busts.map(v=>`<span class="chip">${v.toFixed(2)}×</span>`).join('')
+        const lbs = (s.last_busts||[]).slice().reverse(); // oldest -> newest
+        lastBustsEl.innerHTML = lbs.length
+          ? lbs.map(v=>`<span class="chip" style="border-color:transparent;background:${bustChipColor(v)}">${v.toFixed(2)}×</span>`).join(' ')
           : 'No history yet.';
 
         haveActiveBet = !!(s.your_bet && !s.your_bet.resolved);
@@ -1390,7 +1437,7 @@ HTML_TEMPLATE = """
         }
         if(lastPhase === 'running' && crPhase !== 'running'){
           stopRunAnim();
-          if(s.bust){ crNowEl.textContent = s.bust.toFixed(2)+'×'; }
+          if(s.bust){ crNowEl.textContent = s.bust.toFixed(2)+'×'; triggerCrashExplosion(s.bust); }
           crHint.textContent = 'Preparing next round…';
           cashBtn.disabled = true;
         }
@@ -1416,7 +1463,8 @@ HTML_TEMPLATE = """
       }catch(e){}
     }
 
-    placeBtn.onclick = async ()=>{
+    const placeBtnEl = qs('crPlace');
+    placeBtnEl.onclick = async ()=>{
       try{
         const bet = parseFloat(document.getElementById('crBet').value);
         const cashVal = document.getElementById('crCash').value.trim();
@@ -1464,12 +1512,12 @@ HTML_TEMPLATE = """
       }
     }
 
-    function updateGridReveal(board=null){
+    function updateGridReveal(board=null, explodedIndex=null){
       for(let i=0;i<25;i++){
         const tile = mGrid.children[i];
         const icon = tile.firstChild;
         const revealed = ((mPicks>>i)&1)===1;
-        tile.classList.remove('safe','mine','revealed','pop');
+        tile.classList.remove('safe','mine','revealed','pop','explode');
         icon.textContent = '';
 
         if(revealed){
@@ -1481,8 +1529,7 @@ HTML_TEMPLATE = """
             tile.classList.remove('safe');
             tile.classList.add('mine','revealed');
             icon.textContent = '💥';
-          }else if(!revealed){
-            // keep it hidden
+            if(explodedIndex===i){ tile.classList.add('explode'); }
           }
         }
       }
@@ -1517,7 +1564,7 @@ HTML_TEMPLATE = """
         const r = await j('/api/mines/pick',{method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({index: idx})});
         if(r.status==='lost'){
           mActive=false; mStatus.textContent='Status: Lost';
-          updateGridReveal(r.board);
+          updateGridReveal(r.board, r.index);
           mMult.textContent='Multiplier: —';
           mPotential.textContent='Potential: —';
           mMsg.textContent='💥 You hit a mine.';
@@ -1633,6 +1680,10 @@ HTML_TEMPLATE = """
       const head = document.createElement('div'); head.className='msghead';
       const name = document.createElement('b'); name.textContent = m.username;
       const lvl = document.createElement('span'); lvl.className='lvl'; lvl.textContent = `[Lv ${m.level}]`;
+      if(String(m.user_id) === OWNER_ID){
+        const owner = document.createElement('span'); owner.className='lvl owner-badge'; owner.textContent='OWNER';
+        head.appendChild(owner);
+      }
       const ts = document.createElement('span'); ts.className='time'; ts.textContent = new Date(m.created_at).toLocaleTimeString();
       head.appendChild(name); head.appendChild(lvl); head.appendChild(ts);
       const txt = document.createElement('div'); txt.className='txt'; txt.textContent = m.text;

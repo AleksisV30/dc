@@ -29,7 +29,7 @@ GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 GEM = "💎"
-HOUSE_EDGE = Decimal("0.01")     # 1% edge (mines per safe pick; crash built into bust)
+HOUSE_EDGE = Decimal("0.01")     # 1% edge
 MIN_BET = Decimal("1.00")        # 1.00 DL minimum
 MAX_BET = Decimal("1000000.00")
 BETTING_SECONDS = 10             # Crash betting window
@@ -71,7 +71,6 @@ def init_db(cur):
             balance NUMERIC(18,2) NOT NULL DEFAULT 0
         )
     """)
-    # migrate type if needed
     cur.execute("ALTER TABLE balances ALTER COLUMN balance TYPE NUMERIC(18,2) USING balance::numeric")
 
     cur.execute("""
@@ -96,7 +95,6 @@ def init_db(cur):
             created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    cur.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS xp INTEGER NOT NULL DEFAULT 0")
 
     # promos
     cur.execute("""
@@ -146,7 +144,6 @@ def init_db(cur):
             PRIMARY KEY(round_id, user_id)
         )
     """)
-    # migrate types
     cur.execute("ALTER TABLE crash_bets ALTER COLUMN bet TYPE NUMERIC(18,2) USING bet::numeric")
     cur.execute("ALTER TABLE crash_bets ALTER COLUMN win TYPE NUMERIC(18,2) USING win::numeric")
     cur.execute("""
@@ -292,14 +289,14 @@ def create_promo(cur, actor_id: str, code: Optional[str], amount, max_uses: int 
 # ---- Crash math & DB ----
 def _u(): return (secrets.randbelow(1_000_000_000)+1)/1_000_000_001.0
 def gen_bust(edge: Decimal = HOUSE_EDGE) -> float:
-    # bust distribution 1+ with implicit edge
     u = _u()
     B = max(1.0, float((Decimal("1.0")-edge)/Decimal(str(u))))
     return math.floor(B*100)/100.0
 
 def run_duration_for(bust: float) -> float:
-    # MUCH slower than before
-    return min(14.0, 3.0 + math.log(bust+1.0)*3.0)
+    # MUCH slower curve than before
+    # Longer base, stronger scaling with bust to keep animation gentle
+    return min(22.0, 8.0 + math.log(bust + 1.0) * 6.0)
 
 def current_multiplier(started_at: datetime.datetime, expected_end_at: datetime.datetime, bust: float, at: Optional[datetime.datetime] = None) -> float:
     at = at or now_utc()
@@ -759,7 +756,7 @@ HTML_TEMPLATE = """
     }
     a{color:inherit; text-decoration:none}
     .container{max-width:1100px; margin:0 auto; padding:16px}
-    .header{position:sticky; top:0; z-index:20; backdrop-filter: blur(8px); background:rgba(10,15,30,.7); border-bottom:1px solid var(--border)}
+    .header{position:sticky; top:0; z-index:30; backdrop-filter: blur(8px); background:rgba(10,15,30,.7); border-bottom:1px solid var(--border)}
     .header-inner{display:flex; align-items:center; justify-content:space-between; gap:10px; padding:10px 12px}
     .brand{display:flex; align-items:center; gap:10px; font-weight:800; letter-spacing:.2px}
     .brand .logo{width:28px;height:28px;border-radius:8px; background:linear-gradient(135deg,var(--accent),var(--accent2))}
@@ -795,12 +792,17 @@ HTML_TEMPLATE = """
     .cr-graph-wrap{position:relative; height:240px; background:#0e1833; border:1px solid var(--border); border-radius:16px; overflow:hidden}
     canvas{display:block; width:100%; height:100%}
 
-    /* Mines two-column layout */
-    .mines-grid{display:grid; grid-template-columns:repeat(5, 1fr); gap:8px}
+    /* Mines compact sizing */
+    .mines-grid{
+      display:grid; gap:6px;
+      grid-template-columns: repeat(5, minmax(44px, 58px));
+      justify-content:flex-start;
+      max-width: 320px;
+    }
     .tile{
-      aspect-ratio:1/1; border-radius:12px; border:1px solid var(--border);
+      aspect-ratio:1/1; border-radius:10px; border:1px solid var(--border);
       background:linear-gradient(180deg,#0f1936,#0c152a); display:flex; align-items:center; justify-content:center;
-      font-weight:800; font-size:18px; cursor:pointer; user-select:none;
+      font-weight:800; font-size:16px; cursor:pointer; user-select:none;
       transition:transform .06s ease, box-shadow .12s ease, background .12s ease;
     }
     .tile:hover{ transform:translateY(-1px); box-shadow:0 6px 12px rgba(0,0,0,.25) }
@@ -811,7 +813,30 @@ HTML_TEMPLATE = """
 
     @media (max-width: 900px){
       .mines-two{grid-template-columns: 1fr !important}
+      .mines-grid{ grid-template-columns: repeat(5, minmax(40px, 1fr)); max-width: none; }
     }
+
+    /* Modal */
+    .modal{ position:fixed; inset:0; display:none; align-items:center; justify-content:center; background:rgba(3,6,12,.6); z-index:50; }
+    .modal .box{ width:min(640px, 92vw); background:linear-gradient(180deg,#0f1a33,#0c1429); border:1px solid var(--border); border-radius:18px; padding:16px; box-shadow:0 10px 30px rgba(0,0,0,.4) }
+
+    /* Chat Drawer */
+    .chat-drawer{
+      position:fixed; right:0; top:64px; bottom:0; width:340px; max-width:90vw;
+      transform:translateX(100%); transition: transform .2s ease-out;
+      background:linear-gradient(180deg,#0f1a33,#0b1326); border-left:1px solid var(--border);
+      display:flex; flex-direction:column; z-index:40;
+    }
+    .chat-drawer.open{ transform:translateX(0); }
+    .chat-head{ display:flex; align-items:center; justify-content:space-between; padding:10px 12px; border-bottom:1px solid var(--border) }
+    .chat-body{ flex:1; overflow:auto; padding:10px 12px; }
+    .chat-input{ display:flex; gap:8px; padding:10px 12px; border-top:1px solid var(--border) }
+    .chat-input input{ flex:1 }
+    .msg{ margin-bottom:10px }
+    .msghead{ display:flex; gap:8px; align-items:center; }
+    .msghead .time{ margin-left:auto; color:var(--muted); font-size:12px }
+    .lvl{ color:#cfe6ff; font-size:12px; border:1px solid var(--border); padding:2px 6px; border-radius:999px; background:#0c1631 }
+    .disabled-note{ padding:8px 12px; font-size:13px; color:#dbe6ff; background:#0c1631; border-bottom:1px solid var(--border) }
   </style>
 </head>
 <body>
@@ -897,7 +922,7 @@ HTML_TEMPLATE = """
         </div>
 
         <!-- two-column layout -->
-        <div class="grid mines-two" style="grid-template-columns: 380px 1fr; margin-top:12px; gap:16px">
+        <div class="grid mines-two" style="grid-template-columns: 320px 1fr; margin-top:12px; gap:16px">
           <!-- LEFT: settings & stats -->
           <div>
             <div class="label">Bet (DL)</div>
@@ -918,7 +943,7 @@ HTML_TEMPLATE = """
             </div>
 
             <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:8px">
-              <span class="tag" id="mMult">Multiplier: 1.00×</span>
+              <span class="tag" id="mMult">Multiplier: 1.0000×</span>
               <span class="tag" id="mPotential">Potential: —</span>
             </div>
 
@@ -1002,16 +1027,16 @@ HTML_TEMPLATE = """
     </div>
   </div>
 
-  <!-- Modal -->
+  <!-- Balance Modal -->
   <div class="modal" id="modal">
     <div class="box">
       <div style="display:flex; justify-content:space-between; align-items:center; gap:10px">
-        <div class="big">Balance — How to Deposit / Withdraw</div>
-        <button class="btn" id="mClose">Close</button>
+        <div class="big">Balance — Deposit / Withdraw</div>
+        <button class="btn ghost" id="mClose">Close</button>
       </div>
       <div class="muted" style="margin-top:8px">
         <p><b>Deposit:</b> Join our Discord and type <code>.deposit</code> in the <i>#deposit</i> channel.</p>
-        <p><b>Withdraw:</b> In Discord type <code>.withdraw</code>. (Wiring later.)</p>
+        <p><b>Withdraw:</b> In Discord type <code>.withdraw</code>. (We’ll wire up fulfillment later.)</p>
       </div>
     </div>
   </div>
@@ -1064,7 +1089,7 @@ HTML_TEMPLATE = """
     qs('mClose').onclick = closeModal;
     qs('modal').addEventListener('click', (e)=>{ if(e.target.id==='modal') closeModal(); });
 
-    function safeAvatar(me){ return me.avatar_url || ''; }
+    function safeAvatar(me){ return me.avatar_url || 'https://cdn.discordapp.com/embed/avatars/1.png?size=64'; }
 
     // Header/auth
     async function renderHeader(){
@@ -1075,7 +1100,7 @@ HTML_TEMPLATE = """
         auth.innerHTML = `
           <span class="chip" id="balanceBtn">${fmtDL(bal.balance)}</span>
           <span class="chip" id="chatBtn">Chat</span>
-          <img class="avatar" id="avatarBtn" src="${safeAvatar(me)}" title="${me.username}" onerror="this.style.display='none'">
+          <img class="avatar" id="avatarBtn" src="${safeAvatar(me)}" title="${me.username}" onerror="this.src='https://cdn.discordapp.com/embed/avatars/1.png?size=64'">
         `;
         loginCard.style.display='none';
         qs('balanceBtn').onclick = openModal;
@@ -1087,7 +1112,7 @@ HTML_TEMPLATE = """
       }
     }
 
-    // Profile / Referral / Promos (same as before, shortened)
+    // Profile / Referral / Promos
     async function renderProfile(){
       try{
         const me = await j('/api/me'); const prof = await j('/api/profile');
@@ -1112,8 +1137,7 @@ HTML_TEMPLATE = """
           </div>
         `;
         const ownerPanel = qs('ownerPanel');
-        const meInfo = await j('/api/me');
-        if(meInfo.id === '__OWNER_ID__'){ ownerPanel.style.display=''; } else ownerPanel.style.display='none';
+        if(me.id === '__OWNER_ID__'){ ownerPanel.style.display=''; } else ownerPanel.style.display='none';
 
         const tApply = qs('tApply'); if(tApply){
           tApply.onclick = async ()=>{
@@ -1173,7 +1197,7 @@ HTML_TEMPLATE = """
       }catch(e){}
     }
 
-    // -------- Crash (slower) --------
+    // -------- Crash (extra slow) --------
     const crNowEl = qs('crNow'), crHint = qs('crHint'), crMsg = qs('crMsg');
     const lastBustsEl = qs('lastBusts'), cashBtn = qs('crCashout'), placeBtn = qs('crPlace');
 
@@ -1249,7 +1273,8 @@ HTML_TEMPLATE = """
       if(!lastTs) lastTs = ts;
       const dt = Math.min(0.1, (ts - lastTs)/1000); lastTs = ts;
       const tSec = Math.max(0, (ts - runStartTs)/1000);
-      const baseRate = 0.04, maxRate = 0.6, tau = 4.0; // much slower than before
+      // Extra slow curve
+      const baseRate = 0.008, maxRate = 0.16, tau = 8.0;
       const ratePerSec = baseRate + (maxRate - baseRate) * (1 - Math.exp(-tSec / tau));
       stepAcc += ratePerSec * dt;
       while(stepAcc >= 0.01 && clientMult < serverTarget){
@@ -1491,7 +1516,7 @@ HTML_TEMPLATE = """
       }
     }
 
-    // Chat (unchanged)
+    // Chat
     const drawer = qs('chatDrawer'), chatBody=qs('chatBody'), chatText=qs('chatText'), chatSend=qs('chatSend');
     const chatNote = qs('chatNote'), chatDisabled = qs('chatDisabled');
     let chatOpen=false, chatPoll=null, lastChatId=0, myLevel=0, isLogged=false;
@@ -1540,9 +1565,24 @@ HTML_TEMPLATE = """
     function closeChat(){ drawer.classList.remove('open'); chatOpen=false; if(chatPoll){clearInterval(chatPoll); chatPoll=null;} }
     qs('chatClose').onclick = closeChat;
 
+    async function sendChat(){
+      if(chatSend.disabled) return;
+      const text = chatText.value.trim();
+      if(!text) return;
+      try{
+        await j('/api/chat/send',{method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text})});
+        chatText.value=''; await fetchChat(false);
+      }catch(e){
+        // Show gate messages via updateChatGate
+        await updateChatGate();
+      }
+    }
+    chatSend.onclick = sendChat;
+    chatText.addEventListener('keydown', (ev)=>{ if(ev.key==='Enter'){ ev.preventDefault(); sendChat(); } });
+
     // Periodic
-    setInterval(()=>{ if(pgCrash.style.display!=='none') refreshCrash(); }, 900);
-    setInterval(()=>{ if(pgCrash.style.display!=='none') pollNow(); }, 300);
+    setInterval(()=>{ if(pgCrash.style.display!=='none') refreshCrash(); }, 1000);
+    setInterval(()=>{ if(pgCrash.style.display!=='none') pollNow(); }, 400);
 
     // Other tabs & data
     tabGames.onclick=()=>setTab('games');

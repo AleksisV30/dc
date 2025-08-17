@@ -23,14 +23,11 @@ PORT = int(os.getenv("PORT", "8080"))
 DISCORD_API = "https://discord.com/api"
 OWNER_ID = 1128658280546320426
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
-
-DATABASE_URL = os.getenv("DATABASE_URL")  # set by Railway Postgres plugin
-if not DATABASE_URL:
-    print("WARNING: DATABASE_URL is not set. Add Railway Postgres and expose DATABASE_URL.")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 GEM = "💎"
 
-# ---------- DB (Postgres) ----------
+# ---------- DB (Postgres helpers) ----------
 def with_conn(fn):
     def wrapper(*args, **kwargs):
         if not DATABASE_URL:
@@ -44,12 +41,14 @@ def with_conn(fn):
 
 @with_conn
 def init_db(cur):
+    # balances
     cur.execute("""
         CREATE TABLE IF NOT EXISTS balances (
             user_id TEXT PRIMARY KEY,
             balance INTEGER NOT NULL DEFAULT 0
         )
     """)
+    # admin change log
     cur.execute("""
         CREATE TABLE IF NOT EXISTS balance_log (
             id BIGSERIAL PRIMARY KEY,
@@ -58,6 +57,27 @@ def init_db(cur):
             amount INTEGER NOT NULL,
             reason TEXT,
             created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    # promo codes
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS promo_codes (
+            code TEXT PRIMARY KEY,
+            amount INTEGER NOT NULL,
+            max_uses INTEGER NOT NULL DEFAULT 1,
+            uses INTEGER NOT NULL DEFAULT 0,
+            expires_at TIMESTAMPTZ,
+            created_by TEXT,
+            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    # promo redemptions
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS promo_redemptions (
+            user_id TEXT NOT NULL,
+            code TEXT NOT NULL,
+            redeemed_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(user_id, code)
         )
     """)
 
@@ -99,6 +119,55 @@ def get_recent_logs(cur, limit: int = 20):
     rows = cur.fetchall()
     return [{"actor_id":r[0], "target_id":r[1], "amount":int(r[2]), "reason":r[3], "created_at":str(r[4])} for r in rows]
 
+# ---- Promo helpers ----
+class PromoError(Exception): ...
+class PromoAlreadyRedeemed(PromoError): ...
+class PromoInvalid(PromoError): ...
+class PromoExpired(PromoError): ...
+class PromoExhausted(PromoError): ...
+
+@with_conn
+def redeem_promo(cur, user_id: str, code: str) -> int:
+    code = code.strip().upper()
+    cur.execute("SELECT code, amount, max_uses, uses, expires_at FROM promo_codes WHERE code = %s", (code,))
+    row = cur.fetchone()
+    if not row:
+        raise PromoInvalid("Invalid code")
+    _, amount, max_uses, uses, expires_at = row
+    if expires_at is not None:
+        cur.execute("SELECT NOW() > %s", (expires_at,))
+        if cur.fetchone()[0]:
+            raise PromoExpired("Code expired")
+    if uses >= max_uses:
+        raise PromoExhausted("Code maxed out")
+    cur.execute("SELECT 1 FROM promo_redemptions WHERE user_id=%s AND code=%s", (user_id, code))
+    if cur.fetchone():
+        raise PromoAlreadyRedeemed("You already redeemed this code")
+    # apply
+    cur.execute("INSERT INTO balances (user_id, balance) VALUES (%s, 0) ON CONFLICT (user_id) DO NOTHING", (user_id,))
+    cur.execute("UPDATE balances SET balance = balance + %s WHERE user_id = %s", (amount, user_id))
+    cur.execute("UPDATE promo_codes SET uses = uses + 1 WHERE code = %s", (code,))
+    cur.execute("INSERT INTO promo_redemptions(user_id, code) VALUES (%s, %s)", (user_id, code))
+    cur.execute("INSERT INTO balance_log(actor_id, target_id, amount, reason) VALUES (%s, %s, %s, %s)",
+                ("promo", user_id, amount, f"promo:{code}"))
+    cur.execute("SELECT balance FROM balances WHERE user_id = %s", (user_id,))
+    return int(cur.fetchone()[0])
+
+@with_conn
+def my_redemptions(cur, user_id: str):
+    cur.execute("SELECT code, redeemed_at FROM promo_redemptions WHERE user_id=%s ORDER BY redeemed_at DESC LIMIT 50", (user_id,))
+    return [{"code": r[0], "redeemed_at": str(r[1])} for r in cur.fetchall()]
+
+@with_conn
+def create_promo(cur, actor_id: str, code: str, amount: int, max_uses: int = 1, expires_at: Optional[str] = None):
+    code = code.strip().upper()
+    cur.execute("""
+        INSERT INTO promo_codes(code, amount, max_uses, expires_at, created_by)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (code) DO UPDATE SET amount=EXCLUDED.amount, max_uses=EXCLUDED.max_uses, expires_at=EXCLUDED.expires_at
+    """, (code, amount, max_uses, expires_at, actor_id))
+    return {"ok": True, "code": code}
+
 # ---------- Helpers ----------
 def parse_user_identifier(identifier: str) -> Optional[str]:
     if not identifier: return None
@@ -111,39 +180,29 @@ def fmt_dl(n: int) -> str:
     return f"{GEM} {n:,} DL"
 
 def embed(title: str, desc: Optional[str] = None, color: int = 0x00C2FF) -> discord.Embed:
-    e = discord.Embed(title=title, description=desc or "", color=color)
-    return e
+    return discord.Embed(title=title, description=desc or "", color=color)
 
 # ---------- Discord bot ----------
 intents = discord.Intents.default()
 intents.message_content = True
-intents.members = True  # for owner panel autocomplete
+intents.members = True
 bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
 @bot.event
 async def on_ready():
     g = bot.get_guild(GUILD_ID) if GUILD_ID else None
     print(f"Logged in as {bot.user} (id={bot.user.id}). Guild set: {bool(g)}")
-    if g:
-        print(f"Guild: {g.name} ({g.id}) — cached members: {len(g.members)}")
+    if g: print(f"Guild: {g.name} ({g.id}) — cached members: {len(g.members)}")
 
 @bot.command(name="help")
 async def help_command(ctx: commands.Context):
     is_owner = (ctx.author.id == OWNER_ID)
-    e = embed(
-        title="💎 DL Bank — Help",
-        desc=f"Prefix: `{PREFIX}`",
-        color=0x60A5FA
-    )
-    e.add_field(
-        name="General",
-        value=(
-            f"**{PREFIX}help** — Show this help\n"
-            f"**{PREFIX}bal** — Show **your** balance\n"
-            f"**{PREFIX}bal @User** — Show **someone else’s** balance"
-        ),
-        inline=False
-    )
+    e = embed(title="💎 DL Bank — Help", desc=f"Prefix: `{PREFIX}`", color=0x60A5FA)
+    e.add_field(name="General",
+                value=(f"**{PREFIX}help** — Show this help\n"
+                       f"**{PREFIX}bal** — Show **your** balance\n"
+                       f"**{PREFIX}bal @User** — Show **someone else’s** balance"),
+                inline=False)
     owner_line = f"**{PREFIX}addbal @User <amount>** — Add/subtract DL *(owner only)*"
     if is_owner: owner_line += " ✅"
     e.add_field(name="Admin", value=owner_line, inline=False)
@@ -161,25 +220,18 @@ async def bal(ctx: commands.Context, user: discord.User | None = None):
 @bot.command(name="addbal")
 async def addbal(ctx: commands.Context, user: discord.User | None = None, amount: int | None = None):
     if ctx.author.id != OWNER_ID:
-        e = embed("Not allowed", "Only the owner can adjust balances.", color=0xEF4444)
-        return await ctx.reply(embed=e, mention_author=False)
+        return await ctx.reply(embed=embed("Not allowed","Only the owner can adjust balances.",0xEF4444), mention_author=False)
     if user is None or amount is None:
-        e = embed("Usage", f"`{PREFIX}addbal @User <amount>`", color=0xF59E0B)
-        return await ctx.reply(embed=e, mention_author=False)
+        return await ctx.reply(embed=embed("Usage", f"`{PREFIX}addbal @User <amount>`", 0xF59E0B), mention_author=False)
     if amount == 0:
-        e = embed("Invalid amount", "Amount cannot be zero.", color=0xEF4444)
-        return await ctx.reply(embed=e, mention_author=False)
+        return await ctx.reply(embed=embed("Invalid amount","Amount cannot be zero.",0xEF4444), mention_author=False)
     new_balance = adjust_balance(str(ctx.author.id), str(user.id), amount, reason="bot addbal")
     sign = "+" if amount > 0 else ""
-    e = embed(
-        title="Balance Updated",
-        desc=f"**Target:** {user.mention}\n**Change:** `{sign}{amount}` → {fmt_dl(new_balance)}",
-        color=0x60A5FA
-    )
+    e = embed("Balance Updated", f"**Target:** {user.mention}\n**Change:** `{sign}{amount}` → {fmt_dl(new_balance)}", 0x60A5FA)
     e.set_footer(text="Currency: Growtopia Diamond Locks (DL)")
     await ctx.reply(embed=e, mention_author=False)
 
-# ---------- Web (FastAPI + OAuth + owner panel with autocomplete) ----------
+# ---------- Web (FastAPI) ----------
 app = FastAPI()
 signer = URLSafeSerializer(SECRET_KEY, salt="session")
 
@@ -192,6 +244,7 @@ def read_session(request: Request) -> dict | None:
     try: return signer.loads(raw)
     except BadSignature: return None
 
+# ---- HTML (same vibe, added tabs) ----
 INDEX_HTML = """
 <!doctype html>
 <html>
@@ -202,11 +255,19 @@ INDEX_HTML = """
   <style>
     :root{ --bg:#0b1220; --card:#121a2b; --muted:#8aa0c7; --text:#e8efff; --accent:#60a5fa; --ok:#34d399; --warn:#f59e0b; --err:#ef4444; --border:#23304c; }
     *{box-sizing:border-box}
-    body{background:linear-gradient(180deg,#0a1020,#0e1530); color:var(--text); font-family:system-ui,Segoe UI,Roboto,Arial; margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center; padding:24px}
-    .wrap{width:100%; max-width:860px}
-    .hero{padding:22px 24px; background:linear-gradient(135deg,#0e1630 0%,#0a1124 100%); border:1px solid var(--border); border-radius:18px; box-shadow:0 20px 60px rgba(0,0,0,.35)}
-    .row{display:flex; gap:16px; align-items:center; justify-content:space-between; flex-wrap:wrap}
-    .btn{display:inline-flex; align-items:center; gap:8px; padding:10px 14px; border-radius:10px; text-decoration:none; border:1px solid var(--border); color:var(--text); background:#0f1a33; cursor:pointer}
+    body{background:linear-gradient(180deg,#0a1020,#0e1530); color:var(--text); font-family:system-ui,Segoe UI,Roboto,Arial; margin:0; min-height:100vh;}
+    a{color:inherit; text-decoration:none}
+    .container{max-width:1100px; margin:0 auto; padding:16px}
+    .header{position:sticky; top:0; z-index:10; background:linear-gradient(135deg,#0e1630 0%,#0a1124 100%); border-bottom:1px solid var(--border);}
+    .header-inner{display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 16px;}
+    .brand{display:flex; align-items:center; gap:10px; font-weight:800; letter-spacing:.2px}
+    .nav{display:flex; gap:10px; align-items:center}
+    .tab{padding:8px 12px; border:1px solid var(--border); border-radius:10px; background:#0f1a33; cursor:pointer}
+    .tab.active{background:linear-gradient(135deg,#3b82f6,#22c1dc); border-color:transparent}
+    .right{display:flex; gap:10px; align-items:center}
+    .chip{background:#0c1631; border:1px solid var(--border); color:#dce7ff; padding:6px 10px; border-radius:999px; font-size:12px; white-space:nowrap}
+    .avatar{width:28px;height:28px;border-radius:50%;object-fit:cover;border:1px solid var(--border)}
+    .btn{display:inline-flex; align-items:center; gap:8px; padding:8px 12px; border-radius:10px; border:1px solid var(--border); background:#0f1a33; cursor:pointer}
     .btn.primary{background:linear-gradient(135deg,#3b82f6,#22c1dc); border-color:transparent}
     .grid{display:grid; gap:16px; grid-template-columns:1fr}
     @media(min-width:900px){.grid{grid-template-columns:1fr 1fr}}
@@ -217,7 +278,10 @@ INDEX_HTML = """
     th,td{border-bottom:1px solid var(--border); padding:8px 6px; text-align:left}
     .muted{color:var(--muted)}
     input{width:100%; background:#0e1833; color:var(--text); border:1px solid var(--border); border-radius:10px; padding:10px}
-    .pill{display:inline-flex; align-items:center; gap:6px; padding:6px 10px; border-radius:999px; background:#0f1a33; border:1px solid var(--border)}
+    .games-grid{display:grid; gap:12px; grid-template-columns:1fr; margin-top:16px}
+    @media(min-width:800px){.games-grid{grid-template-columns:repeat(3,1fr)}}
+    .game{background:#0f1a33;border:1px solid var(--border);border-radius:16px;padding:14px}
+    .banner{font-weight:900; font-size:18px}
     .suggest{margin-top:6px; border:1px solid var(--border); border-radius:10px; background:#0f1a33; display:none;}
     .sitem{padding:6px 8px; border-bottom:1px solid var(--border); cursor:pointer; display:flex; align-items:center; gap:8px}
     .sitem:last-child{border-bottom:none}
@@ -225,162 +289,158 @@ INDEX_HTML = """
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <div class="hero">
-      <div class="row">
-        <div class="title">💎 DL Bank</div>
-        <div id="auth" class="actions"></div>
+  <div class="header">
+    <div class="header-inner container">
+      <a class="brand" href="#" id="homeLink"><span class="banner">💎 DL Bank</span></a>
+      <div class="nav">
+        <a class="tab active" id="tab-games">Games</a>
+        <a class="tab" id="tab-ref">Referral</a>
+        <a class="tab" id="tab-promo">Promo Codes</a>
+      </div>
+      <div class="right" id="authArea">
+        <!-- balance + avatar OR login/register -->
+      </div>
+    </div>
+  </div>
+
+  <div class="container" style="padding-top:16px">
+    <div id="page-games">
+      <div class="card">
+        <div class="label">Games</div>
+        <div class="games-grid">
+          <div class="game"><div class="big">🎰 Lucky Spin</div><div class="muted">Coming soon.</div></div>
+          <div class="game"><div class="big">🎯 Coin Flip</div><div class="muted">Coming soon.</div></div>
+          <div class="game"><div class="big">🃏 Blackjack</div><div class="muted">Coming soon.</div></div>
+        </div>
       </div>
     </div>
 
-    <div class="grid" style="margin-top:16px">
+    <div id="page-ref" style="display:none">
       <div class="card">
-        <div class="label">My Balance</div>
-        <div id="bal" class="big">—</div>
-        <div class="muted" style="margin-top:6px">Currency: Growtopia Diamond Locks (DL)</div>
+        <div class="label">Referral</div>
+        <p>Your referral code is your Discord ID. Share this link:</p>
+        <p><code id="refLink">—</code></p>
+        <p class="muted">When friends join via your link and play, you can reward them (details coming soon).</p>
       </div>
+    </div>
 
-      <div id="ownerBox" class="card" style="display:none">
-        <div class="label">Owner Panel</div>
-        <div class="row" style="gap:8px; align-items:flex-end">
-          <div style="flex:2">
-            <div class="label">Discord ID or &lt;@mention&gt;</div>
-            <input id="target" placeholder="Type an ID… or start with @ to search members" />
-            <div id="suggest" class="suggest"></div>
-          </div>
-          <div style="flex:1">
-            <div class="label">Amount (+/-)</div>
-            <input id="amount" type="number" placeholder="e.g. 10 or -5" />
-          </div>
-          <div style="flex:2">
-            <div class="label">Reason (optional)</div>
-            <input id="reason" placeholder="Promo / correction / prize ..." />
+    <div id="page-promo" style="display:none">
+      <div class="card">
+        <div class="label">Promo Codes</div>
+        <div class="grid">
+          <div>
+            <div class="label">Redeem a code</div>
+            <div style="display:flex; gap:8px; align-items:center">
+              <input id="promoInput" placeholder="e.g. WELCOME10" />
+              <button class="btn primary" id="redeemBtn">Redeem</button>
+            </div>
+            <div id="promoMsg" class="muted" style="margin-top:8px"></div>
           </div>
           <div>
-            <button id="doAdjust" class="btn primary">Apply</button>
+            <div class="label">Your redemptions</div>
+            <div id="myCodes" class="muted">—</div>
           </div>
         </div>
-        <div id="msg" class="muted" style="margin-top:8px"></div>
       </div>
     </div>
 
-    <div id="ownerTables" class="grid" style="margin-top:16px; display:none">
-      <div class="card">
-        <div class="label">Top Balances</div>
-        <div id="top"></div>
+    <div id="loginCard" class="card" style="display:none">
+      <div class="label">Get Started</div>
+      <p>If you’re not logged in, click <b>Login with Discord</b>. If you’re new, click <b>Register</b> to see how to join:</p>
+      <div style="display:flex; gap:8px; flex-wrap:wrap">
+        <a class="btn primary" href="/login">Login with Discord</a>
+        <button class="btn" id="registerBtn">Register</button>
       </div>
-      <div class="card">
-        <div class="label">Recent Changes</div>
-        <div id="logs"></div>
+      <div id="registerInfo" class="muted" style="margin-top:10px; display:none">
+        <p>1) Join our Discord server.</p>
+        <p>2) DM the bot and run <code>.signup &lt;password&gt;</code> to set your site password (optional).</p>
+        <p>3) Then use <b>Login with Discord</b> here to see your balance and play.</p>
       </div>
     </div>
   </div>
 
   <script>
-    async function j(u, opt={}) {
-      const r = await fetch(u, Object.assign({credentials:'include'}, opt));
-      if(!r.ok) throw new Error(await r.text());
-      return r.json();
-    }
-    function fmtDL(n){ return `💎 ${Number(n).toLocaleString()} DL`; }
+    function qs(id){return document.getElementById(id)}
+    const tabGames = qs('tab-games'), tabRef=qs('tab-ref'), tabPromo=qs('tab-promo');
+    const pgGames=qs('page-games'), pgRef=qs('page-ref'), pgPromo=qs('page-promo'), loginCard=qs('loginCard');
 
-    async function loadSuggestions(q){
-      const data = await j('/api/admin/members?q='+encodeURIComponent(q||''));
-      return data.members || [];
+    function fmtDL(n){ return `💎 ${Number(n).toLocaleString()} DL`; }
+    async function j(u, opt={}){ const r=await fetch(u, Object.assign({credentials:'include'},opt)); if(!r.ok) throw new Error(await r.text()); return r.json(); }
+
+    function setTab(which){
+      [tabGames,tabRef,tabPromo].forEach(t=>t.classList.remove('active'));
+      [pgGames,pgRef,pgPromo].forEach(p=>p.style.display='none');
+      if(which==='games'){ tabGames.classList.add('active'); pgGames.style.display=''; }
+      if(which==='ref'){ tabRef.classList.add('active'); pgRef.style.display=''; }
+      if(which==='promo'){ tabPromo.classList.add('active'); pgPromo.style.display=''; }
+      window.scrollTo({top:0, behavior:'smooth'});
     }
+
+    tabGames.onclick=()=>setTab('games');
+    tabRef.onclick=()=>setTab('ref');
+    tabPromo.onclick=()=>setTab('promo');
+    qs('homeLink').onclick=(e)=>{ e.preventDefault(); setTab('games'); };
+
+    qs('registerBtn')?.addEventListener('click', ()=> {
+      const info = qs('registerInfo');
+      info.style.display = info.style.display ? '' : 'block';
+    });
 
     async function render(){
-      const auth = document.getElementById('auth');
-      const balEl = document.getElementById('bal');
-      const ownerBox = document.getElementById('ownerBox');
-      const ownerTables = document.getElementById('ownerTables');
-      const target = document.getElementById('target');
-      const suggest = document.getElementById('suggest');
-
+      const auth = qs('authArea');
       try{
         const me = await j('/api/me');
-        auth.innerHTML = `
-          <span class="pill">Logged in as <b>${me.username}</b> (${me.id})</span>
-          <a class="btn" href="/logout">Logout</a>
-        `;
         const bal = await j('/api/balance');
-        balEl.textContent = fmtDL(bal.balance);
+        const avatar = `https://cdn.discordapp.com/avatars/${me.id}/${me.avatar || ''}.png?size=64`;
+        auth.innerHTML = `
+          <span class="chip">${fmtDL(bal.balance)}</span>
+          <img class="avatar" src="${avatar}" onerror="this.style.display='none'" title="${me.username}">
+        `;
+        loginCard.style.display='none';
 
-        if (me.id === 'OWNER_PLACEHOLDER') {
-          ownerBox.style.display = '';
-          ownerTables.style.display = 'grid';
+        // referral link
+        const link = await j('/api/referral/link');
+        qs('refLink').textContent = link.link;
 
-          async function refreshSuggest(){
-            const val = target.value.trim();
-            if (!val.startsWith('@')) { suggest.style.display='none'; return; }
-            const query = val.slice(1);
-            const members = await loadSuggestions(query);
-            if(!members.length){ suggest.style.display='none'; return; }
-            suggest.innerHTML = members.map(m=>`
-              <div class="sitem" data-id="${m.id}">
-                ${m.avatar ? `<img src="${m.avatar}" alt="">` : `<img src="" alt="">`}
-                <span><b>${m.display_name || m.username}</b> <span class="muted">@${m.username}</span> <span class="muted">(${m.id})</span></span>
-              </div>
-            `).join('');
-            [...suggest.querySelectorAll('.sitem')].forEach(el=>{
-              el.onclick = ()=>{ target.value = '<@'+el.dataset.id+'>'; suggest.style.display='none'; };
-            });
-            suggest.style.display='';
-          }
-          target.addEventListener('input', refreshSuggest);
-          target.addEventListener('focus', refreshSuggest);
-          document.addEventListener('click', (e)=>{
-            if (!suggest.contains(e.target) && e.target!==target) suggest.style.display='none';
-          });
-
-          const top = await j('/api/admin/top');
-          const logs = await j('/api/admin/logs');
-          document.getElementById('top').innerHTML = `
-            <table><thead><tr><th>User</th><th>Balance</th></tr></thead>
-            <tbody>${top.rows.map(r=>`<tr><td>&lt;@${r.user_id}&gt;</td><td>${fmtDL(r.balance)}</td></tr>`).join('')}</tbody></table>`;
-          document.getElementById('logs').innerHTML = `
-            <table><thead><tr><th>When</th><th>Actor</th><th>Target</th><th>Change</th><th>Reason</th></tr></thead>
-            <tbody>${logs.rows.map(r=>`<tr><td>${r.created_at}</td><td>&lt;@${r.actor_id}&gt;</td><td>&lt;@${r.target_id}&gt;</td><td>${r.amount>0?'+':''}${r.amount}</td><td>${r.reason ?? ''}</td></tr>`).join('')}</tbody></table>`;
-
-          document.getElementById('doAdjust').onclick = async ()=>{
-            const amount = parseInt(document.getElementById('amount').value, 10);
-            const reason = document.getElementById('reason').value.trim();
-            const msg = document.getElementById('msg');
-            msg.textContent = '';
-            try{
-              const ident = target.value.trim();
-              if(!ident) throw new Error('Fill the target field.');
-              if(Number.isNaN(amount)) throw new Error('Enter a numeric amount.');
-              const res = await j('/api/admin/adjust', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({identifier: ident, amount, reason})});
-              msg.textContent = 'OK. New balance: ' + fmtDL(res.new_balance);
-              const top = await j('/api/admin/top');
-              const logs = await j('/api/admin/logs');
-              document.getElementById('top').innerHTML = `
-                <table><thead><tr><th>User</th><th>Balance</th></tr></thead>
-                <tbody>${top.rows.map(r=>`<tr><td>&lt;@${r.user_id}&gt;</td><td>${fmtDL(r.balance)}</td></tr>`).join('')}</tbody></table>`;
-              document.getElementById('logs').innerHTML = `
-                <table><thead><tr><th>When</th><th>Actor</th><th>Target</th><th>Change</th><th>Reason</th></tr></thead>
-                <tbody>${logs.rows.map(r=>`<tr><td>${r.created_at}</td><td>&lt;@${r.actor_id}&gt;</td><td>&lt;@${r.target_id}&gt;</td><td>${r.amount>0?'+':''}${r.amount}</td><td>${r.reason ?? ''}</td></tr>`).join('')}</tbody></table>`;
-            }catch(e){
-              msg.textContent = 'Error: ' + e.message;
-            }
-          };
-        } else {
-          ownerBox.style.display = 'none';
-          ownerTables.style.display = 'none';
-        }
+        // load my promo redemptions
+        const mine = await j('/api/promo/my');
+        qs('myCodes').innerHTML = mine.rows.length
+          ? '<ul>' + mine.rows.map(r=>`<li><code>${r.code}</code> — ${new Date(r.redeemed_at).toLocaleString()}</li>`).join('') + '</ul>'
+          : 'No redemptions yet.';
       }catch(e){
-        auth.innerHTML = `<a class="btn primary" href="/login">Login with Discord</a>`;
-        balEl.textContent = '—';
-        ownerBox.style.display = 'none';
-        ownerTables.style.display = 'none';
+        // not logged in
+        auth.innerHTML = `
+          <a class="btn primary" href="/login">Login</a>
+          <button class="btn" id="registerBtn2">Register</button>
+        `;
+        loginCard.style.display='';
+        document.getElementById('registerBtn2').onclick = ()=> {
+          const info = qs('registerInfo'); info.style.display = 'block';
+          window.scrollTo({top: document.body.scrollHeight, behavior:'smooth'});
+        };
       }
     }
+
+    // redeem promo
+    qs('redeemBtn').onclick = async ()=>{
+      const code = qs('promoInput').value.trim();
+      const msg = qs('promoMsg');
+      msg.textContent = '';
+      if(!code){ msg.textContent = 'Enter a code.'; return; }
+      try{
+        const res = await j('/api/promo/redeem', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({code})});
+        msg.textContent = 'Success! New balance: ' + fmtDL(res.new_balance);
+        render(); // refresh balance + my codes
+      }catch(e){
+        msg.textContent = 'Error: ' + e.message;
+      }
+    };
+
     render();
   </script>
 </body>
 </html>
-""".replace("OWNER_PLACEHOLDER", str(OWNER_ID))
+"""
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
@@ -403,8 +463,6 @@ async def login():
 async def callback(code: str | None = None):
     if not code:
         raise HTTPException(400, "Missing code")
-    if not (CLIENT_ID and CLIENT_SECRET and OAUTH_REDIRECT):
-        raise HTTPException(500, "OAuth not configured")
     async with httpx.AsyncClient() as client:
         token = (await client.post(f"{DISCORD_API}/oauth2/token", data={
             "client_id": CLIENT_ID,
@@ -415,12 +473,11 @@ async def callback(code: str | None = None):
         })).json()
         if "access_token" not in token:
             raise HTTPException(400, f"OAuth token error: {token}")
-        me = (await client.get(
-            f"{DISCORD_API}/users/@me",
-            headers={"Authorization": f"{token['token_type']} {token['access_token']}"}
-        )).json()
+        me = (await client.get(f"{DISCORD_API}/users/@me",
+                               headers={"Authorization": f"{token['token_type']} {token['access_token']}"}
+                              )).json()
     resp = RedirectResponse(url="/")
-    set_session(resp, {"id": str(me["id"]), "username": me.get("username", "#")})
+    set_session(resp, {"id": str(me["id"]), "username": me.get("username", "#"), "avatar": me.get("avatar")})
     return resp
 
 @app.get("/logout")
@@ -441,11 +498,47 @@ async def api_balance(request: Request):
     if not user: raise HTTPException(401, "Not logged in")
     return JSONResponse({"balance": get_balance(str(user["id"]))})
 
-# -------- Admin APIs (owner-only) --------
-class AdjustBody(BaseModel):
-    identifier: str = Field(..., description="Discord ID or <@mention>")
-    amount: int = Field(..., description="Positive to add, negative to subtract", ge=-1_000_000, le=1_000_000)
-    reason: Optional[str] = Field(default=None, max_length=200)
+# ----- Referral -----
+@app.get("/api/referral/link")
+async def api_ref_link(request: Request):
+    user = read_session(request)
+    if not user: raise HTTPException(401, "Not logged in")
+    base = str(request.base_url).rstrip("/")
+    link = f"{base}/?ref={user['id']}"
+    return {"code": str(user["id"]), "link": link}
+
+# ----- Promo endpoints -----
+class RedeemBody(BaseModel):
+    code: str
+
+@app.get("/api/promo/my")
+async def api_promo_my(request: Request):
+    user = read_session(request)
+    if not user: raise HTTPException(401, "Not logged in")
+    return {"rows": my_redemptions(str(user["id"]))}
+
+@app.post("/api/promo/redeem")
+async def api_promo_redeem(request: Request, body: RedeemBody):
+    user = read_session(request)
+    if not user: raise HTTPException(401, "Not logged in")
+    try:
+        new_bal = redeem_promo(str(user["id"]), body.code)
+        return {"new_balance": new_bal}
+    except PromoAlreadyRedeemed as e:
+        raise HTTPException(400, str(e))
+    except PromoInvalid as e:
+        raise HTTPException(400, str(e))
+    except PromoExpired as e:
+        raise HTTPException(400, str(e))
+    except PromoExhausted as e:
+        raise HTTPException(400, str(e))
+
+# (Optional) Owner create promo via API
+class CreatePromoBody(BaseModel):
+    code: str
+    amount: int
+    max_uses: int = 1
+    expires_at: Optional[str] = None  # ISO timestamp string, optional
 
 def require_owner(request: Request):
     user = read_session(request)
@@ -453,32 +546,13 @@ def require_owner(request: Request):
     if str(user["id"]) != str(OWNER_ID): raise HTTPException(403, "Owner only")
     return user
 
-@app.get("/api/admin/top")
-async def api_admin_top(request: Request, limit: int = Query(20, ge=1, le=100)):
+@app.post("/api/admin/promo/create")
+async def api_admin_promo_create(request: Request, body: CreatePromoBody):
     require_owner(request)
-    return {"rows": get_top_balances(limit)}
-
-@app.get("/api/admin/logs")
-async def api_admin_logs(request: Request, limit: int = Query(20, ge=1, le=100)):
-    require_owner(request)
-    return {"rows": get_recent_logs(limit)}
-
-@app.get("/api/admin/balance")
-async def api_admin_balance(request: Request, identifier: str = Query(...)):
-    require_owner(request)
-    user_id = parse_user_identifier(identifier)
-    if not user_id: raise HTTPException(400, "Invalid identifier (use raw ID or <@mention>)")
-    return {"user_id": user_id, "balance": get_balance(user_id)}
-
-@app.post("/api/admin/adjust")
-async def api_admin_adjust(request: Request, body: AdjustBody):
-    actor = require_owner(request)
-    user_id = parse_user_identifier(body.identifier)
-    if not user_id: raise HTTPException(400, "Invalid identifier (use raw ID or <@mention>)")
     if body.amount == 0: raise HTTPException(400, "Amount cannot be zero")
-    new_balance = adjust_balance(str(actor["id"]), user_id, int(body.amount), body.reason)
-    return {"user_id": user_id, "new_balance": new_balance}
+    return create_promo(str(OWNER_ID), body.code, int(body.amount), int(body.max_uses), body.expires_at)
 
+# ----- Member search for owner autocomplete (kept) -----
 @app.get("/api/admin/members")
 async def api_admin_members(request: Request, q: str = Query("", description="Search after @ (optional)")):
     require_owner(request)
@@ -497,13 +571,7 @@ async def api_admin_members(request: Request, q: str = Query("", description="Se
         for m in found:
             try: avatar = m.display_avatar.url
             except Exception: avatar = None
-            members.append({
-                "id": str(m.id),
-                "username": m.name,
-                "display_name": m.display_name,
-                "mention": m.mention,
-                "avatar": avatar
-            })
+            members.append({"id": str(m.id), "username": m.name, "display_name": m.display_name, "avatar": avatar})
     except Exception:
         members = []
     return {"members": members}
@@ -527,7 +595,7 @@ async def main():
                     raise RuntimeError("DISCORD_TOKEN env var not set.")
                 await bot.start(BOT_TOKEN)
             except discord.errors.LoginFailure:
-                print("[bot] LoginFailure: bad token. Fix DISCORD_TOKEN in Railway.", file=sys.stderr)
+                print("[bot] LoginFailure: bad token. Fix DISCORD_TOKEN.", file=sys.stderr)
                 await asyncio.sleep(3600)
             except Exception:
                 traceback.print_exc()

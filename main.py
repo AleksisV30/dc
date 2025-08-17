@@ -791,47 +791,95 @@ HTML_TEMPLATE = """
     .cr-graph-wrap{position:relative; height:240px; background:#0e1833; border:1px solid var(--border); border-radius:16px; overflow:hidden}
     canvas{display:block; width:100%; height:100%}
 
-    /* ----- MINES layout: centered board that fills remaining space ----- */
-    .mines-right{
+    /* ----- MINES layout: centered, responsive, glossy tiles ----- */
+    .mines-two{
+      grid-template-columns: 340px 1fr !important;
+      align-items: start;
+    }
+    .mines-wrap{
       display:grid;
-      place-items:center;                 /* center both axes */
-      min-height: calc(100vh - 150px);    /* fill vertical space beside settings */
+      place-items:center;
+      min-height: calc(100vh - 160px);
+      padding: 6px;
     }
     .mines-grid{
       --cell: clamp(
-        44px,
-        min( calc((100vw - 380px)/5), calc((100vh - 220px)/5) ),
+        48px,
+        min( calc((100vw - 420px)/5), calc((100vh - 260px)/5) ),
         110px
       );
       display:grid;
-      gap:8px;
+      gap:10px;
       grid-template-columns: repeat(5, var(--cell));
-      justify-content:center;             /* center horizontally */
+      justify-content:center;
+      align-content:center;
+      padding: 6px;
     }
     .tile{
+      position:relative;
       width: var(--cell);
       aspect-ratio: 1/1;
-      border-radius: clamp(8px, calc(var(--cell)*0.18), 14px);
+      border-radius: clamp(10px, calc(var(--cell)*0.18), 16px);
       border:1px solid var(--border);
-      background:linear-gradient(180deg,#0f1936,#0c152a);
+      background:
+        radial-gradient(120% 120% at 30% 0%, #19264f 0%, #0c152a 55%),
+        linear-gradient(180deg,#0f1936,#0c152a);
       display:flex; align-items:center; justify-content:center;
-      font-weight:800;
-      font-size: clamp(12px, calc(var(--cell)*0.32), 20px);
+      font-weight:900;
+      font-size: clamp(13px, calc(var(--cell)*0.34), 22px);
       cursor:pointer; user-select:none;
-      transition:transform .06s ease, box-shadow .12s ease, background .12s ease;
+      transition:transform .09s ease, box-shadow .14s ease, background .18s ease, border-color .14s ease, opacity .14s ease;
+      box-shadow: 0 8px 22px rgba(0,0,0,.35), inset 0 0 0 1px rgba(255,255,255,.03);
+      overflow:hidden;
     }
-    .tile:hover{ transform:translateY(-1px); box-shadow:0 6px 12px rgba(0,0,0,.25) }
-    .tile.safe{ background:linear-gradient(135deg,#16a34a,#22c55e); border-color:transparent }
-    .tile.mine{ background:linear-gradient(135deg,#ef4444,#b91c1c); border-color:transparent }
-    .tile.revealed{ cursor:default }
-    @media (max-width: 900px){
+    .tile::after{
+      content:"";
+      position:absolute; inset:0;
+      background: linear-gradient(145deg, rgba(255,255,255,.18), transparent 40%);
+      mix-blend-mode: soft-light;
+      opacity:.22;
+      transition:opacity .2s ease;
+    }
+    .tile:hover{
+      transform:translateY(-1px);
+      box-shadow: 0 10px 26px rgba(0,0,0,.45), inset 0 0 0 1px rgba(255,255,255,.05);
+    }
+    .tile .icon{
+      filter: drop-shadow(0 2px 6px rgba(0,0,0,.45));
+    }
+    .tile.safe{
+      background: linear-gradient(135deg,#16a34a 0%, #22c55e 70%);
+      border-color: transparent;
+      color:#06240f;
+    }
+    .tile.mine{
+      background: linear-gradient(135deg,#ef4444 0%, #b91c1c 70%);
+      border-color: transparent;
+      color:#260808;
+    }
+    .tile.revealed{ cursor:default; }
+    .tile.pop{ animation: pop .2s ease; }
+    @keyframes pop{
+      from{ transform: scale(.92); opacity:.7 }
+      to  { transform: scale(1);   opacity:1 }
+    }
+
+    .mines-stats{
+      display:flex; gap:8px; flex-wrap:wrap; margin-top:10px
+    }
+    .stat{
+      background:#0c1631; border:1px solid var(--border); color:#dce7ff;
+      padding:6px 10px; border-radius:999px; font-size:12px; white-space:nowrap
+    }
+
+    @media (max-width: 980px){
       .mines-two{ grid-template-columns: 1fr !important; }
-      .mines-right{ min-height:auto; }
+      .mines-wrap{ min-height:auto; }
       .mines-grid{
         --cell: clamp(
-          48px,
-          min( calc((100vw - 64px)/5), calc((100vh - 280px)/5) ),
-          96px
+          52px,
+          min( calc((100vw - 48px)/5), calc((100vh - 320px)/5) ),
+          100px
         );
         justify-content:center;
       }
@@ -942,8 +990,7 @@ HTML_TEMPLATE = """
           <button class="chip" id="backToGames2">← Games</button>
         </div>
 
-        <!-- two-column layout -->
-        <div class="grid mines-two" style="grid-template-columns: 320px 1fr; margin-top:12px; gap:16px">
+        <div class="grid mines-two" style="margin-top:12px; gap:16px">
           <!-- LEFT: settings & stats -->
           <div>
             <div class="label">Bet (DL)</div>
@@ -952,20 +999,22 @@ HTML_TEMPLATE = """
             <div class="label" style="margin-top:10px">Mines (1–24)</div>
             <input id="mMines" type="number" min="1" max="24" step="1" value="3"/>
 
+            <div class="mines-stats">
+              <span class="stat" id="mHash">Commit: —</span>
+              <span class="stat" id="mStatus">Status: —</span>
+              <span class="stat" id="mPicks">Picks: 0</span>
+              <span class="stat" id="mBombs">Mines: 3</span>
+            </div>
+
             <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:12px">
               <button class="btn primary" id="mStart">Start Game</button>
               <button class="btn cashout" id="mCash" style="display:none">💸 Cash Out</button>
               <span id="mMsg" class="muted"></span>
             </div>
 
-            <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:12px">
-              <span class="tag" id="mHash">Commit: —</span>
-              <span class="tag" id="mStatus">Status: —</span>
-            </div>
-
             <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:8px">
-              <span class="tag" id="mMult">Multiplier: 1.0000×</span>
-              <span class="tag" id="mPotential">Potential: —</span>
+              <span class="stat" id="mMult">Multiplier: 1.0000×</span>
+              <span class="stat" id="mPotential">Potential: —</span>
             </div>
 
             <div class="card" style="margin-top:14px">
@@ -974,8 +1023,8 @@ HTML_TEMPLATE = """
             </div>
           </div>
 
-          <!-- RIGHT: centered, fills space -->
-          <div class="mines-right">
+          <!-- RIGHT: centered, fills remaining space -->
+          <div class="mines-wrap">
             <div class="mines-grid" id="mGrid"></div>
           </div>
         </div>
@@ -1390,31 +1439,49 @@ HTML_TEMPLATE = """
     // ---- MINES ----
     const mGrid = qs('mGrid'), mStart = qs('mStart'), mCash = qs('mCash'), mMsg = qs('mMsg');
     const mHash = qs('mHash'), mStatus = qs('mStatus'), mPotential = qs('mPotential'), mMult = qs('mMult');
+    const mPicksEl = qs('mPicks'), mBombsEl = qs('mBombs');
+
     let mActive = false, mPicks = 0, mGameId = null, mMines = 3, mBet = 0;
 
     function buildGrid(){
       mGrid.innerHTML = '';
       for(let i=0;i<25;i++){
-        const b = document.createElement('div');
-        b.className = 'tile';
-        b.textContent = '';
-        b.dataset.idx = i;
-        b.onclick = onTileClick;
-        mGrid.appendChild(b);
+        const tile = document.createElement('div');
+        tile.className = 'tile';
+        tile.dataset.idx = i;
+        const icon = document.createElement('div');
+        icon.className = 'icon';
+        tile.appendChild(icon);
+        tile.onclick = onTileClick;
+        mGrid.appendChild(tile);
       }
     }
+
     function updateGridReveal(board=null){
       for(let i=0;i<25;i++){
-        const b = mGrid.children[i];
-        const bit = (mPicks>>i)&1;
-        b.classList.remove('safe','mine','revealed');
-        if(bit){ b.classList.add('safe','revealed'); b.textContent='💎'; }
-        else { b.textContent=''; }
+        const tile = mGrid.children[i];
+        const icon = tile.firstChild;
+        const revealed = ((mPicks>>i)&1)===1;
+        tile.classList.remove('safe','mine','revealed','pop');
+        icon.textContent = '';
+
+        if(revealed){
+          tile.classList.add('safe','revealed','pop');
+          icon.textContent = '💎';
+        }
         if(board){
-          if(board[i]==='1'){ b.classList.add('mine','revealed'); b.textContent='💥'; }
+          if(board[i]==='1'){
+            tile.classList.remove('safe');
+            tile.classList.add('mine','revealed');
+            icon.textContent = '💥';
+          }else if(!revealed){
+            // keep it hidden
+          }
         }
       }
     }
+
+    function countBits(x){ return x.toString(2).split('0').join('').length; }
     function clientMinesMultiplier(mines, picks){
       if(picks<=0) return 1.0;
       let t=1.0;
@@ -1423,6 +1490,15 @@ HTML_TEMPLATE = """
         t *= (1 - 0.01);
       }
       return t;
+    }
+    function updateMinesStats(){
+      mPicksEl.textContent = 'Picks: ' + countBits(mPicks);
+      mBombsEl.textContent = 'Mines: ' + mMines;
+      const p = countBits(mPicks);
+      const mult = clientMinesMultiplier(mMines, p);
+      mMult.textContent = 'Multiplier: ' + mult.toFixed(4) + '×';
+      const potential = (p>0? (mBet * mult) : mBet);
+      mPotential.textContent = 'Potential: ' + fmtDL(potential);
     }
 
     async function onTileClick(e){
@@ -1443,15 +1519,14 @@ HTML_TEMPLATE = """
           renderMinesHistory();
         }else{
           mPicks = r.picks;
-          mPotential.textContent = 'Potential: '+fmtDL(r.potential_win);
-          mMult.textContent = 'Multiplier: ' + (r.multiplier||clientMinesMultiplier(mMines, countBits(mPicks))).toFixed(4)+'×';
-          mStatus.textContent='Status: Active';
           updateGridReveal();
-          if(mPicks>0){ mCash.disabled=false; }
+          updateMinesStats();
+          mStatus.textContent='Status: Active';
+          mMsg.textContent='';
+          if(countBits(mPicks)>0){ mCash.disabled=false; }
         }
       }catch(err){ mMsg.textContent='Error: '+err.message; }
     }
-    function countBits(x){ return x.toString(2).split('0').join('').length; }
 
     async function minesStart(){
       try{
@@ -1463,10 +1538,8 @@ HTML_TEMPLATE = """
         mActive=true; mPicks=0; mGameId=r.id; mMines=mines; mBet=bet;
         mHash.textContent = 'Commit: '+r.hash;
         mStatus.textContent = 'Status: Active';
-        mMult.textContent = 'Multiplier: 1.0000×';
-        mPotential.textContent = 'Potential: '+fmtDL(bet);
         mMsg.textContent='';
-        buildGrid(); updateGridReveal();
+        buildGrid(); updateGridReveal(); updateMinesStats();
         mStart.style.display='none'; mCash.style.display=''; mCash.disabled=true;
         renderHeader();
         renderMinesHistory();
@@ -1478,8 +1551,9 @@ HTML_TEMPLATE = """
         mActive=false;
         mStatus.textContent='Status: Cashed';
         mMsg.textContent='✅ Cashed out: '+fmtDL(r.win);
-        mMult.textContent='Multiplier: —';
         updateGridReveal(r.board);
+        mMult.textContent='Multiplier: —';
+        mPotential.textContent='Potential: —';
         mStart.style.display=''; mCash.style.display='none';
         renderHeader();
         renderMinesHistory();
@@ -1489,7 +1563,7 @@ HTML_TEMPLATE = """
     mCash.onclick = minesCash;
 
     async function renderMines(){
-      buildGrid(); updateGridReveal();
+      buildGrid(); updateGridReveal(); updateMinesStats();
       try{
         const s = await j('/api/mines/state');
         if(s && s.status==='active'){
@@ -1497,19 +1571,22 @@ HTML_TEMPLATE = """
           mMines=s.mines; mBet=s.bet;
           mHash.textContent='Commit: '+s.hash;
           mStatus.textContent='Status: Active';
-          mStart.style.display='none'; mCash.style.display=''; mCash.disabled=(mPicks<1);
-          mMult.textContent = 'Multiplier: ' + clientMinesMultiplier(mMines, countBits(mPicks)).toFixed(4)+'×';
-          mPotential.textContent = 'Potential: '+fmtDL(mBet * clientMinesMultiplier(mMines, countBits(mPicks)));
-          updateGridReveal();
+          mStart.style.display='none'; mCash.style.display=''; mCash.disabled=(countBits(mPicks)<1);
+          updateGridReveal(); updateMinesStats();
         }else{
           mActive=false; mPicks=0; mGameId=null;
-          mHash.textContent='Commit: —'; mStatus.textContent='Status: —'; mMult.textContent='Multiplier: —'; mPotential.textContent='Potential: —';
+          mHash.textContent='Commit: —'; mStatus.textContent='Status: —';
           mStart.style.display=''; mCash.style.display='none';
+          mMult.textContent='Multiplier: 1.0000×';
+          mPotential.textContent='Potential: —';
+          updateGridReveal(); updateMinesStats();
         }
       }catch(e){
         mActive=false; mPicks=0; mGameId=null;
-        mHash.textContent='Commit: —'; mStatus.textContent='Status: —'; mMult.textContent='Multiplier: —'; mPotential.textContent='Potential: —';
+        mHash.textContent='Commit: —'; mStatus.textContent='Status: —';
         mStart.style.display=''; mCash.style.display='none';
+        mMult.textContent='Multiplier: 1.0000×';
+        mPotential.textContent='Potential: —';
       }
       renderMinesHistory();
     }
@@ -1566,7 +1643,7 @@ HTML_TEMPLATE = """
       }catch(e){}
     }
     async function updateChatGate(){
-      try{ await j('/api/me'); isLogged = True; }catch(e){ isLogged = false; }
+      try{ await j('/api/me'); isLogged = true; }catch(e){ isLogged = false; }  // <-- fixed (true/false)
       if(isLogged){
         const prof = await j('/api/profile'); myLevel = prof.level || 1;
       }else{ myLevel = 0; }

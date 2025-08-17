@@ -1,4 +1,4 @@
-import os, json, asyncio
+import os, json, asyncio, re, random, string
 from urllib.parse import urlencode
 from typing import Optional
 
@@ -17,7 +17,7 @@ PREFIX = "."
 BOT_TOKEN = os.getenv("DISCORD_TOKEN")
 CLIENT_ID = os.getenv("DISCORD_CLIENT_ID")
 CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
-OAUTH_REDIRECT = os.getenv("OAUTH_REDIRECT")   # e.g. https://your-app.up.railway.app/callback
+OAUTH_REDIRECT = os.getenv("OAUTH_REDIRECT")
 SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret")
 PORT = int(os.getenv("PORT", "8080"))
 DISCORD_API = "https://discord.com/api"
@@ -48,7 +48,7 @@ def init_db(cur):
             balance INTEGER NOT NULL DEFAULT 0
         )
     """)
-    # admin change log
+    # logs
     cur.execute("""
         CREATE TABLE IF NOT EXISTS balance_log (
             id BIGSERIAL PRIMARY KEY,
@@ -71,13 +71,22 @@ def init_db(cur):
             created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # promo redemptions
+    # redemptions (1 per user per code)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS promo_redemptions (
             user_id TEXT NOT NULL,
             code TEXT NOT NULL,
             redeemed_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY(user_id, code)
+        )
+    """)
+    # profiles (unique referral name)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS profiles (
+            user_id TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            name_lower TEXT NOT NULL UNIQUE,
+            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
@@ -158,15 +167,44 @@ def my_redemptions(cur, user_id: str):
     cur.execute("SELECT code, redeemed_at FROM promo_redemptions WHERE user_id=%s ORDER BY redeemed_at DESC LIMIT 50", (user_id,))
     return [{"code": r[0], "redeemed_at": str(r[1])} for r in cur.fetchall()]
 
+def _rand_code(n=8):
+    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=n))
+
 @with_conn
-def create_promo(cur, actor_id: str, code: str, amount: int, max_uses: int = 1, expires_at: Optional[str] = None):
-    code = code.strip().upper()
+def create_promo(cur, actor_id: str, code: Optional[str], amount: int, max_uses: int = 1, expires_at: Optional[str] = None):
+    code = (code.strip().upper() if code else _rand_code())
     cur.execute("""
         INSERT INTO promo_codes(code, amount, max_uses, expires_at, created_by)
         VALUES (%s, %s, %s, %s, %s)
         ON CONFLICT (code) DO UPDATE SET amount=EXCLUDED.amount, max_uses=EXCLUDED.max_uses, expires_at=EXCLUDED.expires_at
     """, (code, amount, max_uses, expires_at, actor_id))
     return {"ok": True, "code": code}
+
+# ---- Profiles (referral name) ----
+NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{3,20}$")
+
+@with_conn
+def get_profile(cur, user_id: str):
+    cur.execute("SELECT display_name FROM profiles WHERE user_id = %s", (user_id,))
+    row = cur.fetchone()
+    return row[0] if row else None
+
+@with_conn
+def set_profile_name(cur, user_id: str, name: str):
+    if not NAME_RE.match(name):
+        raise ValueError("Name must be 3-20 chars [a-zA-Z0-9_-]")
+    name_lower = name.lower()
+    # unique (case-insensitive)
+    cur.execute("SELECT user_id FROM profiles WHERE name_lower = %s AND user_id <> %s", (name_lower, user_id))
+    if cur.fetchone():
+        raise ValueError("Name is already taken")
+    cur.execute("""
+        INSERT INTO profiles(user_id, display_name, name_lower)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (user_id)
+        DO UPDATE SET display_name = EXCLUDED.display_name, name_lower = EXCLUDED.name_lower
+    """, (user_id, name, name_lower))
+    return {"ok": True, "name": name}
 
 # ---------- Helpers ----------
 def parse_user_identifier(identifier: str) -> Optional[str]:
@@ -181,6 +219,14 @@ def fmt_dl(n: int) -> str:
 
 def embed(title: str, desc: Optional[str] = None, color: int = 0x00C2FF) -> discord.Embed:
     return discord.Embed(title=title, description=desc or "", color=color)
+
+def avatar_url_from(id_str: str, avatar_hash: Optional[str]) -> str:
+    # Return a working Discord CDN avatar URL
+    if avatar_hash:
+        return f"https://cdn.discordapp.com/avatars/{id_str}/{avatar_hash}.png?size=64"
+    # default avatar sprite 0..5
+    idx = int(id_str) % 6
+    return f"https://cdn.discordapp.com/embed/avatars/{idx}.png?size=64"
 
 # ---------- Discord bot ----------
 intents = discord.Intents.default()
@@ -244,7 +290,7 @@ def read_session(request: Request) -> dict | None:
     try: return signer.loads(raw)
     except BadSignature: return None
 
-# ---- HTML (same vibe, added tabs) ----
+# ---- HTML (same dark style; header with tabs; owner promo creator) ----
 INDEX_HTML = """
 <!doctype html>
 <html>
@@ -282,10 +328,7 @@ INDEX_HTML = """
     @media(min-width:800px){.games-grid{grid-template-columns:repeat(3,1fr)}}
     .game{background:#0f1a33;border:1px solid var(--border);border-radius:16px;padding:14px}
     .banner{font-weight:900; font-size:18px}
-    .suggest{margin-top:6px; border:1px solid var(--border); border-radius:10px; background:#0f1a33; display:none;}
-    .sitem{padding:6px 8px; border-bottom:1px solid var(--border); cursor:pointer; display:flex; align-items:center; gap:8px}
-    .sitem:last-child{border-bottom:none}
-    .sitem img{width:20px; height:20px; border-radius:50%; object-fit:cover}
+    .owner{margin-top:16px; border-top:1px dashed var(--border); padding-top:12px}
   </style>
 </head>
 <body>
@@ -297,9 +340,7 @@ INDEX_HTML = """
         <a class="tab" id="tab-ref">Referral</a>
         <a class="tab" id="tab-promo">Promo Codes</a>
       </div>
-      <div class="right" id="authArea">
-        <!-- balance + avatar OR login/register -->
-      </div>
+      <div class="right" id="authArea"><!-- balance + avatar OR login/register --></div>
     </div>
   </div>
 
@@ -318,9 +359,7 @@ INDEX_HTML = """
     <div id="page-ref" style="display:none">
       <div class="card">
         <div class="label">Referral</div>
-        <p>Your referral code is your Discord ID. Share this link:</p>
-        <p><code id="refLink">—</code></p>
-        <p class="muted">When friends join via your link and play, you can reward them (details coming soon).</p>
+        <div id="refContent">Loading…</div>
       </div>
     </div>
 
@@ -340,6 +379,16 @@ INDEX_HTML = """
             <div class="label">Your redemptions</div>
             <div id="myCodes" class="muted">—</div>
           </div>
+        </div>
+
+        <div id="ownerPromoBox" class="owner" style="display:none">
+          <div class="label">Owner — Create Promo Code</div>
+          <div class="grid" style="grid-template-columns:1fr 1fr 1fr; gap:8px">
+            <div><div class="label">Code (optional)</div><input id="cCode" placeholder="auto-generate if empty"/></div>
+            <div><div class="label">Amount (DL)</div><input id="cAmount" type="number" placeholder="e.g. 10"/></div>
+            <div><div class="label">Max Uses</div><input id="cMax" type="number" placeholder="e.g. 100"/></div>
+          </div>
+          <div style="margin-top:8px"><button class="btn primary" id="cMake">Create</button> <span id="cMsg" class="muted"></span></div>
         </div>
       </div>
     </div>
@@ -375,7 +424,6 @@ INDEX_HTML = """
       if(which==='promo'){ tabPromo.classList.add('active'); pgPromo.style.display=''; }
       window.scrollTo({top:0, behavior:'smooth'});
     }
-
     tabGames.onclick=()=>setTab('games');
     tabRef.onclick=()=>setTab('ref');
     tabPromo.onclick=()=>setTab('promo');
@@ -386,27 +434,78 @@ INDEX_HTML = """
       info.style.display = info.style.display ? '' : 'block';
     });
 
+    function safeAvatar(me){
+      return me.avatar_url || '';
+    }
+
     async function render(){
       const auth = qs('authArea');
       try{
-        const me = await j('/api/me');
+        const me = await j('/api/me');          // now includes avatar_url
         const bal = await j('/api/balance');
-        const avatar = `https://cdn.discordapp.com/avatars/${me.id}/${me.avatar || ''}.png?size=64`;
         auth.innerHTML = `
           <span class="chip">${fmtDL(bal.balance)}</span>
-          <img class="avatar" src="${avatar}" onerror="this.style.display='none'" title="${me.username}">
+          <img class="avatar" src="${safeAvatar(me)}" title="${me.username}" onerror="this.style.display='none'">
         `;
         loginCard.style.display='none';
 
-        // referral link
-        const link = await j('/api/referral/link');
-        qs('refLink').textContent = link.link;
+        // REFERRAL
+        const ref = await j('/api/referral/state');
+        if(ref.name){
+          const base = location.origin;
+          const link = base + '/?ref=' + encodeURIComponent(ref.name);
+          qs('refContent').innerHTML = \`
+            <p>Your referral name: <b>\${ref.name}</b></p>
+            <p>Share this link:</p>
+            <p><code>\${link}</code></p>
+          \`;
+        } else {
+          qs('refContent').innerHTML = \`
+            <p>Claim a referral name to get your link.</p>
+            <div style="display:flex; gap:8px; align-items:center; max-width:420px">
+              <input id="refName" placeholder="3-20 letters/numbers/_-" />
+              <button class="btn primary" id="claimBtn">Claim</button>
+            </div>
+            <div id="refMsg" class="muted" style="margin-top:8px"></div>
+          \`;
+          qs('claimBtn').onclick = async ()=>{
+            const name = qs('refName').value.trim();
+            const msg = qs('refMsg');
+            msg.textContent='';
+            try{
+              const r = await j('/api/profile/set_name', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name})});
+              msg.textContent = 'Saved. Your link: ' + location.origin + '/?ref=' + encodeURIComponent(r.name);
+              render();
+            }catch(e){ msg.textContent = 'Error: ' + e.message; }
+          };
+        }
 
-        // load my promo redemptions
+        // PROMO: my redemptions
         const mine = await j('/api/promo/my');
         qs('myCodes').innerHTML = mine.rows.length
-          ? '<ul>' + mine.rows.map(r=>`<li><code>${r.code}</code> — ${new Date(r.redeemed_at).toLocaleString()}</li>`).join('') + '</ul>'
+          ? '<ul>' + mine.rows.map(r=>\`<li><code>\${r.code}</code> — \${new Date(r.redeemed_at).toLocaleString()}</li>\`).join('') + '</ul>'
           : 'No redemptions yet.';
+
+        // Owner promo creator
+        if (me.id === 'OWNER_PLACEHOLDER') {
+          const box = qs('ownerPromoBox'); box.style.display='';
+          qs('cMake').onclick = async ()=>{
+            const c = qs('cCode').value.trim();
+            const a = parseInt(qs('cAmount').value, 10);
+            const m = parseInt(qs('cMax').value, 10);
+            const msg = qs('cMsg'); msg.textContent='';
+            try{
+              if(Number.isNaN(a) || a === 0) throw new Error('Amount must be non-zero');
+              if(Number.isNaN(m) || m < 1) throw new Error('Max uses must be >= 1');
+              const res = await j('/api/admin/promo/create', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({code:c||null, amount:a, max_uses:m})});
+              msg.textContent = 'Created code: ' + res.code;
+              qs('cCode').value=''; qs('cAmount').value=''; qs('cMax').value='';
+            }catch(e){ msg.textContent = 'Error: ' + e.message; }
+          };
+        } else {
+          qs('ownerPromoBox').style.display='none';
+        }
+
       }catch(e){
         // not logged in
         auth.innerHTML = `
@@ -430,7 +529,8 @@ INDEX_HTML = """
       try{
         const res = await j('/api/promo/redeem', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({code})});
         msg.textContent = 'Success! New balance: ' + fmtDL(res.new_balance);
-        render(); // refresh balance + my codes
+        qs('promoInput').value='';
+        render();
       }catch(e){
         msg.textContent = 'Error: ' + e.message;
       }
@@ -440,8 +540,9 @@ INDEX_HTML = """
   </script>
 </body>
 </html>
-"""
+""".replace("OWNER_PLACEHOLDER", str(OWNER_ID))
 
+# ----- Routes -----
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return HTMLResponse(INDEX_HTML)
@@ -477,7 +578,9 @@ async def callback(code: str | None = None):
                                headers={"Authorization": f"{token['token_type']} {token['access_token']}"}
                               )).json()
     resp = RedirectResponse(url="/")
-    set_session(resp, {"id": str(me["id"]), "username": me.get("username", "#"), "avatar": me.get("avatar")})
+    # store only essentials
+    payload = {"id": str(me["id"]), "username": me.get("username", "#"), "avatar": me.get("avatar")}
+    set_session(resp, payload)
     return resp
 
 @app.get("/logout")
@@ -490,22 +593,38 @@ async def logout():
 async def api_me(request: Request):
     user = read_session(request)
     if not user: raise HTTPException(401, "Not logged in")
-    return JSONResponse(user)
+    return {
+        "id": user["id"],
+        "username": user.get("username", ""),
+        "avatar_url": avatar_url_from(user["id"], user.get("avatar"))
+    }
 
 @app.get("/api/balance")
 async def api_balance(request: Request):
     user = read_session(request)
     if not user: raise HTTPException(401, "Not logged in")
-    return JSONResponse({"balance": get_balance(str(user["id"]))})
+    return {"balance": get_balance(str(user["id"]))}
 
-# ----- Referral -----
-@app.get("/api/referral/link")
-async def api_ref_link(request: Request):
+# ----- Referral / Profiles -----
+class SetNameBody(BaseModel):
+    name: str
+
+@app.get("/api/referral/state")
+async def api_ref_state(request: Request):
     user = read_session(request)
     if not user: raise HTTPException(401, "Not logged in")
-    base = str(request.base_url).rstrip("/")
-    link = f"{base}/?ref={user['id']}"
-    return {"code": str(user["id"]), "link": link}
+    name = get_profile(str(user["id"]))
+    return {"name": name}
+
+@app.post("/api/profile/set_name")
+async def api_set_name(request: Request, body: SetNameBody):
+    user = read_session(request)
+    if not user: raise HTTPException(401, "Not logged in")
+    try:
+        res = set_profile_name(str(user["id"]), body.name)
+        return res
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 # ----- Promo endpoints -----
 class RedeemBody(BaseModel):
@@ -524,21 +643,17 @@ async def api_promo_redeem(request: Request, body: RedeemBody):
     try:
         new_bal = redeem_promo(str(user["id"]), body.code)
         return {"new_balance": new_bal}
-    except PromoAlreadyRedeemed as e:
-        raise HTTPException(400, str(e))
-    except PromoInvalid as e:
-        raise HTTPException(400, str(e))
-    except PromoExpired as e:
-        raise HTTPException(400, str(e))
-    except PromoExhausted as e:
-        raise HTTPException(400, str(e))
+    except PromoAlreadyRedeemed as e: raise HTTPException(400, str(e))
+    except PromoInvalid as e: raise HTTPException(400, str(e))
+    except PromoExpired as e: raise HTTPException(400, str(e))
+    except PromoExhausted as e: raise HTTPException(400, str(e))
 
-# (Optional) Owner create promo via API
+# ----- Owner: create promo -----
 class CreatePromoBody(BaseModel):
-    code: str
+    code: Optional[str] = None
     amount: int
     max_uses: int = 1
-    expires_at: Optional[str] = None  # ISO timestamp string, optional
+    expires_at: Optional[str] = None  # optional ISO string
 
 def require_owner(request: Request):
     user = read_session(request)
@@ -550,9 +665,10 @@ def require_owner(request: Request):
 async def api_admin_promo_create(request: Request, body: CreatePromoBody):
     require_owner(request)
     if body.amount == 0: raise HTTPException(400, "Amount cannot be zero")
+    if body.max_uses < 1: raise HTTPException(400, "Max uses must be >= 1")
     return create_promo(str(OWNER_ID), body.code, int(body.amount), int(body.max_uses), body.expires_at)
 
-# ----- Member search for owner autocomplete (kept) -----
+# (member search endpoint kept from earlier, if you still use it elsewhere)
 @app.get("/api/admin/members")
 async def api_admin_members(request: Request, q: str = Query("", description="Search after @ (optional)")):
     require_owner(request)

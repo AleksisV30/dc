@@ -1,4 +1,4 @@
-# app/main.py  — SECTION 1/4
+# main.py
 import os, json, asyncio, re, random, string, math, secrets, datetime, hashlib
 from urllib.parse import urlencode
 from typing import Optional, Tuple, Dict, List
@@ -37,6 +37,9 @@ BETTING_SECONDS = 10
 
 HOUSE_EDGE_CRASH = Decimal(os.getenv("HOUSE_EDGE_CRASH", "0.06"))
 HOUSE_EDGE_MINES = Decimal(os.getenv("HOUSE_EDGE_MINES", "0.03"))
+
+# ✅ let everyone chat by default
+CHAT_MIN_LEVEL = int(os.getenv("CHAT_MIN_LEVEL", "1"))
 
 TWO = Decimal("0.01")
 def D(x) -> Decimal:
@@ -556,7 +559,7 @@ def finish_round(cur, round_id: int):
     cur.execute("SELECT bust FROM crash_rounds WHERE id=%s", (round_id,))
     bust = float(cur.fetchone()[0])
     now = now_utc()
-    resolve_round_end(cur, round_id, bust)
+    resolve_round_end(round_id, bust)
     cur.execute("""UPDATE crash_rounds
                    SET status='ended', ended_at=%s
                    WHERE id=%s AND status='running'""", (now, round_id))
@@ -630,7 +633,8 @@ def chat_insert(cur, user_id: str, username: str, text: str, private_to: Optiona
         cur.execute("SELECT xp FROM profiles WHERE user_id=%s", (user_id,))
         xp = int(cur.fetchone()[0])
         lvl = 1 + xp // 100
-        if lvl < 5: raise PermissionError("You must be level 5 to chat")
+        # ✅ lowered gate so chat works for new users
+        if lvl < CHAT_MIN_LEVEL: raise PermissionError(f"You must be level {CHAT_MIN_LEVEL} to chat")
         cur.execute("SELECT until FROM chat_timeouts WHERE user_id=%s", (user_id,))
         r = cur.fetchone()
         if r and r[0] > now_utc(): raise PermissionError("You are timed out")
@@ -880,7 +884,6 @@ def apply_migrations(cur):
     cur.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS is_anon BOOLEAN NOT NULL DEFAULT FALSE")
     cur.execute("CREATE INDEX IF NOT EXISTS ix_crash_games_created_at ON crash_games (created_at)")
     cur.execute("CREATE INDEX IF NOT EXISTS ix_mines_games_started_at ON mines_games (started_at)")
-# app/main.py — SECTION 2/4
 
 # ---------- OAuth token store & Discord join ----------
 @with_conn
@@ -1331,6 +1334,7 @@ async def api_discord_join(request: Request):
     s = _require_session(request)
     nick = get_profile_name(s["id"]) or s["username"]
     return await guild_add_member(s["id"], nickname=nick)
+
 # ---------- Crash: on-demand cashout ----------
 @with_conn
 def cashout_now(cur, user_id: str) -> Dict:
@@ -1363,7 +1367,7 @@ def cashout_now(cur, user_id: str) -> Dict:
 HTML_TEMPLATE = """
 <!doctype html><html lang="en"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
-<title>💎 DL Bank</title>
+<title>GROWCB</title>
 <style>
 :root{--bg:#0a0f1e;--bg2:#0c1428;--card:#111a31;--muted:#9eb3da;--text:#ecf2ff;--accent:#6aa6ff;--accent2:#22c1dc;--ok:#34d399;--warn:#f59e0b;--err:#ef4444;--border:#1f2b47;--chatW:340px;--input-bg:#0b1430;--input-br:#223457;--input-tx:#e6eeff;--input-ph:#9db4e4}
 *{box-sizing:border-box}html,body{height:100%}body{margin:0;color:var(--text);background:radial-gradient(1400px 600px at 20% -10%, #11204d 0%, transparent 60%),linear-gradient(180deg,#0a0f1e,#0a0f1e 60%, #0b1124);font-family:Inter,system-ui,Segoe UI,Roboto,Arial,Helvetica,sans-serif;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}
@@ -1431,13 +1435,12 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
   <div class="header">
     <div class="header-inner container">
       <div class="left">
-        <a class="brand" href="#" id="homeLink"><span class="logo"></span> 💎 DL Bank</a>
+        <a class="brand" href="#" id="homeLink"><span class="logo"></span> GROWCB</a>
         <div class="tabs">
           <a class="tab active" id="tab-games">Games</a>
           <a class="tab" id="tab-ref">Referral</a>
           <a class="tab" id="tab-promo">Promo Codes</a>
           <a class="tab" id="tab-lb">Leaderboard</a>
-          <!-- Settings tab intentionally hidden (open from avatar menu) -->
         </div>
       </div>
       <div class="right" id="authArea"></div>
@@ -1449,7 +1452,7 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
     <div id="page-games">
       <div class="card">
         <div class="hero">
-          <div class="big">Welcome to DL Bank</div>
+          <div class="big">Welcome to GROWCB</div>
           <div class="discord-cta">
             <button class="btn ghost" id="btnJoinDiscord">Join Discord</button>
             <a class="chip" id="btnInvite" href="__INVITE__" target="_blank" rel="noopener">Invite Link</a>
@@ -1463,7 +1466,7 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
             <div class="title">💣 Mines</div><div class="muted">5×5 board • Choose mines • Cash out anytime</div>
           </div>
 
-          <!-- New stubs -->
+          <!-- More games (placeholders) -->
           <div class="game-card" id="openCoinflip" style="background-image: radial-gradient(600px 280px at 50% -20%, rgba(250,204,21,.22), transparent 60%);">
             <div class="title">🪙 Coinflip</div><div class="muted">Quick 50/50 — coming soon</div>
           </div>
@@ -1499,7 +1502,7 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
       </div>
     </div>
 
-    <!-- Mines (show only Cash Out while active) -->
+    <!-- Mines -->
     <div id="page-mines" style="display:none">
       <div class="card">
         <div class="hero"><div class="big">💣 Mines</div><button class="chip" id="backToGames2">← Games</button></div>
@@ -1608,559 +1611,4 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
         <div class="hero"><div class="big">🏆 Leaderboard — Top Wagered</div><div class="countdown" id="lbCountdown">—</div></div>
         <div class="lb-controls" style="margin-top:10px">
           <div class="seg" id="lbSeg"><button data-period="daily" class="active">Daily</button><button data-period="monthly">Monthly</button><button data-period="alltime">All-time</button></div>
-          <span class="hint">Anonymous players show as “Anonymous”. Amounts hidden for anonymous users.</span>
-        </div>
-        <div id="lbWrap" class="muted">Loading…</div>
-      </div>
-    </div>
-
-    <!-- Settings (open via avatar; logout at bottom) -->
-    <div id="page-settings" style="display:none">
-      <div class="card">
-        <div class="label">Settings</div>
-        <div style="margin-top:8px">
-          <label style="display:flex;align-items:center;gap:10px">
-            <input type="checkbox" id="anonToggle" style="width:auto"/>
-            <span><strong>Anonymous Mode</strong> — hide your name & wager amounts from others. You still show as “Anonymous”.</span>
-          </label>
-          <div class="hint">Takes effect immediately.</div>
-          <div id="setMsg" class="muted" style="margin-top:8px"></div>
-          <div class="sep"></div>
-          <a class="btn ghost" href="/logout" style="margin-top:6px">Logout</a>
-        </div>
-      </div>
-    </div>
-
-    <!-- Profile (open by clicking avatar) -->
-    <div id="page-profile" style="display:none">
-      <div class="card">
-        <div class="label">Profile</div><div id="profileBox">Loading…</div>
-        <div id="ownerPanel" class="card soft" style="display:none;margin-top:12px">
-          <div class="label">Owner / Admin Panel</div>
-          <div class="row cols-4" style="margin-top:6px">
-            <div class="field"><div class="label">Discord ID or &lt;@mention&gt;</div><input id="tIdent" placeholder="ID or <@id>"/></div>
-            <div class="field"><div class="label">Amount (+/- DL)</div><input id="tAmt" type="text" placeholder="10 or -5.25"/></div>
-            <div class="field"><div class="label">Reason (optional)</div><input id="tReason" placeholder="promo/correction/prize"/></div>
-            <div style="align-self:end"><button class="btn primary" id="tApply">Apply</button></div>
-          </div>
-          <div id="tMsg" class="hint" style="margin-top:6px"></div>
-          <div class="sep"></div>
-          <div class="row cols-3">
-            <div class="field"><div class="label">Target</div><input id="rIdent" placeholder="ID or <@id>"/></div>
-            <button class="btn" id="rAdmin">Make ADMIN</button>
-            <button class="btn" id="rMember">Make MEMBER</button>
-          </div>
-          <div id="rMsg" class="hint" style="margin-top:6px"></div>
-          <div class="sep"></div>
-          <div class="row cols-5">
-            <div class="field"><div class="label">Target</div><input id="xIdent" placeholder="ID or <@id>"/></div>
-            <div class="field"><div class="label">Seconds</div><input id="xSecs" type="number" value="600"/></div>
-            <div class="field"><div class="label">Reason</div><input id="xReason" placeholder="spam / rude / etc"/></div>
-            <button class="btn" id="xSite">Site Only</button><button class="btn" id="xBoth">Site + Discord</button>
-          </div>
-          <div id="xMsg" class="hint" style="margin-top:6px"></div>
-          <div class="sep"></div>
-          <div class="row cols-3">
-            <div class="field"><div class="label">Code (optional)</div><input id="cCode" placeholder="auto-generate if empty"/></div>
-            <div class="field"><div class="label">Amount (DL)</div><input id="cAmount" type="text" placeholder="e.g. 10 or 1.24"/></div>
-            <div class="field"><div class="label">Max Uses</div><input id="cMax" type="number" placeholder="e.g. 100"/></div>
-          </div>
-          <div style="margin-top:8px"><button class="btn primary" id="cMake">Create</button> <span id="cMsg" class="hint"></span></div>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- Floating chat -->
-  <button class="fab" id="fabChat" title="Open chat"><svg viewBox="0 0 24 24"><path d="M4 4h16v12H7l-3 3V4z"/></svg></button>
-  <div class="chat-drawer" id="chatDrawer">
-    <div class="chat-head"><div>Global Chat <span id="chatNote" class="muted"></span></div><button class="chip" id="chatClose">Close</button></div>
-    <div class="chat-body" id="chatBody"></div>
-    <div class="chat-input"><input id="chatText" placeholder="Say something…"/><button class="btn primary" id="chatSend">Send</button></div>
-  </div>
-
-  <script>
-  const qs = id => document.getElementById(id);
-  const j = async (url, init) => {
-    const r = await fetch(url, init);
-    if(!r.ok){
-      let t = await r.text().catch(()=> '');
-      try{ const js = JSON.parse(t); throw new Error(js.detail || js.message || t || r.statusText); }
-      catch{ throw new Error(t || r.statusText); }
-    }
-    const ct = r.headers.get('content-type')||'';
-    return ct.includes('application/json') ? r.json() : r.text();
-  };
-  const GEM = "💎"; const fmtDL = (n)=> `${GEM} ${(Number(n)||0).toFixed(2)} DL`;
-
-  // Simple router
-  const pages = ['page-games','page-crash','page-mines','page-coinflip','page-blackjack','page-pump','page-ref','page-promo','page-lb','page-settings','page-profile'];
-  function showOnly(id){
-    for(const p of pages){ const el = qs(p); if(el) el.style.display = (p===id) ? '' : 'none'; }
-    // Tabs highlight (settings/profile not in tabs)
-    const map = {'page-games':'tab-games','page-ref':'tab-ref','page-promo':'tab-promo','page-lb':'tab-lb'};
-    for(const t of ['tab-games','tab-ref','tab-promo','tab-lb']){
-      const el = qs(t); if(el) el.classList.toggle('active', map[id]===t);
-    }
-  }
-
-  // Header / Auth (avatar opens menu with Profile/Settings)
-  async function renderHeader(){
-    try{
-      const me = await j('/api/me');
-      const bal = await j('/api/balance');
-      qs('authArea').innerHTML = `
-        <span class="chip">Balance: <strong>${fmtDL(bal.balance)}</strong></span>
-        <button class="btn" id="btnJoinSmall">${me.in_guild ? 'In Discord' : 'Join Discord'}</button>
-        <div class="avatar-wrap">
-          <img class="avatar" id="avatarBtn" src="${me.avatar_url||''}" title="${me.username||'user'}"/>
-          <div id="userMenu" class="menu">
-            <div class="item" id="menuProfile">Profile</div>
-            <div class="item" id="menuSettings">Settings</div>
-          </div>
-        </div>
-      `;
-      qs('btnJoinSmall').onclick = joinDiscord;
-      const menu = qs('userMenu');
-      const av = qs('avatarBtn');
-      av.onclick = (e)=>{ e.stopPropagation(); menu.classList.toggle('open'); };
-      document.body.addEventListener('click', ()=> menu.classList.remove('open'));
-      qs('menuProfile').onclick = ()=>{ menu.classList.remove('open'); showOnly('page-profile'); renderProfile(); };
-      qs('menuSettings').onclick = ()=>{ menu.classList.remove('open'); showOnly('page-settings'); loadSettings(); };
-    }catch(_){
-      qs('authArea').innerHTML = `<a class="btn primary" href="/login">Login with Discord</a>`;
-    }
-  }
-
-  // Join Discord (buttons in multiple places)
-  async function joinDiscord(){
-    try{
-      await j('/api/discord/join', { method:'POST' });
-      alert('Joined the Discord server!');
-      renderHeader();
-    }catch(e){ alert(e.message || 'Could not join. Try relogin.'); }
-  }
-  for(const id of ['btnJoinDiscord','btnJoinDiscord2','btnJoinDiscord3']){
-    const el = qs(id); if(el) el.onclick = joinDiscord;
-  }
-  for(const id of ['btnInvite','btnInvite2','btnInvite3']){
-    const a = qs(id); if(a && a.getAttribute('href') === '__INVITE__'){ a.style.display='none'; }
-  }
-
-  // Tabs
-  qs('homeLink').onclick = (e)=>{ e.preventDefault(); showOnly('page-games'); };
-  qs('tab-games').onclick = ()=> showOnly('page-games');
-  qs('tab-ref').onclick = ()=> { showOnly('page-ref'); loadReferral(); };
-  qs('tab-promo').onclick = ()=> { showOnly('page-promo'); renderPromo(); };
-  qs('tab-lb').onclick = ()=> { showOnly('page-lb'); refreshLeaderboard(); };
-
-  // ---------- Referral ----------
-  async function loadReferral(){
-    try{
-      const st = await j('/api/referral/state');
-      if(st && st.name){ qs('refName').value = st.name; qs('refLink').value = location.origin + '/r/' + st.name; }
-      qs('refClicks').textContent = st.clicks||0; qs('refJoins').textContent = st.joined||0;
-    }catch(_){}
-  }
-  qs('refSave').onclick = async()=>{
-    const name = qs('refName').value.trim();
-    qs('refMsg').textContent = '';
-    try{
-      await j('/api/referral/set', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ name })});
-      qs('refMsg').textContent = 'Saved.'; qs('refLink').value = location.origin + '/r/' + name.toLowerCase();
-    }catch(e){ qs('refMsg').textContent = e.message; }
-  };
-  qs('copyRef').onclick = ()=>{
-    const inp = qs('refLink'); inp.select(); inp.setSelectionRange(0, 99999); document.execCommand('copy');
-  };
-
-  // ---------- Promo ----------
-  async function renderPromo(){
-    try{
-      const my = await j('/api/promo/my');
-      qs('myCodes').innerHTML = (my.rows && my.rows.length)
-        ? '<table><thead><tr><th>Code</th><th>Redeemed</th></tr></thead><tbody>' +
-          my.rows.map(r=>`<tr><td>${r.code}</td><td>${new Date(r.redeemed_at).toLocaleString()}</td></tr>`).join('') +
-          '</tbody></table>' : '—';
-    }catch(_){}
-  }
-  qs('redeemBtn').onclick = async ()=>{
-    const code = qs('promoInput').value.trim();
-    qs('promoMsg').textContent = '';
-    try{
-      const r = await j('/api/promo/redeem', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ code }) });
-      qs('promoMsg').textContent = 'Redeemed! New balance: ' + fmtDL(r.new_balance);
-      renderHeader(); renderPromo();
-    }catch(e){ qs('promoMsg').textContent = e.message; }
-  };
-
-  // ---------- Profile ----------
-  async function renderProfile(){
-    try{
-      const p = await j('/api/profile');
-      const role = p.role || 'member';
-      const isOwner = (role==='owner') || (String(p.id||'') === String('__OWNER_ID__'));
-      qs('profileBox').innerHTML = `
-        <div class="games-grid" style="grid-template-columns:1fr 1fr 1fr">
-          <div class="card soft"><div class="label">Level</div><div class="big">Lv ${p.level}</div><div class="muted">${p.xp} XP • ${p.progress_pct}% to next</div></div>
-          <div class="card soft"><div class="label">Balance</div><div class="big">${fmtDL(p.balance)}</div></div>
-          <div class="card soft"><div class="label">Role</div><div class="big" style="text-transform:uppercase">${role}</div></div>
-        </div>
-      `;
-      qs('ownerPanel').style.display = isOwner ? '' : 'none';
-
-      if(isOwner){
-        qs('tApply').onclick = async ()=>{
-          qs('tMsg').textContent='';
-          try{
-            const r = await j('/api/admin/adjust',{ method:'POST', headers:{'Content-Type':'application/json'},
-              body: JSON.stringify({ identifier: qs('tIdent').value.trim(), amount: qs('tAmt').value.trim(), reason: qs('tReason').value.trim() })});
-            qs('tMsg').textContent = 'OK. New balance: ' + fmtDL(r.new_balance); renderHeader();
-          }catch(e){ qs('tMsg').textContent = e.message; }
-        };
-        qs('rAdmin').onclick = ()=> setRole('admin');
-        qs('rMember').onclick = ()=> setRole('member');
-        async function setRole(role){
-          qs('rMsg').textContent='';
-          try{
-            await j('/api/admin/role',{ method:'POST', headers:{'Content-Type':'application/json'},
-              body: JSON.stringify({ identifier: qs('rIdent').value.trim(), role })});
-            qs('rMsg').textContent = 'Role updated.';
-          }catch(e){ qs('rMsg').textContent = e.message; }
-        }
-        qs('xSite').onclick = ()=> timeout('site');
-        qs('xBoth').onclick = ()=> timeout('both');
-        async function timeout(which){
-          qs('xMsg').textContent='';
-          try{
-            const payload = { identifier: qs('xIdent').value.trim(), seconds: parseInt(qs('xSecs').value||'600',10), reason: qs('xReason').value.trim() };
-            const url = which==='both' ? '/api/admin/timeout_both' : '/api/admin/timeout_site';
-            await j(url, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
-            qs('xMsg').textContent='Timeout set.';
-          }catch(e){ qs('xMsg').textContent = e.message; }
-        }
-        qs('cMake').onclick = async ()=>{
-          qs('cMsg').textContent='';
-          try{
-            const r = await j('/api/admin/promo/create',{ method:'POST', headers:{'Content-Type':'application/json'},
-              body: JSON.stringify({ code: (qs('cCode').value||'').trim() || null, amount: qs('cAmount').value.trim(), max_uses: parseInt(qs('cMax').value||'1',10)||1 })});
-            qs('cMsg').textContent = 'Created: ' + r.code;
-          }catch(e){ qs('cMsg').textContent = e.message; }
-        };
-      }
-    }catch(_){ qs('profileBox').textContent = '—'; }
-  }
-
-  // ---------- Settings ----------
-  async function loadSettings(){
-    qs('setMsg').textContent='';
-    try{ const r = await j('/api/settings/get'); qs('anonToggle').checked = !!(r && r.is_anon); }catch(_){}
-  }
-  qs('anonToggle')?.addEventListener('change', async (e)=>{
-    qs('setMsg').textContent='';
-    try{
-      const r = await j('/api/settings/set_anon', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ is_anon: !!e.target.checked }) });
-      qs('setMsg').textContent = r && r.ok ? 'Saved.' : 'Updated.';
-    }catch(err){ qs('setMsg').textContent = err.message; }
-  });
-
-  // ---------- Leaderboard ----------
-  const lbWrap = ()=> qs('lbWrap'); let lbPeriod = 'daily', lbMe = null;
-  function setLbButtons(){
-    const btns = Array.from(qs('lbSeg').querySelectorAll('button'));
-    btns.forEach(b=> b.classList.toggle('active', b.dataset.period===lbPeriod));
-  }
-  function nextUtcMidnight(){
-    const now = new Date();
-    return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()+1, 0,0,0,0));
-  }
-  function endOfUtcMonth(){
-    const now = new Date();
-    return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth()+1, 1, 0,0,0,0));
-  }
-  function renderLbCountdown(){
-    const el = qs('lbCountdown');
-    if(lbPeriod==='alltime'){ el.textContent='No expiry'; return; }
-    const target = (lbPeriod==='daily') ? nextUtcMidnight() : endOfUtcMonth();
-    const tick = ()=>{
-      const diff = target - new Date();
-      if(diff <= 0){ el.textContent = 'Resets soon'; return; }
-      const s = Math.floor(diff/1000);
-      const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), ss = s%60;
-      el.textContent = `Resets in ${h}h ${m}m ${ss}s (UTC)`;
-    };
-    tick(); if(window._lbTimer) clearInterval(window._lbTimer); window._lbTimer = setInterval(tick, 1000);
-  }
-  async function refreshLeaderboard(){
-    try{
-      const me = await j('/api/me').catch(()=>null);
-      lbMe = me && me.id ? String(me.id) : null;
-    }catch(_){}
-    setLbButtons(); renderLbCountdown();
-    lbWrap().textContent = 'Loading…';
-    try{
-      const r = await j(`/api/leaderboard?period=${lbPeriod}`);
-      const rows = r.rows || [];
-      if(!rows.length){ lbWrap().textContent='—'; return; }
-      lbWrap().innerHTML = `
-        <table>
-          <thead><tr><th>#</th><th>User</th><th>Total Wagered</th></tr></thead>
-          <tbody>
-            ${rows.map((row, i)=>{
-              const meRow = (lbMe && String(row.user_id)===lbMe);
-              const cls = [ meRow ? 'me-row' : '', row.is_anon ? 'anon' : '' ].filter(Boolean).join(' ');
-              const name = row.is_anon && !meRow ? 'Anonymous' : row.display_name;
-              const amt = (row.is_anon && !meRow) ? '—' : fmtDL(row.total_wagered);
-              return `<tr class="${cls}"><td>${i+1}</td><td class="name">${name}</td><td>${amt}</td></tr>`;
-            }).join('')}
-          </tbody>
-        </table>
-      `;
-    }catch(e){ lbWrap().textContent = e.message || 'Error'; }
-  }
-  qs('lbSeg').addEventListener('click', (e)=>{
-    const b = e.target.closest('button'); if(!b) return;
-    lbPeriod = b.dataset.period; refreshLeaderboard();
-  });
-
-  // ---------- Crash rendering ----------
-  const crCanvas = qs('crCanvas'); const crNow = qs('crNow'), crHint = qs('crHint'), lastBusts = qs('lastBusts'), crMsg = qs('crMsg');
-  let haveActiveBet = false;
-  function drawCurve(mult){
-    const ctx = crCanvas.getContext('2d');
-    const w = crCanvas.width = crCanvas.clientWidth * window.devicePixelRatio;
-    const h = crCanvas.height = crCanvas.clientHeight * window.devicePixelRatio;
-    ctx.clearRect(0,0,w,h);
-    ctx.lineWidth = 3; ctx.strokeStyle = '#6aa6ff';
-    ctx.beginPath();
-    const maxX = Math.min(mult, 10.0);
-    for(let i=0;i<=200;i++){
-      const t = i/200 * maxX;
-      const x = (i/200) * w;
-      const y = h - (Math.log(1+t) / Math.log(1+maxX)) * h * 0.92 - h*0.04;
-      if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
-    }
-    ctx.stroke();
-  }
-  async function refreshCrash(){
-    try{
-      const s = await j('/api/crash/state');
-      if(s.phase==='betting'){
-        crHint.textContent = 'Betting… next round soon';
-        crNow.textContent = '1.00×'; drawCurve(1.0);
-      }else if(s.phase==='running'){
-        const m = s.current_multiplier || 1.0;
-        crHint.textContent = 'Running';
-        crNow.textContent = m.toFixed(2) + '×'; drawCurve(m);
-      }else{
-        crHint.textContent = 'Ended';
-        crNow.textContent = (s.bust||0).toFixed(2)+'×'; drawCurve(s.bust || 1.0);
-      }
-      if(s.last_busts && s.last_busts.length){
-        lastBusts.innerHTML = s.last_busts.map(b=>`<span class="chip" style="margin-right:6px">${b.toFixed(2)}×</span>`).join('');
-      }
-      if(s.your_bet){
-        haveActiveBet = !s.your_bet.resolved && (s.your_bet.cashed_out==null);
-        qs('crCashout').style.display = haveActiveBet ? '' : 'none';
-      }else qs('crCashout').style.display='none';
-
-      // recent rounds
-      try{
-        const h = await j('/api/crash/history');
-        const rows = h.rows||[];
-        qs('crLast').innerHTML = rows.length
-          ? `<table><thead><tr><th>When</th><th>Bet</th><th>Cashout</th><th>Bust</th><th>Win</th></tr></thead>
-             <tbody>${rows.map(r=>`<tr><td>${new Date(r.created_at).toLocaleString()}</td><td>${fmtDL(r.bet)}</td><td>${r.cashout.toFixed(2)}×</td><td>${r.bust.toFixed(2)}×</td><td>${fmtDL(r.win)}</td></tr>`).join('')}</tbody></table>`
-          : '—';
-      }catch(_){}
-    }catch(e){
-      crHint.textContent = 'Error loading state';
-    }
-  }
-  qs('crPlace').onclick = async ()=>{
-    crMsg.textContent = '';
-    try{
-      const bet = parseFloat(qs('crBet').value||'0');
-      const cashStr = qs('crCash').value.trim();
-      const cashout = cashStr ? parseFloat(cashStr) : null;
-      await j('/api/crash/place', { method:'POST', headers:{'Content-Type': 'application/json'}, body: JSON.stringify({ bet: String(bet), cashout }) });
-      crMsg.textContent = 'Bet placed. Good luck!';
-      refreshCrash(); renderHeader();
-    }catch(e){ crMsg.textContent = e.message; }
-  };
-  qs('crCashout').onclick = async ()=>{
-    crMsg.textContent = '';
-    try{
-      const r = await j('/api/crash/cashout', { method:'POST' });
-      crMsg.textContent = `Cashed out at ${r.multiplier.toFixed(2)}× for ${fmtDL(r.win)}.`; haveActiveBet = false; renderHeader();
-    }catch(e){ crMsg.textContent = e.message; }
-  };
-  setInterval(()=>{ if(qs('page-crash').style.display !== 'none') refreshCrash(); }, 1000);
-
-  // ---------- Mines grid (show only Cash Out while active) ----------
-  const mGrid = qs('mGrid'); const mSetup = qs('mSetup'); const mStart = qs('mStart'); const mCash = qs('mCash');
-  function renderGridTiles(disabled=false){
-    mGrid.innerHTML = '';
-    for(let i=0;i<25;i++){
-      const el = document.createElement('button'); el.textContent = ''; el.style.width='64px'; el.style.height='64px'; el.style.borderRadius='12px'; el.style.border='1px solid #1f2b47'; el.style.background='#0e1833'; el.style.cursor='pointer';
-      el.onclick = async ()=>{
-        if(disabled) return;
-        try{
-          const r = await j(`/api/mines/pick?index=${i}`, { method: 'POST' });
-          if(r.status === 'lost'){
-            el.textContent = '💣'; el.style.background='#7a1212'; el.disabled = true;
-            qs('mStatus').textContent = 'Status: lost';
-            // Reveal full board
-            for(let k=0;k<25;k++){
-              const b = mGrid.children[k];
-              b.disabled = true;
-            }
-            mCash.style.display='none'; mSetup.style.display=''; renderMines(); renderHeader();
-          }else{
-            el.textContent = '✓'; el.style.background='#1d7c3a'; el.disabled = true;
-            qs('mPicks').textContent = 'Picks: ' + (r.picks.toString(2).match(/1/g)||[]).length;
-            qs('mMult').textContent = 'Multiplier: ' + r.multiplier.toFixed(4) + '×';
-            qs('mPotential').textContent = 'Potential: ' + fmtDL(r.potential_win);
-            qs('mStatus').textContent = 'Status: Active';
-            mCash.style.display='';
-          }
-        }catch(e){ qs('mMsg').textContent = e.message; }
-      };
-      mGrid.appendChild(el);
-    }
-  }
-  function markPicked(mask){
-    for(let i=0;i<25;i++){
-      const el = mGrid.children[i];
-      if((mask>>i) & 1){ el.textContent = '✓'; el.style.background='#1d7c3a'; el.disabled = true; }
-    }
-  }
-  async function renderMines(){
-    qs('mMsg').textContent = '';
-    try{
-      const s = await j('/api/mines/state');
-      if(s && s.id){
-        qs('mHash').textContent = 'Commit: ' + s.hash.slice(0,12) + '…';
-        qs('mStatus').textContent = 'Status: ' + s.status;
-        qs('mPicks').textContent = 'Picks: ' + (s.picks.toString(2).match(/1/g)||[]).length;
-        // During active game: hide setup, show Cash Out only
-        mSetup.style.display = (s.status==='active') ? 'none' : '';
-        mCash.style.display = (s.status==='active') ? '' : 'none';
-        qs('mBombs').textContent = 'Mines: ' + s.mines;
-        renderGridTiles(s.status!=='active'); markPicked(s.picks);
-      }else{
-        qs('mHash').textContent = 'Commit: —';
-        qs('mStatus').textContent = 'Status: —';
-        qs('mPicks').textContent = 'Picks: 0';
-        qs('mBombs').textContent = 'Mines: ' + (parseInt(qs('mMines').value||'3',10));
-        mCash.style.display='none'; mSetup.style.display='';
-        renderGridTiles(false);
-      }
-    }catch(_){}
-    try{
-      const h = await j('/api/mines/history');
-      const rows = h.rows || [];
-      qs('mHist').innerHTML = rows.length
-        ? `<table><thead><tr><th>ID</th><th>When</th><th>Mines</th><th>Bet</th><th>Win</th><th>Status</th></tr></thead>
-           <tbody>${rows.map(r=>`<tr><td>${r.id}</td><td>${new Date(r.started_at).toLocaleString()}</td><td>${r.mines}</td><td>${fmtDL(r.bet)}</td><td>${fmtDL(r.win)}</td><td>${r.status}</td></tr>`).join('')}</tbody></table>`
-        : '—';
-    }catch(_){}
-  }
-  mStart.onclick = async ()=>{
-    const bet = qs('mBet').value.trim();
-    const mines = parseInt(qs('mMines').value||'3',10);
-    qs('mMsg').textContent = '';
-    try{
-      const r = await j('/api/mines/start',{ method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ bet, mines }) });
-      qs('mHash').textContent = 'Commit: ' + r.hash.slice(0,12) + '…';
-      qs('mStatus').textContent = 'Status: active';
-      qs('mPicks').textContent = 'Picks: 0';
-      qs('mBombs').textContent = 'Mines: ' + mines;
-      // Hide setup, show Cash Out only
-      mSetup.style.display='none'; mCash.style.display='';
-      renderGridTiles(false); renderHeader();
-    }catch(e){ qs('mMsg').textContent = e.message; }
-  };
-  mCash.onclick = async ()=>{
-    qs('mMsg').textContent = '';
-    try{
-      const r = await j('/api/mines/cashout', { method:'POST' });
-      qs('mStatus').textContent = 'Status: cashed';
-      qs('mMsg').textContent = 'Cashed out for ' + fmtDL(r.win);
-      mCash.style.display='none'; mSetup.style.display=''; // back to setup after cashing
-      renderMines(); renderHeader();
-    }catch(e){ qs('mMsg').textContent = e.message; }
-  };
-
-  // ---------- Chat (hide FAB while open) ----------
-  const chatDrawer = qs('chatDrawer'), fabChat = qs('fabChat'), chatBody = qs('chatBody'), chatText = qs('chatText'), chatSend = qs('chatSend'), chatClose = qs('chatClose')||{onclick:()=>{}};
-  fabChat.onclick = ()=>{ chatDrawer.classList.add('open'); fabChat.style.display='none'; };
-  chatClose.onclick = ()=>{ chatDrawer.classList.remove('open'); fabChat.style.display=''; };
-  let chatSince = 0;
-  function badge(role){ role = (role||'member').toLowerCase(); return `<span class="badge ${role}">${role.toUpperCase()}</span>`; }
-  function levelChip(lv){ return `<span class="level">Lv ${lv||1}</span>`; }
-  function appendMessages(list){
-    for(const m of list){
-      const row = document.createElement('div'); row.className = 'msg'; row.dataset.id = m.id;
-      row.innerHTML = `
-        <div class="msghead">
-          <span class="user-link" data-uid="${m.user_id}">${m.username}</span>
-          ${badge(m.role)} ${levelChip(m.level)}
-          <span class="time">${new Date(m.created_at).toLocaleTimeString()}</span>
-        </div>
-        <div class="text">${(m.text||'').replace(/[&<>]/g, s=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[s]))}</div>
-      `;
-      chatBody.appendChild(row);
-      chatBody.scrollTop = chatBody.scrollHeight;
-      chatSince = Math.max(chatSince, m.id);
-    }
-  }
-  async function chatPoll(){ try{ const r = await j(`/api/chat/fetch?since=${chatSince}`); appendMessages(r.rows || r); }catch(_){} }
-  setInterval(()=>{ if(chatDrawer.classList.contains('open')) chatPoll(); }, 1500);
-  chatSend.onclick = async ()=>{
-    try{
-      const txt = (chatText.value||'').trim(); if(!txt) return;
-      await j('/api/chat/send', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ text: txt }) });
-      chatText.value = ''; chatPoll(); renderHeader();
-    }catch(e){ alert(e.message || 'Cannot send'); }
-  };
-
-  // ---------- Nav bindings ----------
-  qs('openCrash').onclick=()=>{ showOnly('page-crash'); refreshCrash(); };
-  qs('openMines').onclick=()=>{ showOnly('page-mines'); renderMines(); };
-  qs('openCoinflip').onclick=()=>{ showOnly('page-coinflip'); };
-  qs('openBlackjack').onclick=()=>{ showOnly('page-blackjack'); };
-  qs('openPump').onclick=()=>{ showOnly('page-pump'); };
-
-  qs('backToGames').onclick=()=> showOnly('page-games');
-  qs('backToGames2').onclick=()=> showOnly('page-games');
-  qs('backToGames_cf').onclick=()=> showOnly('page-games');
-  qs('backToGames_bj').onclick=()=> showOnly('page-games');
-  qs('backToGames_pu').onclick=()=> showOnly('page-games');
-
-  // Boot
-  renderHeader();
-  </script>
-</body></html>
-""".replace("__OWNER_ID__", str(OWNER_ID)).replace("__INVITE__", (DISCORD_INVITE or "__INVITE__"))
-# ---------- Routes: index ----------
-@app.get("/", response_class=HTMLResponse)
-async def index(request: Request):
-    # If referral cookie exists, attempt to attach (best-effort)
-    ref_cookie = request.cookies.get("refname")
-    if ref_cookie:
-        try:
-            s = _require_session(request)
-            try:
-                async with httpx.AsyncClient(timeout=4) as cx:
-                    await cx.get(str(request.base_url) + f"api/referral/attach?refname={ref_cookie}")
-            except:
-                pass
-        except:
-            pass
-    return HTMLResponse(HTML_TEMPLATE)
-
-# ---------- Dev runner ----------
-if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=bool(os.getenv("RELOAD","0")=="1"))
-
+          <span class="hint">Anonymous players show as “Anonymous”. Amounts

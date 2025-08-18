@@ -32,6 +32,17 @@ def mines_multiplier(mines: int, picks_count: int) -> float:
         total *= (Decimal("1.0") - HOUSE_EDGE_MINES)
     return float(total)
 
+def _reveals_from(board: str, picks: int):
+    # 'u' = unrevealed, 'g' = safe, 'b' = bomb (shown after lose/cashout)
+    reveals = []
+    for i in range(25):
+        bit = 1 << i
+        if picks & bit:
+            reveals.append('g' if board[i] == '0' else 'b')
+        else:
+            reveals.append('u')
+    return reveals
+
 @with_conn
 def mines_start(cur, user_id: str, bet: Decimal, mines: int):
     if bet < MIN_BET or bet > MAX_BET: raise ValueError(f"Bet must be between {MIN_BET:.2f} and {MAX_BET:.2f}")
@@ -101,13 +112,26 @@ def mines_cashout(cur, user_id: str):
 
 @with_conn
 def mines_state(cur, user_id: str):
-    cur.execute("""SELECT id, bet, mines, picks, commit_hash, status
-                   FROM mines_games WHERE user_id=%s AND status<>'lost'
+    cur.execute("""SELECT id, bet, mines, board, picks, commit_hash, status
+                   FROM mines_games WHERE user_id=%s
                    ORDER BY id DESC LIMIT 1""", (user_id,))
     r = cur.fetchone()
     if not r: return None
-    return {"id": int(r[0]), "bet": float(q2(D(r[1]))), "mines": int(r[2]),
-            "picks": int(r[3]), "hash": str(r[4]), "status": str(r[5])}
+    gid, bet, mines, board, picks, commit_hash, status = int(r[0]), D(r[1]), int(r[2]), str(r[3]), int(r[4]), str(r[5]), str(r[6])
+    pcount = picks_count_from_bitmask(picks)
+    mult = mines_multiplier(mines, pcount) if status == 'active' else 1.0
+    potential = q2(bet * D(mult)) if status == 'active' and pcount > 0 else None
+    return {
+        "id": gid,
+        "bet": float(q2(bet)),
+        "mines": mines,
+        "picks": picks,
+        "commit_hash": commit_hash,
+        "status": status,
+        "reveals": _reveals_from(board, picks),
+        "multiplier": float(mult),
+        "potential_win": (float(potential) if potential is not None else None),
+    }
 
 @with_conn
 def mines_history(cur, user_id: str, limit: int = 15):

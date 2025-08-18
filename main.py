@@ -1066,7 +1066,13 @@ input::placeholder{color:var(--input-ph)}input:focus{border-color:#4c78ff;box-sh
 .header{position:sticky;top:0;z-index:30;backdrop-filter:blur(8px);background:rgba(10,15,30,.72);border-bottom:1px solid var(--border)}
 .header-inner{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px}
 .left{display:flex;align-items:center;gap:14px;flex:1;min-width:0}.brand{display:flex;align-items:center;gap:10px;font-weight:800;white-space:nowrap}
-.brand .logo{width:28px;height:28px;border-radius:8px;background:linear-gradient(135deg,var(--accent),var(--accent2))}
+.brand .logo{
+  width:28px;height:28px;border-radius:8px;
+  background-image:url('/static/GrowCBnobackground.png');
+  background-size:contain;background-position:center;background-repeat:no-repeat;
+  box-shadow:0 0 0 1px var(--border), 0 4px 10px rgba(0,0,0,.35);
+}
+
 .tabs{display:flex;gap:4px;align-items:center;padding:4px;border-radius:14px;background:linear-gradient(180deg,#0f1a33,#0b1326);border:1px solid var(--border)}
 .tab{padding:8px 12px;border-radius:10px;cursor:pointer;font-weight:700;white-space:nowrap;color:#d8e6ff;opacity:.85;transition:all .15s ease;display:flex;align-items:center;gap:8px}
 .tab:hover{opacity:1;transform:translateY(-1px)}.tab.active{background:linear-gradient(135deg,#3b82f6,#22c1dc);color:#051326;box-shadow:0 6px 16px rgba(59,130,246,.25);opacity:1}
@@ -1136,36 +1142,50 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
 
   <div class="container" style="padding-top:16px">
     <!-- Games -->
-    <div id="page-games">
-      <div class="card">
-        <div class="hero">
-          <div class="big">Welcome to GROWCB</div>
-          <div class="discord-cta">
-            <button class="btn ghost" id="btnJoinDiscord">Join Discord</button>
-            <a class="chip" id="btnInvite" href="__INVITE__" target="_blank" rel="noopener">Invite Link</a>
-          </div>
-        </div>
-        <div class="games-grid" style="margin-top:12px">
-          <div class="game-card" id="openCrash" style="background-image: radial-gradient(600px 280px at 10% -10%, rgba(59,130,246,.25), transparent 60%);">
-            <div class="title">🚀 Crash</div><div class="muted">Shared rounds • 10s betting • Live cashout</div>
-          </div>
-          <div class="game-card" id="openMines" style="background-image: radial-gradient(600px 280px at 85% -20%, rgba(34,197,94,.25), transparent 60%);">
-            <div class="title">💣 Mines</div><div class="muted">5×5 board • Choose mines • Cash out anytime</div>
-          </div>
+<!-- Crash -->
+<div class="game-card" id="openCrash"
+     style="background:
+       linear-gradient(180deg, rgba(10,15,30,.0), rgba(10,15,30,.65)),
+       url('/static/crash.png') center/cover no-repeat;">
+  <div class="title">🚀 Crash</div>
+  <div class="muted">Shared rounds • 10s betting • Live cashout</div>
+</div>
 
-          <!-- New stubs -->
-          <div class="game-card" id="openCoinflip" style="background-image: radial-gradient(600px 280px at 50% -20%, rgba(250,204,21,.22), transparent 60%);">
-            <div class="title">🪙 Coinflip</div><div class="muted">Quick 50/50 — coming soon</div>
-          </div>
-          <div class="game-card" id="openBlackjack" style="background-image: radial-gradient(600px 280px at 30% -10%, rgba(16,185,129,.22), transparent 60%);">
-            <div class="title">🃏 Blackjack</div><div class="muted">Beat the dealer — coming soon</div>
-          </div>
-          <div class="game-card" id="openPump" style="background-image: radial-gradient(600px 280px at 70% -10%, rgba(147,51,234,.22), transparent 60%);">
-            <div class="title">📈 Pump</div><div class="muted">Ride the spike — coming soon</div>
-          </div>
-        </div>
-      </div>
-    </div>
+<!-- Mines -->
+<div class="game-card" id="openMines"
+     style="background:
+       linear-gradient(180deg, rgba(10,15,30,.0), rgba(10,15,30,.65)),
+       url('/static/mines.png') center/cover no-repeat;">
+  <div class="title">💣 Mines</div>
+  <div class="muted">5×5 board • Choose mines • Cash out anytime</div>
+</div>
+
+<!-- Coinflip -->
+<div class="game-card" id="openCoinflip"
+     style="background:
+       linear-gradient(180deg, rgba(10,15,30,.0), rgba(10,15,30,.65)),
+       url('/static/coinflip.png') center/cover no-repeat;">
+  <div class="title">🪙 Coinflip</div>
+  <div class="muted">Quick 50/50 — coming soon</div>
+</div>
+
+<!-- Blackjack -->
+<div class="game-card" id="openBlackjack"
+     style="background:
+       linear-gradient(180deg, rgba(10,15,30,.0), rgba(10,15,30,.65)),
+       url('/static/blackjack.png') center/cover no-repeat;">
+  <div class="title">🃏 Blackjack</div>
+  <div class="muted">Beat the dealer — coming soon</div>
+</div>
+
+<!-- Pump -->
+<div class="game-card" id="openPump"
+     style="background:
+       linear-gradient(180deg, rgba(10,15,30,.0), rgba(10,15,30,.65)),
+       url('/static/pump.png') center/cover no-repeat;">
+  <div class="title">📈 Pump</div>
+  <div class="muted">Ride the spike — coming soon</div>
+</div>
 
     <!-- Crash -->
     <div id="page-crash" style="display:none">
@@ -1941,3 +1961,4 @@ async def root():
 # ---------- Run ----------
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=bool(os.getenv("RELOAD","1")=="1"))
+

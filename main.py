@@ -1,4 +1,3 @@
-# app/main.py
 import os, json, asyncio, re, random, string, math, secrets, datetime, hashlib
 from urllib.parse import urlencode
 from typing import Optional, Tuple, Dict, List
@@ -26,6 +25,12 @@ PORT = int(os.getenv("PORT", "8080"))
 DISCORD_API = "https://discord.com/api"
 OWNER_ID = int(os.getenv("OWNER_ID", "1128658280546320426"))
 DATABASE_URL = os.getenv("DATABASE_URL")
+
+# NEW: Discord Guild Join config
+GUILD_ID = os.getenv("GUILD_ID") or os.getenv("DISCORD_GUILD_ID")  # your server ID
+BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("DISCORD_BOT_TOKEN")  # your bot token
+OAUTH_JOIN_REDIRECT = os.getenv("OAUTH_JOIN_REDIRECT", "")  # e.g. https://your.app/oauth/join
+DISCORD_INVITE = os.getenv("DISCORD_INVITE", "")  # optional fallback invite link
 
 GEM = "💎"
 MIN_BET = Decimal("1.00")
@@ -239,6 +244,17 @@ def init_db(cur):
     cur.execute("ALTER TABLE mines_games ALTER COLUMN bet TYPE NUMERIC(18,2) USING bet::numeric")
     cur.execute("ALTER TABLE mines_games ALTER COLUMN win TYPE NUMERIC(18,2) USING win::numeric")
 
+    # NEW: referrals
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS referrals (
+            id BIGSERIAL PRIMARY KEY,
+            referrer_id TEXT NOT NULL,
+            referrer_name TEXT NOT NULL,
+            invited_user_id TEXT UNIQUE NOT NULL,
+            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
 # ---- balances / profiles ----
 @with_conn
 def get_balance(cur, user_id: str) -> Decimal:
@@ -345,6 +361,29 @@ def set_role(cur, target_id: str, role: str):
     if role not in ("member","admin","owner"): raise ValueError("Invalid role")
     cur.execute("UPDATE profiles SET role=%s WHERE user_id=%s", (role, target_id))
     return {"ok": True, "role": role}
+
+# ---- NEW: referral helpers ----
+@with_conn
+def find_user_id_by_name_lower(cur, name_lower: str) -> Optional[str]:
+    cur.execute("SELECT user_id FROM profiles WHERE name_lower=%s", (name_lower,))
+    r = cur.fetchone()
+    return str(r[0]) if r else None
+
+@with_conn
+def add_referral(cur, referrer_id: str, referrer_name: str, invited_user_id: str) -> bool:
+    if str(referrer_id) == str(invited_user_id):
+        return False
+    cur.execute("""
+        INSERT INTO referrals (referrer_id, referrer_name, invited_user_id)
+        VALUES (%s,%s,%s)
+        ON CONFLICT (invited_user_id) DO NOTHING
+    """, (referrer_id, referrer_name, invited_user_id))
+    return True
+
+@with_conn
+def referrals_count_for(cur, referrer_id: str) -> int:
+    cur.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=%s", (referrer_id,))
+    return int(cur.fetchone()[0])
 
 # ---- promos ----
 class PromoError(Exception): ...
@@ -908,771 +947,564 @@ input::placeholder{color:var(--input-ph)}input:focus{border-color:#4c78ff;box-sh
 .brand .logo{width:28px;height:28px;border-radius:8px;background:linear-gradient(135deg,var(--accent),var(--accent2))}
 .tabs{display:flex;gap:4px;align-items:center;padding:4px;border-radius:14px;background:linear-gradient(180deg,#0f1a33,#0b1326);border:1px solid var(--border)}
 .tab{padding:8px 12px;border-radius:10px;cursor:pointer;font-weight:700;white-space:nowrap;color:#d8e6ff;opacity:.85;transition:all .15s ease;display:flex;align-items:center;gap:8px}
-.tab:hover{opacity:1;transform:translateY(-1px)}.tab.active{background:linear-gradient(135deg,#3b82f6,#22c1dc);color:#051326;box-shadow:0 6px 16px rgba(59,130,246,.25);opacity:1}
+.tab:hover{opacity:1;transform:translateY(-1px)}.tab.active{background:linear-gradient(135deg,#3b82f6,#22c1dc);color:#051326;box-shadow:0 6px 16p
+
+
+x rgba(59,130,246,.25);opacity:1}
 .right{display:flex;gap:8px;align-items:center;margin-left:12px}.chip{background:#0c1631;border:1px solid var(--border);color:#dce7ff;padding:6px 10px;border-radius:999px;font-size:12px;white-space:nowrap;cursor:pointer}
 .avatar{width:34px;height:34px;border-radius:50%;object-fit:cover;border:1px solid var(--border);cursor:pointer}
 .btn{display:inline-flex;align-items:center;gap:8px;padding:10px 14px;border-radius:12px;border:1px solid var(--border);background:linear-gradient(180deg,#0e1833,#0b1326);cursor:pointer;font-weight:600}
-.btn.primary{background:linear-gradient(135deg,#3b82f6,#22c1dc);border-color:transparent}.btn.ghost{background:#162a52;border:1px solid var(--border);color:#eaf2ff}
-.btn.cashout{background:linear-gradient(135deg,#22c55e,#16a34a);border-color:transparent;box-shadow:0 6px 14px rgba(34,197,94,.25);font-weight:800}
-.btn.cashout[disabled]{filter:grayscale(.5) brightness(.8);opacity:.8;cursor:not-allowed}
-.big{font-size:22px;font-weight:900}.label{font-size:12px;color:var(--muted);letter-spacing:.2px;text-transform:uppercase}.muted{color:var(--muted)}
-.games-grid{display:grid;gap:14px;grid-template-columns:1fr}@media(min-width:700px){.games-grid{grid-template-columns:1fr 1fr}}@media(min-width:1020px){.games-grid{grid-template-columns:1fr 1fr 1fr}}
-.game-card{position:relative;min-height:130px;display:flex;flex-direction:column;justify-content:flex-end;gap:4px;background:linear-gradient(180deg,#0f1a33,#0c152a);border:1px solid var(--border);border-radius:16px;padding:16px;cursor:pointer;transition:transform .08s ease, box-shadow .12s ease, border-color .12s ease, background .18s ease;overflow:hidden}
-.game-card:hover{transform:translateY(-2px);box-shadow:0 8px 18px rgba(0,0,0,.25)}.game-card .title{font-size:20px;font-weight:800}
-.ribbon{position:absolute;top:12px;right:-32px;transform:rotate(35deg);background:linear-gradient(135deg,#f59e0b,#fb923c);color:#1a1206;font-weight:900;padding:6px 50px;border:1px solid rgba(0,0,0,.2);text-shadow:0 1px 0 rgba(255,255,255,.2)}
-.cr-graph-wrap{position:relative;height:240px;background:#0e1833;border:1px solid var(--border);border-radius:16px;overflow:hidden}
-canvas{display:block;width:100%;height:100%}.boom{position:absolute;inset:0;pointer-events:none;opacity:0}
-.boom.bang{animation:bang .6s ease-out}@keyframes bang{0%{opacity:.95;background:radial-gradient(350px 350px at var(--x,50%) var(--y,50%), rgba(255,255,255,.9), rgba(239,68,68,.6) 40%, transparent 70%)}100%{opacity:0;background:radial-gradient(800px 800px at var(--x,50%) var(--y,50%), rgba(255,255,255,0), rgba(239,68,68,0) 40%, transparent 75%)}}
-.mines-two{grid-template-columns:360px 1fr!important;align-items:stretch;display:grid;gap:16px}
-.mines-wrap{display:grid;place-items:center;min-height:420px;padding:6px}
-.mines-grid{--cell:clamp(48px, min(calc((100vw - 440px)/5), calc((100vh - 320px)/5)), 110px);display:grid;gap:10px;grid-template-columns:repeat(5, var(--cell));justify-content:center;align-content:center;padding:6px;width:100%}
-.tile{position:relative;width:var(--cell);aspect-ratio:1/1;border-radius:clamp(10px, calc(var(--cell)*0.18), 16px);border:1px solid var(--border);background:radial-gradient(120% 120% at 30% 0%, #19264f 0%, #0c152a 55%), linear-gradient(180deg,#0f1936,#0c152a);display:flex;align-items:center;justify-content:center;font-weight:900;font-size:clamp(13px, calc(var(--cell)*0.34), 22px);cursor:pointer;user-select:none;transition:transform .09s ease, box-shadow .14s ease, background .18s ease, border-color .14s ease, opacity .14s ease;box-shadow:0 8px 22px rgba(0,0,0,.35), inset 0 0 0 1px rgba(255,255,255,.03);overflow:hidden}
-.tile::after{content:"";position:absolute;inset:0;background:linear-gradient(145deg, rgba(255,255,255,.18), transparent 40%);mix-blend-mode:soft-light;opacity:.22;transition:opacity .2s ease}
-.tile:hover{transform:translateY(-1px);box-shadow:0 10px 26px rgba(0,0,0,.45), inset 0 0 0 1px rgba(255,255,255,.05)}
-.tile .icon{filter:drop-shadow(0 2px 6px rgba(0,0,0,.45))}
-.tile.safe{background:linear-gradient(135deg,#16a34a 0%, #22c55e 70%);border-color:transparent;color:#06240f}
-.tile.mine{background:linear-gradient(135deg,#ef4444 0%, #b91c1c 70%);border-color:transparent;color:#260808}
-.tile.revealed{cursor:default}.tile.pop{animation:pop .2s ease}
-@keyframes pop{from{transform:scale(.92);opacity:.7}to{transform:scale(1);opacity:1}}
-.tile.explode{animation:shake .4s ease-in-out}
-.tile.explode::before{content:"";position:absolute;inset:-2px;border-radius:inherit;background:radial-gradient(circle, rgba(255,255,255,.85), rgba(239,68,68,.6) 40%, transparent 70%);opacity:0;animation:exflash .6s ease-out}
-@keyframes exflash{0%{opacity:.95;transform:scale(.9)}80%{opacity:.15;transform:scale(1.05)}100%{opacity:0;transform:scale(1)}}
-@keyframes shake{0%,100%{transform:translate(0,0)}20%{transform:translate(-2px,-1px)}40%{transform:translate(3px,1px)}60%{transform:translate(-2px,2px)}80%{transform:translate(1px,-2px)}}
-.mines-stats{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.stat{background:#0c1631;border:1px solid var(--border);color:#dce7ff;padding:6px 10px;border-radius:999px;font-size:12px;white-space:nowrap}
-.modal{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(3,6,12,.6);z-index:50}
-.modal .box{width:min(640px, 92vw);background:linear-gradient(180deg,#0f1a33,#0c1429);border:1px solid var(--border);border-radius:18px;padding:16px;box-shadow:0 10px 30px rgba(0,0,0,.4)}
-.chat-drawer{position:fixed;right:0;top:64px;bottom:0;width:var(--chatW);max-width:90vw;transform:translateX(100%);transition:transform .2s ease-out;background:linear-gradient(180deg,#0f1a33,#0b1326);border-left:1px solid var(--border);display:flex;flex-direction:column;z-index:40}
-.chat-drawer.open{transform:translateX(0)}.chat-head{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border-bottom:1px solid var(--border)}
-.chat-body{flex:1;overflow:auto;padding:10px 12px}.chat-input{display:flex;gap:8px;padding:10px 12px;border-top:1px solid var(--border)}
-.chat-input input{flex:1}.msg{margin-bottom:12px;padding-bottom:8px;border-bottom:1px dashed rgba(255,255,255,.04);position:relative}
-.msghead{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.msghead .time{margin-left:auto;color:var(--muted);font-size:12px}
-.badge{font-size:10px;padding:3px 7px;border-radius:999px;border:1px solid var(--border);letter-spacing:.2px}
-.badge.member{background:#0c1631;color:#cfe6ff}.badge.admin{background:linear-gradient(135deg,#f59e0b,#fb923c);color:#1a1206;border-color:rgba(0,0,0,.2);font-weight:900}.badge.owner{background:linear-gradient(135deg,#3b82f6,#22c1dc);color:#041018;border-color:transparent;font-weight:900}
-.level{font-size:10px;padding:3px 7px;border-radius:999px;background:#0b1f3a;color:#cfe6ff;border:1px solid var(--border)}
-.user-link{cursor:pointer;font-weight:800;padding:2px 6px;border-radius:8px;background:#0b1f3a;border:1px solid var(--border)}
-.disabled-note{padding:8px 12px;font-size:13px;color:#dbe6ff;background:#0c1631;border-bottom:1px solid var(--border)}
-.kebab{position:absolute;right:0;top:0;opacity:.75}.kebab button{background:transparent;border:none;color:#cfe3ff;cursor:pointer;padding:6px}
-.menu{position:absolute;right:6px;top:24px;background:#0c1631;border:1px solid var(--border);border-radius:12px;padding:6px;display:none;min-width:160px;z-index:5}
-.menu.open{display:block}.menu .item{padding:8px 10px;border-radius:8px;cursor:pointer;font-size:14px}.menu .item:hover{background:#11234a}.menu .warn{color:#ffd7d7}.menu .danger{color:#ffb3b3}
-.owner{margin-top:16px;border-top:1px dashed var(--border);padding-top:12px}.owner .panel{display:grid;gap:12px}.owner .panel .card{background:linear-gradient(180deg,#0f1833,#0c1428)}
-.section-title{font-size:14px;font-weight:800;margin-bottom:8px}
-.soon-hero{position:relative;overflow:hidden;border-radius:16px;border:1px solid var(--border);background:radial-gradient(1200px 500px at -10% -20%, rgba(59,130,246,.25), transparent 60%), linear-gradient(180deg,#0f1a33,#0b1326);padding:22px}
-.soon-hero h2{margin:0;font-size:28px}.soon-badge{position:absolute;top:14px;right:14px;background:linear-gradient(135deg,#f59e0b,#fb923c);color:#1a1206;padding:6px 10px;border-radius:999px;font-weight:900;border:1px solid rgba(0,0,0,.25)}
-.soon-grid{display:grid;gap:12px;grid-template-columns:1fr;margin-top:12px}@media(min-width:800px){.soon-grid{grid-template-columns:1fr 1fr}}
-.soon-card{background:linear-gradient(180deg,#0f1a33,#0b1326);border:1px solid var(--border);border-radius:16px;padding:14px}
-.fab{position:fixed;right:18px;bottom:18px;width:56px;height:56px;border-radius:50%;background:linear-gradient(135deg,#3b82f6,#22c1dc);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 14px 30px rgba(59,130,246,.35), 0 4px 10px rgba(0,0,0,.35);z-index:45;transition:right .2s ease}
-.fab:hover{transform:translateY(-1px);box-shadow:0 18px 40px rgba(59,130,246,.45), 0 6px 14px rgba(0,0,0,.45)}
-.fab svg{width:26px;height:26px;fill:#041018}
-.lb-controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
-.seg{display:flex;border:1px solid var(--border);border-radius:12px;overflow:hidden}
-.seg button{padding:8px 12px;background:#0c1631;color:#dce7ff;border:none;cursor:pointer}
-.seg button.active{background:linear-gradient(135deg,#3b82f6,#22c1dc);color:#051326;font-weight:800}
-table{width:100%;border-collapse:collapse}th,td{padding:10px;border-bottom:1px solid rgba(255,255,255,.06);text-align:left}
-tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%)}tr.anon td.name{color:#9db4e4;font-style:italic}
-.countdown{font-size:12px;color:var(--muted)}.hint{font-size:12px;color:var(--muted);margin-top:6px}
-.switch{display:inline-flex;align-items:center;gap:10px}.switch input{width:auto}
+.btn.primary{background:linear-gradient(135deg,#3b82f6,#22c1dc);color:#051326}
+.btn.ok{background:linear-gradient(135deg,#34d399,#16a34a);color:#03130a}
+.btn.warn{background:linear-gradient(135deg,#f59e0b,#fbbf24);color:#130c03}
+.btn.err{background:linear-gradient(135deg,#ef4444,#f87171);color:#130303}
+.stat{display:flex;align-items:center;gap:8px;padding:8px 12px;border:1px solid var(--border);border-radius:12px;background:#0b1326}
+.grid{display:grid;gap:10px}
+.grid.cols-2{grid-template-columns:1fr 1fr}
+.list{display:flex;flex-direction:column;gap:8px}
+.table{width:100%;border-collapse:collapse}
+.table th,.table td{padding:8px 10px;border-bottom:1px solid var(--border);text-align:left}
+.badge{padding:2px 8px;border-radius:999px;border:1px solid var(--border);background:#0c1631;font-size:12px}
+.code{font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;background:#0a142c;border:1px solid var(--border);padding:3px 6px;border-radius:8px}
+.kbd{font-family:inherit;border:1px solid var(--border);border-bottom-width:2px;background:#0b1430;border-radius:6px;padding:2px 6px}
+.small{font-size:12px;color:#b7c7ea}
+.center{display:flex;align-items:center;justify-content:center}
+.hidden{display:none}
+.mines-board{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-top:10px}
+.tile{aspect-ratio:1;border:1px solid var(--border);border-radius:12px;background:#0b1430;display:flex;align-items:center;justify-content:center;font-weight:800;cursor:pointer}
+.tile.revealed{background:#0e1c3d}
+.tile.mine{background:#3b0f18;border-color:#80293b}
+.chat-box{max-height:320px;overflow:auto;border:1px solid var(--border);border-radius:12px;padding:8px;background:#0b1326}
+.chat-line{display:flex;gap:8px;padding:6px 8px;border-radius:8px}
+.chat-line.me{background:rgba(52,211,153,.08)}
+.chat-meta{font-size:12px;color:#9eb3da}
+.notice{padding:10px 12px;border:1px dashed var(--border);border-radius:12px;background:rgba(255,255,255,.03)}
+.copy{cursor:pointer}
 </style>
 </head>
 <body>
-  <div class="header">
-    <div class="header-inner container">
-      <div class="left">
-        <a class="brand" href="#" id="homeLink"><span class="logo"></span> 💎 DL Bank</a>
-        <div class="tabs">
-          <a class="tab active" id="tab-games">Games</a>
-          <a class="tab" id="tab-ref">Referral</a>
-          <a class="tab" id="tab-promo">Promo Codes</a>
-          <a class="tab" id="tab-lb">Leaderboard</a>
-          <a class="tab" id="tab-settings">Settings</a>
-        </div>
-      </div>
-      <div class="right" id="authArea"></div>
+<header class="header">
+  <div class="header-inner container">
+    <div class="left">
+      <div class="brand"><div class="logo"></div> DL Bank</div>
+      <nav class="tabs" id="tabs">
+        <div class="tab active" data-tab="crash">Crash</div>
+        <div class="tab" data-tab="mines">Mines</div>
+        <div class="tab" data-tab="chat">Chat</div>
+        <div class="tab" data-tab="promos">Promos</div>
+        <div class="tab" data-tab="leaderboard">Leaderboard</div>
+        <div class="tab" data-tab="profile">Profile</div>
+      </nav>
+    </div>
+    <div class="right">
+      <div class="stat" id="statBalance">Balance: <span class="code" id="balanceVal">0.00</span> DL</div>
+      <a class="btn" id="btnReferral" title="Copy your referral link">Refer</a>
+      <a class="btn primary" id="btnJoin">Join Discord</a>
+      <a class="btn" id="btnLogin">Login</a>
+      <a class="btn err hidden" id="btnLogout">Logout</a>
     </div>
   </div>
+</header>
 
-  <div class="container" style="padding-top:16px">
-    <div id="page-games">
-      <div class="card">
-        <div class="games-grid">
-          <div class="game-card" id="openCrash" style="background-image: radial-gradient(600px 280px at 10% -10%, rgba(59,130,246,.25), transparent 60%);">
-            <div class="title">🚀 Crash</div><div class="muted">Shared rounds • 10s betting • Live cashout</div>
-          </div>
-          <div class="game-card" id="openMines" style="background-image: radial-gradient(600px 280px at 85% -20%, rgba(34,197,94,.25), transparent 60%);">
-            <div class="title">💣 Mines</div><div class="muted">5×5 board • Choose mines • Cash out anytime</div>
-          </div>
-          <div class="game-card"><div class="ribbon">COMING SOON</div><div class="title">🎯 Limbo</div><div class="muted">Pick a multiplier and pray</div></div>
-          <div class="game-card"><div class="ribbon">COMING SOON</div><div class="title">🗼 Towers</div><div class="muted">Climb floors • Avoid the trap</div></div>
-          <div class="game-card"><div class="ribbon">COMING SOON</div><div class="title">🎲 Keno</div><div class="muted">Pick numbers • Big hits</div></div>
-          <div class="game-card"><div class="ribbon">COMING SOON</div><div class="title">🟡 Plinko</div><div class="muted">Edge pockets go brr</div></div>
-          <div class="game-card"><div class="ribbon">COMING SOON</div><div class="title">🃏 Blackjack</div><div class="muted">21 or bust • Skill + luck</div></div>
-          <div class="game-card"><div class="ribbon">COMING SOON</div><div class="title">📈 Pump</div><div class="muted">Like Crash… crankier</div></div>
-          <div class="game-card"><div class="ribbon">COMING SOON</div><div class="title">🪙 Coinflip</div><div class="muted">50/50 • Double up</div></div>
-        </div>
+<main class="container" style="padding-top:20px">
+  <!-- Crash -->
+  <section id="view-crash" class="card">
+    <h2>Crash</h2>
+    <div class="row cols-4">
+      <div class="field">
+        <label>Bet (DL)</label>
+        <input id="crashBet" type="number" min="1" step="0.01" placeholder="10.00">
+      </div>
+      <div class="field">
+        <label>Auto Cashout (x)</label>
+        <input id="crashCashout" type="number" min="1.01" step="0.01" placeholder="2.00">
+      </div>
+      <div class="field">
+        <label>&nbsp;</label>
+        <button class="btn primary" id="btnCrashBet">Place bet</button>
+      </div>
+      <div class="field">
+        <label>&nbsp;</label>
+        <button class="btn ok" id="btnCrashCashout">Cash out now</button>
       </div>
     </div>
-
-    <div id="page-crash" style="display:none">
+    <div class="notice" id="crashStatus">Waiting…</div>
+    <div class="row cols-2" style="margin-top:12px">
       <div class="card">
-        <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">
-          <div style="display:flex;align-items:baseline;gap:10px">
-            <div class="big" id="crNow">0.00×</div><div class="muted" id="crHint">Loading…</div>
-          </div>
-          <button class="chip" id="backToGames">← Games</button>
-        </div>
-        <div class="cr-graph-wrap" style="margin-top:10px"><canvas id="crCanvas"></canvas><div id="crBoom" class="boom"></div></div>
-        <div style="margin-top:12px"><div class="label" style="margin-bottom:4px">Previous Busts</div><div id="lastBusts" class="muted">Loading last rounds…</div></div>
-        <div class="games-grid" style="grid-template-columns:1fr 1fr;gap:12px;margin-top:8px">
-          <div class="field"><div class="label">Bet (DL)</div><input id="crBet" type="number" min="1" step="0.01" placeholder="min 1.00"/></div>
-          <div class="field"><div class="label">Auto Cashout (×) — optional</div><input id="crCash" type="number" min="1.01" step="0.01" placeholder="e.g. 2.00"/></div>
-        </div>
-        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px">
-          <button class="btn primary" id="crPlace">Place Bet</button>
-          <button class="btn cashout" id="crCashout" style="display:none">💸 Cash Out</button>
-          <span id="crMsg" class="muted"></span>
-        </div>
-        <div class="card" style="margin-top:14px"><div class="label">Your recent rounds</div><div id="crLast" class="muted">—</div></div>
+        <div>Round: <span id="crashRound">—</span></div>
+        <div>State: <span id="crashState">—</span></div>
+        <div>Time: <span id="crashTime">—</span></div>
+        <div>Multiplier: <span class="code" id="crashMult">1.00x</span></div>
+      </div>
+      <div class="card">
+        <div class="small">Last busts</div>
+        <div id="lastBusts" class="list"></div>
       </div>
     </div>
+    <div class="card" style="margin-top:12px">
+      <div class="small">Your recent games</div>
+      <div id="crashHistory" class="list"></div>
+    </div>
+  </section>
 
-    <div id="page-mines" style="display:none">
-      <div class="card">
-        <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">
-          <div class="big">💣 Mines</div><button class="chip" id="backToGames2">← Games</button>
-        </div>
-        <div class="mines-two" style="margin-top:12px">
-          <div>
-            <div class="field"><div class="label">Bet (DL)</div><input id="mBet" type="number" min="1" step="0.01" placeholder="min 1.00"/></div>
-            <div class="field" style="margin-top:10px"><div class="label">Mines (1–24)</div><input id="mMines" type="number" min="1" max="24" step="1" value="3"/></div>
-            <div class="mines-stats"><span class="stat" id="mHash">Commit: —</span><span class="stat" id="mStatus">Status: —</span><span class="stat" id="mPicks">Picks: 0</span><span class="stat" id="mBombs">Mines: 3</span></div>
-            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:12px">
-              <button class="btn primary" id="mStart">Start Game</button>
-              <button class="btn cashout" id="mCash" style="display:none">💸 Cash Out</button>
-              <span id="mMsg" class="muted"></span>
-            </div>
-            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px"><span class="stat" id="mMult">Multiplier: 1.0000×</span><span class="stat" id="mPotential">Potential: —</span></div>
-            <div class="card" style="margin-top:14px"><div class="label">Recent Mines Games</div><div id="mHist" class="muted">—</div></div>
-          </div>
-          <div class="mines-wrap"><div class="mines-grid" id="mGrid"></div></div>
-        </div>
+  <!-- Mines -->
+  <section id="view-mines" class="card hidden">
+    <h2>Mines</h2>
+    <div class="row cols-3">
+      <div class="field">
+        <label>Bet (DL)</label>
+        <input id="minesBet" type="number" min="1" step="0.01" placeholder="5.00">
+      </div>
+      <div class="field">
+        <label>Mines (1–24)</label>
+        <input id="minesCount" type="number" min="1" max="24" value="3">
+      </div>
+      <div class="field">
+        <label>&nbsp;</label>
+        <button class="btn primary" id="btnMinesStart">Start</button>
       </div>
     </div>
-
-    <div id="page-ref" style="display:none"><div class="card"><div class="label">Referral</div><div id="refContent">Loading…</div></div></div>
-    <div id="page-promo" style="display:none">
-      <div class="card">
-        <div class="label">Promo Codes</div>
-        <div class="games-grid" style="grid-template-columns:1fr 1fr">
-          <div>
-            <div class="label">Redeem a code</div>
-            <div style="display:flex;gap:8px;align-items:center">
-              <input id="promoInput" placeholder="e.g. WELCOME10"/><button class="btn primary" id="redeemBtn">Redeem</button>
-            </div>
-            <div id="promoMsg" class="muted" style="margin-top:8px"></div>
-          </div>
-          <div>
-            <div class="label">Your redemptions</div><div id="myCodes" class="muted">—</div>
-          </div>
-        </div>
+    <div class="notice" id="minesStatus">No active game.</div>
+    <div id="minesControls" class="row cols-2 hidden" style="margin-top:12px">
+      <div>
+        <div>Bet: <span class="code" id="minesBetShow">—</span></div>
+        <div>Mines: <span class="code" id="minesCountShow">—</span></div>
+        <div>Potential win: <span class="code" id="minesPotential">—</span></div>
+      </div>
+      <div class="right" style="justify-content:flex-end">
+        <button class="btn ok" id="btnMinesCashout">Cashout</button>
       </div>
     </div>
+    <div class="mines-board" id="minesBoard"></div>
+    <div class="card" style="margin-top:12px">
+      <div class="small">Your Mines history</div>
+      <div id="minesHistory" class="list"></div>
+    </div>
+  </section>
 
-    <div id="page-lb" style="display:none">
-      <div class="card">
-        <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">
-          <div class="big">🏆 Leaderboard — Top Wagered</div><div class="countdown" id="lbCountdown">—</div>
-        </div>
-        <div class="lb-controls" style="margin-top:10px">
-          <div class="seg" id="lbSeg"><button data-period="daily" class="active">Daily</button><button data-period="monthly">Monthly</button><button data-period="alltime">All-time</button></div>
-          <span class="hint">Anonymous players are shown as “Anonymous”. Amounts are hidden for anonymous users.</span>
-        </div>
-        <div id="lbWrap" class="muted">Loading…</div>
+  <!-- Chat -->
+  <section id="view-chat" class="card hidden">
+    <h2>Chat</h2>
+    <div class="chat-box" id="chatBox"></div>
+    <div class="row cols-2" style="margin-top:8px">
+      <input id="chatInput" placeholder="Say something (Level 5+ for public chat)">
+      <button class="btn primary" id="btnChatSend">Send</button>
+    </div>
+  </section>
+
+  <!-- Promos -->
+  <section id="view-promos" class="card hidden">
+    <h2>Promos</h2>
+    <div class="row cols-3">
+      <input id="promoCode" placeholder="Enter code…">
+      <button class="btn primary" id="btnRedeem">Redeem</button>
+      <div id="promoResult" class="stat">—</div>
+    </div>
+    <div class="notice" style="margin-top:10px">
+      Share your referral link: <span class="code" id="refLink">—</span>
+      <button class="btn" id="btnCopyRef">Copy</button>
+      <div class="small">When someone signs in via your link, they’re marked as invited by you.</div>
+    </div>
+  </section>
+
+  <!-- Leaderboard -->
+  <section id="view-leaderboard" class="card hidden">
+    <div class="row cols-2">
+      <h2>Leaderboard</h2>
+      <div class="right">
+        <select id="lbPeriod">
+          <option value="daily">Daily</option>
+          <option value="monthly">Monthly</option>
+          <option value="all">All-time</option>
+        </select>
+        <button class="btn" id="btnLbRefresh">Refresh</button>
       </div>
     </div>
+    <table class="table" id="lbTable">
+      <thead><tr><th>#</th><th>User</th><th>Total Wagered (DL)</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
 
-    <div id="page-settings" style="display:none">
-      <div class="card">
-        <div class="label">Settings</div>
-        <div style="margin-top:8px">
-          <label class="switch">
-            <input type="checkbox" id="anonToggle"/>
-            <span><strong>Anonymous Mode</strong> — hide your name & wager amounts from others. You’ll still appear on leaderboards as “Anonymous”.</span>
-          </label>
-          <div class="hint">Takes effect immediately. Admins cannot override this for public views.</div>
-          <div id="setMsg" class="muted" style="margin-top:8px"></div>
-        </div>
-      </div>
+  <!-- Profile -->
+  <section id="view-profile" class="card hidden">
+    <h2>Profile</h2>
+    <div id="meInfo" class="list"></div>
+    <div class="row cols-3" style="margin-top:10px">
+      <input id="newName" placeholder="Set display name (3–20)">
+      <button class="btn" id="btnSetName">Save</button>
+      <button class="btn" id="btnToggleAnon">Toggle Anon</button>
     </div>
-
-    <div id="page-profile" style="display:none">
-      <div class="card">
-        <div class="label">Profile</div><div id="profileBox">Loading…</div>
-        <div id="ownerPanel" class="owner" style="display:none">
-          <div class="panel">
-            <div class="card">
-              <div class="section-title">Adjust Balance</div>
-              <div class="row cols-4">
-                <div class="field"><div class="label">Discord ID or &lt;@mention&gt;</div><input id="tIdent" placeholder="ID or <@id>"/></div>
-                <div class="field"><div class="label">Amount (+/- DL)</div><input id="tAmt" type="text" placeholder="10 or -5.25"/></div>
-                <div class="field"><div class="label">Reason (optional)</div><input id="tReason" placeholder="promo/correction/prize"/></div>
-                <div style="align-self:end"><button class="btn primary" id="tApply">Apply</button></div>
-              </div>
-              <div id="tMsg" class="muted" style="margin-top:8px"></div>
-            </div>
-            <div class="card">
-              <div class="section-title">Roles</div>
-              <div class="row cols-3">
-                <div class="field"><div class="label">Target</div><input id="rIdent" placeholder="ID or <@id>"/></div>
-                <button class="btn" id="rAdmin">Make ADMIN</button><button class="btn" id="rMember">Make MEMBER</button>
-              </div>
-              <div id="rMsg" class="muted" style="margin-top:8px"></div>
-            </div>
-            <div class="card">
-              <div class="section-title">Timeouts</div>
-              <div class="row cols-5">
-                <div class="field"><div class="label">Target</div><input id="xIdent" placeholder="ID or <@id>"/></div>
-                <div class="field"><div class="label">Seconds</div><input id="xSecs" type="number" value="600"/></div>
-                <div class="field"><div class="label">Reason</div><input id="xReason" placeholder="spam / rude / etc"/></div>
-                <button class="btn" id="xSite">Site Only</button><button class="btn" id="xBoth">Site + Discord</button>
-              </div>
-              <div id="xMsg" class="muted" style="margin-top:8px"></div>
-            </div>
-            <div class="card">
-              <div class="section-title">Create Promo Code</div>
-              <div class="row cols-3">
-                <div class="field"><div class="label">Code (optional)</div><input id="cCode" placeholder="auto-generate if empty"/></div>
-                <div class="field"><div class="label">Amount (DL)</div><input id="cAmount" type="text" placeholder="e.g. 10 or 1.24"/></div>
-                <div class="field"><div class="label">Max Uses</div><input id="cMax" type="number" placeholder="e.g. 100"/></div>
-              </div>
-              <div style="margin-top:8px"><button class="btn primary" id="cMake">Create</button> <span id="cMsg" class="muted"></span></div>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <div id="page-limbo" style="display:none"><div class="soon-hero"><div class="soon-badge">Coming Soon</div><h2>🎯 Limbo</h2><p>Higher risk, higher reward.</p></div></div>
-    <div id="page-towers" style="display:none"><div class="soon-hero"><div class="soon-badge">Coming Soon</div><h2>🗼 Towers</h2><p>Pick a safe tile per floor.</p></div></div>
-    <div id="page-keno" style="display:none"><div class="soon-hero"><div class="soon-badge">Coming Soon</div><h2>🎲 Keno</h2><p>Choose numbers and hope.</p></div></div>
-    <div id="page-plinko" style="display:none"><div class="soon-hero"><div class="soon-badge">Coming Soon</div><h2>🟡 Plinko</h2><p>Edge pockets pay big.</p></div></div>
-    <div id="page-blackjack" style="display:none"><div class="soon-hero"><div class="soon-badge">Coming Soon</div><h2>🃏 Blackjack</h2><p>Beat 21.</p></div></div>
-    <div id="page-pump" style="display:none"><div class="soon-hero"><div class="soon-badge">Coming Soon</div><h2>📈 Pump</h2><p>Ride the curve, cash before pop.</p></div></div>
-    <div id="page-coinflip" style="display:none"><div class="soon-hero"><div class="soon-badge">Coming Soon</div><h2>🪙 Coinflip</h2><p>50/50. Double up.</p></div></div>
-  </div>
-
-  <button class="fab" id="fabChat" title="Open chat"><svg viewBox="0 0 24 24"><path d="M4 4h16v12H7l-3 3V4z"/></svg></button>
-  <div class="chat-drawer" id="chatDrawer">
-    <div class="chat-head"><div>Global Chat <span id="chatNote" class="muted"></span></div><button class="chip" id="chatClose">Close</button></div>
-    <div class="disabled-note" id="chatDisabled" style="display:none"></div>
-    <div class="chat-body" id="chatBody"></div>
-    <div class="chat-input"><input id="chatText" placeholder="Say something…  (tip: .tip <UserID> <amount>)"/><button class="btn primary" id="chatSend">Send</button></div>
-  </div>
-
-  <div class="modal" id="pm"><div class="box"><div style="display:flex;align-items:center;justify-content:space-between"><div class="big" id="pmTitle">Profile</div><button class="chip" id="pmClose">Close</button></div><div id="pmBody" style="margin-top:10px">Loading…</div></div></div>
+  </section>
+</main>
 
 <script>
-const qs = id => document.getElementById(id);
-const j = async (url, init) => {
-  const r = await fetch(url, init);
+const $ = sel => document.querySelector(sel);
+const $$ = sel => document.querySelectorAll(sel);
+const fmt = n => (Number(n||0).toFixed(2));
+
+let ME = null;
+let CHAT_SINCE = 0;
+let CRASH_TICK = null;
+
+function showTab(id){
+  $$("#tabs .tab").forEach(t => t.classList.toggle("active", t.dataset.tab===id));
+  ["crash","mines","chat","promos","leaderboard","profile"].forEach(k=>{
+    $("#view-"+k).classList.toggle("hidden", k!==id);
+  });
+  if(id==="chat"){ loadChat(); }
+  if(id==="leaderboard"){ loadLeaderboard(); }
+  if(id==="crash"){ startCrashLoop(); }
+}
+
+$("#tabs").addEventListener("click", (e)=>{
+  const t = e.target.closest(".tab"); if(!t) return;
+  showTab(t.dataset.tab);
+});
+
+async function jfetch(path, opts={}){
+  const r = await fetch(path, Object.assign({headers:{'Content-Type':'application/json'}}, opts));
   if(!r.ok){
-    let t = await r.text().catch(()=> '');
-    try{ const js = JSON.parse(t); throw new Error(js.detail || js.message || t || r.statusText); }
-    catch{ throw new Error(t || r.statusText); }
+    const text = await r.text();
+    throw new Error(text || (r.status+" "+r.statusText));
   }
-  const ct = r.headers.get('content-type')||'';
-  return ct.includes('application/json') ? r.json() : r.text();
+  const ctype = r.headers.get("content-type") || "";
+  if(ctype.includes("application/json")) return r.json();
+  return r.text();
+}
+
+async function refreshMe(){
+  try{
+    ME = await jfetch("/me");
+    $("#btnLogin").classList.add("hidden");
+    $("#btnLogout").classList.remove("hidden");
+    $("#balanceVal").textContent = fmt(ME.balance);
+    $("#btnReferral").classList.remove("hidden");
+    $("#refLink").textContent = location.origin + "/ref/" + (ME.name_lower || "me");
+  }catch{
+    ME = null;
+    $("#btnLogin").classList.remove("hidden");
+    $("#btnLogout").classList.add("hidden");
+    $("#btnReferral").classList.add("hidden");
+    $("#balanceVal").textContent = "0.00";
+    $("#refLink").textContent = "—";
+  }
+}
+
+$("#btnLogin").onclick = ()=> location.href = "/login";
+$("#btnLogout").onclick = async ()=>{ await jfetch("/logout"); await refreshMe(); }
+$("#btnJoin").onclick = ()=> location.href = "/login/join";
+
+$("#btnCopyRef").onclick = async ()=>{
+  const text = $("#refLink").textContent;
+  try{ await navigator.clipboard.writeText(text); alert("Copied!"); }catch(e){ alert(text); }
 };
-const GEM = "💎"; const fmtDL = (n)=> `${GEM} ${(Number(n)||0).toFixed(2)} DL`;
-const pages = ['page-games','page-crash','page-mines','page-ref','page-promo','page-lb','page-settings','page-profile','page-limbo','page-towers','page-keno','page-plinko','page-blackjack','page-pump','page-coinflip'];
-function showOnly(id){
-  for(const p of pages){ const el = qs(p); if(el) el.style.display = (p===id) ? '' : 'none'; }
-  const map = {'page-games':'tab-games','page-ref':'tab-ref','page-promo':'tab-promo','page-lb':'tab-lb','page-settings':'tab-settings'};
-  for(const t of ['tab-games','tab-ref','tab-promo','tab-lb','tab-settings']){
-    const el = qs(t); if(el) el.classList.toggle('active', map[id]===t);
-  }
-}
-async function renderHeader(){
-  try{
-    const me = await j('/api/me');
-    const bal = await j('/api/balance');
-    qs('authArea').innerHTML = `<span class="chip">Balance: <strong>${fmtDL(bal.balance)}</strong></span><a class="btn ghost" id="btnProfile">Profile</a><img class="avatar" id="btnLogout" src="${me.avatar_url||''}" title="${me.username||'user'}"/>`;
-    qs('btnProfile').onclick = ()=>{ showOnly('page-profile'); renderProfile(); };
-    qs('btnLogout').onclick = ()=>{ location.href = '/logout'; };
-  }catch(_){
-    qs('authArea').innerHTML = `<a class="btn primary" href="/login">Login with Discord</a>`;
-  }
-}
-qs('homeLink').onclick = (e)=>{ e.preventDefault(); showOnly('page-games'); };
-qs('tab-games').onclick = ()=> showOnly('page-games');
-qs('tab-ref').onclick = ()=> showOnly('page-ref');
-qs('tab-promo').onclick = ()=> { showOnly('page-promo'); renderPromo(); };
-qs('tab-lb').onclick = ()=> { showOnly('page-lb'); refreshLeaderboard(); };
-qs('tab-settings').onclick = ()=> { showOnly('page-settings'); loadSettings(); };
+$("#btnReferral").onclick = ()=> $("#view-promos").scrollIntoView({behavior:"smooth"});
 
-// Promo
-async function renderPromo(){
-  try{
-    const my = await j('/api/promo/my');
-    qs('myCodes').innerHTML = (my.rows && my.rows.length)
-      ? '<table><thead><tr><th>Code</th><th>Redeemed</th></tr></thead><tbody>' +
-        my.rows.map(r=>`<tr><td>${r.code}</td><td>${new Date(r.redeemed_at).toLocaleString()}</td></tr>`).join('') +
-        '</tbody></table>' : '—';
-  }catch(_){}
+async function loadLeaderboard(){
+  const period = $("#lbPeriod").value;
+  const rows = await jfetch(`/leaderboard?period=${encodeURIComponent(period)}`);
+  const tbody = $("#lbTable tbody");
+  tbody.innerHTML = "";
+  rows.forEach((r,i)=>{
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${i+1}</td><td>${r.is_anon?"Anonymous":r.display_name}</td><td>${fmt(r.total_wagered)}</td>`;
+    tbody.appendChild(tr);
+  });
 }
-qs('redeemBtn').onclick = async ()=>{
-  const code = qs('promoInput').value.trim();
-  qs('promoMsg').textContent = '';
+$("#btnLbRefresh").onclick = loadLeaderboard;
+
+async function loadChat(){
   try{
-    const r = await j('/api/promo/redeem', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ code }) });
-    qs('promoMsg').textContent = 'Redeemed! New balance: ' + fmtDL(r.new_balance);
-    renderHeader(); renderPromo();
-  }catch(e){ qs('promoMsg').textContent = e.message; }
+    const lines = await jfetch(`/chat?since_id=${CHAT_SINCE}`);
+    const box = $("#chatBox");
+    lines.forEach(l=>{
+      CHAT_SINCE = Math.max(CHAT_SINCE, l.id);
+      const div = document.createElement("div");
+      div.className = "chat-line" + (ME && ME.id === l.user_id ? " me":"");
+      div.innerHTML = `<div><div class="chat-meta">[Lv${l.level}] ${(l.role||"").toUpperCase()} • ${l.username}</div><div>${escapeHtml(l.text)}</div></div>`;
+      box.appendChild(div);
+    });
+    box.scrollTop = box.scrollHeight;
+  }catch(e){}
+}
+setInterval(loadChat, 2000);
+
+$("#btnChatSend").onclick = async ()=>{
+  const t = $("#chatInput").value.trim(); if(!t) return;
+  $("#chatInput").value = "";
+  try{ await jfetch("/chat", {method:"POST", body:JSON.stringify({text:t})}); }catch(e){ alert(e.message); }
 };
 
-// Referral
-(async ()=>{ try{
-  const st = await j('/api/referral/state');
-  qs('refContent').innerHTML = `Your referral name: <strong>${(st && st.name) ? st.name : '—'}</strong>`;
-}catch(_){ qs('refContent').textContent='—'; } })();
+function escapeHtml(s){ return s.replace(/[&<>"]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
 
-// Profile & Owner Panel
-async function renderProfile(){
+// Promos
+$("#btnRedeem").onclick = async ()=>{
+  const code = $("#promoCode").value.trim(); if(!code) return;
   try{
-    const p = await j('/api/profile');
-    const role = p.role || 'member';
-    const isOwner = (role==='owner') || (String(p.id||'') === String('__OWNER_ID__'));
-    qs('profileBox').innerHTML = `
-      <div class="games-grid" style="grid-template-columns:1fr 1fr 1fr">
-        <div class="card"><div class="label">Level</div><div class="big">Lv ${p.level}</div><div class="muted">${p.xp} XP • ${p.progress_pct}% to next</div></div>
-        <div class="card"><div class="label">Balance</div><div class="big">${fmtDL(p.balance)}</div></div>
-        <div class="card"><div class="label">Role</div><div class="big" style="text-transform:uppercase">${role}</div></div>
-      </div>
-      <div class="hint" style="margin-top:8px">Visit Settings to enable Anonymous mode.</div>
-    `;
-    qs('ownerPanel').style.display = isOwner ? '' : 'none';
-
-    if(isOwner){
-      qs('tApply').onclick = async ()=>{
-        qs('tMsg').textContent='';
-        try{
-          const r = await j('/api/admin/adjust',{ method:'POST', headers:{'Content-Type':'application/json'},
-            body: JSON.stringify({ identifier: qs('tIdent').value.trim(), amount: qs('tAmt').value.trim(), reason: qs('tReason').value.trim() })});
-          qs('tMsg').textContent = 'OK. New balance: ' + fmtDL(r.new_balance); renderHeader();
-        }catch(e){ qs('tMsg').textContent = e.message; }
-      };
-      qs('rAdmin').onclick = ()=> setRole('admin');
-      qs('rMember').onclick = ()=> setRole('member');
-      async function setRole(role){
-        qs('rMsg').textContent='';
-        try{
-          await j('/api/admin/role',{ method:'POST', headers:{'Content-Type':'application/json'},
-            body: JSON.stringify({ identifier: qs('rIdent').value.trim(), role })});
-          qs('rMsg').textContent = 'Role updated.'; 
-        }catch(e){ qs('rMsg').textContent = e.message; }
-      }
-      qs('xSite').onclick = ()=> timeout('site');
-      qs('xBoth').onclick = ()=> timeout('both');
-      async function timeout(which){
-        qs('xMsg').textContent='';
-        try{
-          const payload = { identifier: qs('xIdent').value.trim(), seconds: parseInt(qs('xSecs').value||'600',10), reason: qs('xReason').value.trim() };
-          const url = which==='both' ? '/api/admin/timeout_both' : '/api/admin/timeout_site';
-          await j(url, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
-          qs('xMsg').textContent='Timeout set.';
-        }catch(e){ qs('xMsg').textContent = e.message; }
-      }
-      qs('cMake').onclick = async ()=>{
-        qs('cMsg').textContent='';
-        try{
-          const r = await j('/api/admin/promo/create',{ method:'POST', headers:{'Content-Type':'application/json'},
-            body: JSON.stringify({ code: (qs('cCode').value||'').trim() || null, amount: qs('cAmount').value.trim(), max_uses: parseInt(qs('cMax').value||'1',10)||1 })});
-          qs('cMsg').textContent = 'Created: ' + r.code;
-        }catch(e){ qs('cMsg').textContent = e.message; }
-      };
-    }
-  }catch(_){ qs('profileBox').textContent = '—'; }
-}
-
-// Settings
-async function loadSettings(){
-  qs('setMsg').textContent='';
-  try{ const r = await j('/api/settings/get'); qs('anonToggle').checked = !!(r && r.is_anon); }catch(_){}
-}
-qs('anonToggle').addEventListener('change', async (e)=>{
-  qs('setMsg').textContent='';
-  try{
-    const r = await j('/api/settings/set_anon', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ is_anon: !!e.target.checked }) });
-    qs('setMsg').textContent = r && r.ok ? 'Saved.' : 'Updated.';
-  }catch(err){ qs('setMsg').textContent = err.message; }
-});
-
-// Leaderboard
-const lbWrap = ()=> qs('lbWrap'); let lbPeriod = 'daily', lbMe = null;
-function setLbButtons(){
-  const btns = Array.from(qs('lbSeg').querySelectorAll('button'));
-  btns.forEach(b=> b.classList.toggle('active', b.dataset.period===lbPeriod));
-}
-function nextUtcMidnight(){
-  const now = new Date();
-  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()+1, 0,0,0,0));
-}
-function endOfUtcMonth(){
-  const now = new Date();
-  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth()+1, 1, 0,0,0,0));
-}
-function renderLbCountdown(){
-  const el = qs('lbCountdown');
-  if(lbPeriod==='alltime'){ el.textContent='No expiry'; return; }
-  const target = (lbPeriod==='daily') ? nextUtcMidnight() : endOfUtcMonth();
-  const tick = ()=>{
-    const diff = target - new Date();
-    if(diff <= 0){ el.textContent = 'Resets soon'; return; }
-    const s = Math.floor(diff/1000);
-    const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), ss = s%60;
-    el.textContent = `Resets in ${h}h ${m}m ${ss}s (UTC)`;
-  };
-  tick(); if(window._lbTimer) clearInterval(window._lbTimer); window._lbTimer = setInterval(tick, 1000);
-}
-async function refreshLeaderboard(){
-  try{
-    const me = await j('/api/me').catch(()=>null);
-    lbMe = me && me.id ? String(me.id) : null;
-  }catch(_){}
-  setLbButtons(); renderLbCountdown();
-  lbWrap().textContent = 'Loading…';
-  try{
-    const r = await j(`/api/leaderboard?period=${lbPeriod}`);
-    const rows = r.rows || [];
-    if(!rows.length){ lbWrap().textContent='—'; return; }
-    lbWrap().innerHTML = `
-      <table>
-        <thead><tr><th>#</th><th>User</th><th>Total Wagered</th></tr></thead>
-        <tbody>
-          ${rows.map((row, i)=>{
-            const meRow = (lbMe && String(row.user_id)===lbMe);
-            const cls = [ meRow ? 'me-row' : '', row.is_anon ? 'anon' : '' ].filter(Boolean).join(' ');
-            const name = row.is_anon && !meRow ? 'Anonymous' : row.display_name;
-            const amt = (row.is_anon && !meRow) ? '—' : fmtDL(row.total_wagered);
-            return `<tr class="${cls}"><td>${i+1}</td><td class="name">${name}</td><td>${amt}</td></tr>`;
-          }).join('')}
-        </tbody>
-      </table>
-    `;
-  }catch(e){ lbWrap().textContent = e.message || 'Error'; }
-}
-qs('lbSeg').addEventListener('click', (e)=>{
-  const b = e.target.closest('button'); if(!b) return;
-  lbPeriod = b.dataset.period; refreshLeaderboard();
-});
-
-// Modal helpers
-const pm = qs('pm'); const openPm = ()=> pm.style.display='flex'; const closePm = ()=> pm.style.display='none';
-qs('pmClose').onclick = closePm; pm.addEventListener('click',(e)=>{ if(e.target===pm) closePm(); });
-
-// Crash JS
-const pgCrash = qs('page-crash'); const crNow = qs('crNow'), crHint = qs('crHint'), lastBusts = qs('lastBusts'), crMsg = qs('crMsg');
-const crCanvas = qs('crCanvas'), crBoom = qs('crBoom'); let haveActiveBet = false
-# (continuation of the HTML <script>… you pasted)
-function drawCurve(mult){
-  const ctx = crCanvas.getContext('2d');
-  const w = crCanvas.width = crCanvas.clientWidth * window.devicePixelRatio;
-  const h = crCanvas.height = crCanvas.clientHeight * window.devicePixelRatio;
-  ctx.clearRect(0,0,w,h);
-  ctx.lineWidth = 3; ctx.strokeStyle = '#6aa6ff';
-  ctx.beginPath();
-  const maxX = Math.min(mult, 10.0);
-  for(let i=0;i<=200;i++){
-    const t = i/200 * maxX;
-    const x = (i/200) * w;
-    const y = h - (Math.log(1+t) / Math.log(1+maxX)) * h * 0.92 - h*0.04;
-    if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
-  }
-  ctx.stroke();
-}
-function boomAt(x,y){
-  crBoom.style.setProperty('--x', (x*100)+'%');
-  crBoom.style.setProperty('--y', (y*100)+'%');
-  crBoom.classList.remove('bang'); void crBoom.offsetWidth; crBoom.classList.add('bang');
-}
-async function refreshCrash(){
-  try{
-    const s = await j('/api/crash/state');
-    if(s.phase==='betting'){
-      crHint.textContent = 'Betting… next round soon';
-      crNow.textContent = '1.00×'; drawCurve(1.0);
-    }else if(s.phase==='running'){
-      const m = s.current_multiplier || 1.0;
-      crHint.textContent = 'Running';
-      crNow.textContent = m.toFixed(2) + '×';
-      drawCurve(m);
-    }else{
-      crHint.textContent = 'Ended';
-      crNow.textContent = (s.bust||0).toFixed(2)+'×';
-      drawCurve(s.bust || 1.0); boomAt(0.92, 0.2);
-    }
-    if(s.last_busts && s.last_busts.length){
-      lastBusts.innerHTML = s.last_busts.map(b=>`<span class="chip" style="margin-right:6px">${b.toFixed(2)}×</span>`).join('');
-    }
-    if(s.your_bet){
-      haveActiveBet = !s.your_bet.resolved && (s.your_bet.cashed_out==null);
-      qs('crCashout').style.display = haveActiveBet ? '' : 'none';
-    }else qs('crCashout').style.display='none';
-
-    try{
-      const h = await j('/api/crash/history');
-      const rows = h.rows||[];
-      qs('crLast').innerHTML = rows.length
-        ? `<table><thead><tr><th>When</th><th>Bet</th><th>Cashout</th><th>Bust</th><th>Win</th></tr></thead>
-           <tbody>${rows.map(r=>`<tr><td>${new Date(r.created_at).toLocaleString()}</td><td>${fmtDL(r.bet)}</td><td>${r.cashout.toFixed(2)}×</td><td>${r.bust.toFixed(2)}×</td><td>${fmtDL(r.win)}</td></tr>`).join('')}</tbody></table>`
-        : '—';
-    }catch(_){}
-  }catch(e){
-    crHint.textContent = 'Error loading state';
-  }
-}
-qs('crPlace').onclick = async ()=>{
-  crMsg.textContent = '';
-  try{
-    const bet = parseFloat(qs('crBet').value||'0');
-    const cashStr = qs('crCash').value.trim();
-    const cashout = cashStr ? parseFloat(cashStr) : 2.0;
-    const body = { bet: String(bet), cashout };
-    await j('/api/crash/place', { method:'POST', headers:{'Content-Type': 'application/json'}, body: JSON.stringify(body) });
-    crMsg.textContent = 'Bet placed. Good luck!';
-    refreshCrash(); renderHeader();
-  }catch(e){ crMsg.textContent = e.message; }
+    const r = await jfetch("/promo/redeem", {method:"POST", body:JSON.stringify({code})});
+    $("#promoResult").textContent = `Redeemed ${code}. New balance: ${fmt(r.balance)} DL`;
+    $("#balanceVal").textContent = fmt(r.balance);
+  }catch(e){ $("#promoResult").textContent = e.message; }
 };
-qs('crCashout').onclick = async ()=>{
-  crMsg.textContent = '';
+
+// Crash
+async function updateCrash(){
+  const s = await jfetch("/crash/state");
+  $("#crashRound").textContent = s.id || "—";
+  $("#crashState").textContent = s.status;
+  $("#crashTime").textContent = s.time_label;
+  $("#crashMult").textContent = (s.multiplier? s.multiplier.toFixed(2):1).toString()+"x";
+  $("#crashStatus").textContent = s.message;
+  const list = $("#lastBusts"); list.innerHTML = "";
+  s.last_busts.forEach(v=>{
+    const b = document.createElement("span");
+    b.className="badge"; b.textContent = v.toFixed(2)+"x";
+    list.appendChild(b);
+  });
+  const hist = $("#crashHistory"); hist.innerHTML="";
+  s.history.forEach(h=>{
+    const item = document.createElement("div");
+    item.className="stat";
+    item.textContent = `Bet ${fmt(h.bet)} @ ${h.cashout.toFixed(2)}x • Bust ${h.bust.toFixed(2)}x • Win ${fmt(h.win)} DL`;
+    hist.appendChild(item);
+  });
+}
+function startCrashLoop(){
+  if(CRASH_TICK) clearInterval(CRASH_TICK);
+  updateCrash();
+  CRASH_TICK = setInterval(updateCrash, 1000);
+}
+$("#btnCrashBet").onclick = async ()=>{
+  const bet = Number($("#crashBet").value||0);
+  const cashout = Number($("#crashCashout").value||0);
   try{
-    const r = await j('/api/crash/cashout', { method:'POST' });
-    crMsg.textContent = `Cashed out at ${r.multiplier.toFixed(2)}× for ${fmtDL(r.win)}.`; haveActiveBet = false; renderHeader();
-  }catch(e){ crMsg.textContent = e.message; }
+    const r = await jfetch("/crash/bet", {method:"POST", body:JSON.stringify({bet, cashout})});
+    $("#crashStatus").textContent = `Bet placed on round ${r.round_id}`;
+  }catch(e){ alert(e.message); }
 };
-setInterval(()=>{ if(pgCrash.style.display !== 'none') refreshCrash(); }, 1000);
+$("#btnCrashCashout").onclick = async ()=>{
+  try{
+    const r = await jfetch("/crash/cashout", {method:"POST"});
+    alert(`Cashed out at ${r.multiplier.toFixed(2)}x for ${fmt(r.win)} DL`);
+  }catch(e){ alert(e.message); }
+};
 
 // Mines
-const mGrid = qs('mGrid'); let mState = null;
-function renderGridTiles(disabled=false){
-  if(!mGrid) return;
-  mGrid.innerHTML = '';
+function renderMinesBoard(revealedMask, boardString, active=true){
+  const board = $("#minesBoard");
+  board.innerHTML="";
   for(let i=0;i<25;i++){
-    const el = document.createElement('div');
-    el.className = 'tile'; el.dataset.index = i;
-    el.onclick = async ()=>{
-      if(disabled) return;
-      try{
-        const r = await j(`/api/mines/pick?index=${i}`, { method: 'POST' });
-        if(r.status === 'lost'){
-          el.classList.add('mine','explode','revealed');
-          setTimeout(()=>{ revealBoard(r.board); }, 150);
-          qs('mStatus').textContent = 'Status: Lost';
-          qs('mCash').style.display='none';
-          renderHeader(); renderMines();
-        }else{
-          el.classList.add('safe','revealed','pop');
-          qs('mPicks').textContent = 'Picks: ' + (r.picks.toString(2).match(/1/g)||[]).length;
-          qs('mMult').textContent = 'Multiplier: ' + r.multiplier.toFixed(4) + '×';
-          qs('mPotential').textContent = 'Potential: ' + fmtDL(r.potential_win);
-          qs('mStatus').textContent = 'Status: Active';
-          qs('mCash').style.display='';
-        }
-      }catch(e){ qs('mMsg').textContent = e.message; }
-    };
-    mGrid.appendChild(el);
+    const btn = document.createElement("button");
+    btn.className = "tile";
+    const revealed = (revealedMask & (1<<i))!==0;
+    if(revealed) btn.classList.add("revealed");
+    if(!active && boardString[i]==='1') btn.classList.add("mine");
+    btn.textContent = revealed ? "✓" : "";
+    btn.disabled = !active || revealed;
+    btn.onclick = ()=> pickMines(i);
+    board.appendChild(btn);
   }
 }
-function markPicked(mask){
-  for(let i=0;i<25;i++){
-    const el = mGrid.children[i];
-    if((mask>>i) & 1){ el.classList.add('safe','revealed'); el.textContent = '✓'; }
-  }
-}
-function revealBoard(board){
-  for(let i=0;i<25;i++){
-    const el = mGrid.children[i];
-    if(board[i] === '1'){ el.classList.add('mine','revealed','explode'); el.textContent = '💣'; }
-    else if(!el.classList.contains('revealed')){ el.classList.add('safe','revealed'); el.textContent = '✓'; }
-  }
-}
-async function renderMines(){
-  qs('mMsg').textContent = '';
+async function startMines(){
+  const bet = Number($("#minesBet").value||0);
+  const mines = Number($("#minesCount").value||3);
   try{
-    const s = await j('/api/mines/state');
-    if(s){
-      mState = s;
-      qs('mHash').textContent = 'Commit: ' + s.hash.slice(0,12) + '…';
-      qs('mStatus').textContent = 'Status: ' + s.status;
-      qs('mPicks').textContent = 'Picks: ' + (s.picks.toString(2).match(/1/g)||[]).length;
-      qs('mBombs').textContent = 'Mines: ' + s.mines;
-      qs('mCash').style.display = (s.status==='active') ? '' : 'none';
-      renderGridTiles(s.status!=='active'); markPicked(s.picks);
+    const r = await jfetch("/mines/start", {method:"POST", body:JSON.stringify({bet, mines})});
+    $("#minesStatus").textContent = `Game #${r.id} started • hash ${r.hash}`;
+    await minesState();
+  }catch(e){ alert(e.message); }
+}
+$("#btnMinesStart").onclick = startMines;
+async function pickMines(index){
+  try{
+    const r = await jfetch("/mines/pick", {method:"POST", body:JSON.stringify({index})});
+    if(r.status==="lost"){
+      $("#minesStatus").textContent = "Boom! You hit a mine.";
+      renderMinesBoard(0, r.board, false);
+      await minesHistory();
+      await refreshMe();
+      $("#minesControls").classList.add("hidden");
     }else{
-      mState = null;
-      qs('mHash').textContent = 'Commit: —';
-      qs('mStatus').textContent = 'Status: —';
-      qs('mPicks').textContent = 'Picks: 0';
-      qs('mBombs').textContent = 'Mines: ' + (parseInt(qs('mMines').value||'3',10));
-      qs('mCash').style.display='none';
-      renderGridTiles(false);
+      $("#minesPotential").textContent = fmt(r.potential_win);
+      renderMinesBoard(r.picks, "0".repeat(25), true);
     }
-  }catch(_){}
-  try{
-    const h = await j('/api/mines/history');
-    const rows = h.rows || [];
-    qs('mHist').innerHTML = rows.length
-      ? `<table><thead><tr><th>ID</th><th>When</th><th>Mines</th><th>Bet</th><th>Win</th><th>Status</th></tr></thead>
-         <tbody>${rows.map(r=>`<tr><td>${r.id}</td><td>${new Date(r.started_at).toLocaleString()}</td><td>${r.mines}</td><td>${fmtDL(r.bet)}</td><td>${fmtDL(r.win)}</td><td>${r.status}</td></tr>`).join('')}</tbody></table>`
-      : '—';
-  }catch(_){}
+  }catch(e){ alert(e.message); }
 }
-qs('mStart').onclick = async ()=>{
-  const bet = qs('mBet').value.trim();
-  const mines = parseInt(qs('mMines').value||'3',10);
-  qs('mMsg').textContent = '';
+$("#btnMinesCashout").onclick = async ()=>{
   try{
-    const r = await j('/api/mines/start',{ method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ bet, mines }) });
-    qs('mHash').textContent = 'Commit: ' + r.hash.slice(0,12) + '…';
-    qs('mStatus').textContent = 'Status: active';
-    qs('mPicks').textContent = 'Picks: 0';
-    qs('mBombs').textContent = 'Mines: ' + mines;
-    qs('mCash').style.display = '';
-    renderGridTiles(false); renderHeader();
-  }catch(e){ qs('mMsg').textContent = e.message; }
+    const r = await jfetch("/mines/cashout", {method:"POST"});
+    $("#minesStatus").textContent = `Cashed: +${fmt(r.win)} DL`;
+    renderMinesBoard(0, r.board, false);
+    await refreshMe();
+    await minesHistory();
+    $("#minesControls").classList.add("hidden");
+  }catch(e){ alert(e.message); }
 };
-qs('mCash').onclick = async ()=>{
-  qs('mMsg').textContent = '';
-  try{
-    const r = await j('/api/mines/cashout', { method:'POST' });
-    qs('mStatus').textContent = 'Status: cashed';
-    qs('mMsg').textContent = 'Cashed out for ' + fmtDL(r.win);
-    revealBoard(r.board);
-    qs('mCash').style.display='none';
-    renderHeader(); renderMines();
-  }catch(e){ qs('mMsg').textContent = e.message; }
-};
-
-// Chat
-const chatDrawer = qs('chatDrawer'), fabChat = qs('fabChat'), chatBody = qs('chatBody'), chatDisabled = qs('chatDisabled');
-const chatText = qs('chatText'); const chatSend = qs('chatSend'); const chatNote = qs('chatNote');
-const chatClose = qs('chatClose');
-fabChat.onclick = ()=>{ chatDrawer.classList.add('open'); };
-chatClose.onclick = ()=>{ chatDrawer.classList.remove('open'); };
-let chatSince = 0; let chatTimer = null; let meCache = null;
-function badge(role){ role = (role||'member').toLowerCase(); return `<span class="badge ${role}">${role.toUpperCase()}</span>`; }
-function levelChip(lv){ return `<span class="level">Lv ${lv||1}</span>`; }
-function appendMessages(list){
-  for(const m of (list||[])){
-    const row = document.createElement('div'); row.className = 'msg'; row.dataset.id = m.id;
-    row.innerHTML = `
-      <div class="msghead">
-        <span class="user-link" data-uid="${m.user_id}">${m.username}</span>
-        ${badge(m.role)} ${levelChip(m.level)}
-        <span class="time">${new Date(m.created_at).toLocaleTimeString()}</span>
-      </div>
-      <div class="text">${escapeHtml(m.text)}</div>
-    `;
-    chatBody.appendChild(row); chatBody.scrollTop = chatBody.scrollHeight;
-    chatSince = Math.max(chatSince, m.id);
-  }
+async function minesState(){
+  const s = await jfetch("/mines/state");
+  if(!s){ $("#minesStatus").textContent = "No active game."; $("#minesControls").classList.add("hidden"); $("#minesBoard").innerHTML=""; return;}
+  $("#minesControls").classList.remove("hidden");
+  $("#minesBetShow").textContent = fmt(s.bet);
+  $("#minesCountShow").textContent = s.mines;
+  $("#minesStatus").textContent = `Active game #${s.id} • hash ${s.hash}`;
+  renderMinesBoard(s.picks, "0".repeat(25), true);
 }
-function escapeHtml(s){ return (s||'').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-async function chatPoll(){ try{ const r = await j(`/api/chat/fetch?since=${chatSince}`); appendMessages(r.rows || r); }catch(_){} }
-async function renderChatHeader(){ try{ const prof = await j('/api/profile'); meCache = prof; chatNote.textContent = `Lv ${prof.level} — ${prof.role.toUpperCase()}`; }catch(_){} }
-chatTimer = setInterval(()=>{ if(chatDrawer.classList.contains('open')) chatPoll(); }, 1500);
-chatBody.addEventListener('click',(e)=>{ const el = e.target.closest('.user-link'); if(!el) return; openProfileModal(el.dataset.uid); });
-async function openProfileModal(uid){
-  try{
-    const p = await j(`/api/public_profile?user_id=${encodeURIComponent(uid)}`);
-    qs('pmTitle').textContent = 'Profile — ' + p.name;
-    qs('pmBody').innerHTML = `
-      <div class="games-grid" style="grid-template-columns:1fr 1fr">
-        <div class="card"><div class="label">Role</div><div>${(p.role||'member').toUpperCase()}</div></div>
-        <div class="card"><div class="label">Level / XP</div><div>Lv ${p.level} — ${p.xp} XP</div></div>
-        <div class="card"><div class="label">Balance</div><div>${fmtDL(p.balance)}</div></div>
-        <div class="card"><div class="label">Stats</div><div>Crash: ${p.crash_games} • Mines: ${p.mines_games}</div></div>
-      </div>
-      <div class="muted" style="margin-top:8px">Joined: ${new Date(p.created_at).toLocaleString()}</div>
-    `;
-    openPm();
-  }catch(_){}
+async function minesHistory(){
+  const list = $("#minesHistory"); list.innerHTML="";
+  const rows = await jfetch("/mines/history");
+  rows.forEach(r=>{
+    const d = document.createElement("div");
+    d.className="stat";
+    d.textContent = `#${r.id} • ${r.status.toUpperCase()} • Bet ${fmt(r.bet)} • Mines ${r.mines} • Win ${fmt(r.win)} DL`;
+    list.appendChild(d);
+  });
 }
-chatSend.onclick = async ()=>{
+
+// Profile
+$("#btnSetName").onclick = async ()=>{
+  const name = $("#newName").value.trim();
+  if(!name) return;
   try{
-    const txt = (chatText.value||'').trim(); if(!txt) return;
-    await j('/api/chat/send', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ text: txt }) });
-    chatText.value = ''; chatPoll();
-  }catch(e){
-    chatDisabled.style.display = ''; chatDisabled.textContent = e.message || 'Cannot send';
-    setTimeout(()=>{ chatDisabled.style.display='none'; }, 3500);
-  }
+    const r = await jfetch("/name", {method:"POST", body:JSON.stringify({name})});
+    alert("Updated name to "+r.name);
+    await refreshMe();
+    updateProfile();
+  }catch(e){ alert(e.message); }
 };
+$("#btnToggleAnon").onclick = async ()=>{
+  try{
+    const r = await jfetch("/anon", {method:"POST", body:JSON.stringify({toggle:true})});
+    alert("Anonymous mode: "+(r.is_anon?"ON":"OFF"));
+    await updateProfile();
+  }catch(e){ alert(e.message); }
+};
+async function updateProfile(){
+  if(!ME){ $("#meInfo").innerHTML = "<div class='notice'>Not logged in.</div>"; return; }
+  const fresh = await jfetch("/me");
+  $("#balanceVal").textContent = fmt(fresh.balance);
+  $("#meInfo").innerHTML = `
+    <div>Display name: <span class="code">${fresh.display_name}</span> ${fresh.is_anon?'<span class="badge">Anon</span>':''}</div>
+    <div>Level: <span class="code">${fresh.level}</span> (${fresh.xp} XP)</div>
+    <div>Your referral link: <span class="code copy" id="copyRef">${location.origin}/ref/${fresh.name_lower}</span></div>
+  `;
+  $("#copyRef").onclick = async ()=>{
+    try{ await navigator.clipboard.writeText(location.origin+"/ref/"+fresh.name_lower); alert("Copied!"); }catch(e){ alert("Copy failed."); }
+  };
+}
 
-// Navigation
-qs('openCrash').onclick=()=>{ showOnly('page-crash'); refreshCrash(); };
-qs('openMines').onclick=()=>{ showOnly('page-mines'); renderMines(); };
-qs('backToGames').onclick=()=> showOnly('page-games');
-qs('backToGames2').onclick=()=> showOnly('page-games');
+// Init
+(async ()=>{
+  await refreshMe();
+  await loadLeaderboard();
+  await minesHistory();
+  await minesState();
+  startCrashLoop();
+  updateProfile();
+})();
 
-// Boot
-renderHeader(); renderChatHeader();
+// Referral cookie helper
+(function setRefFromQuery(){
+  const m = location.search.match(/[?&]ref=([a-z0-9_-]{3,20})/i);
+  if(m){ document.cookie = "ref_src="+encodeURIComponent(m[1])+"; max-age="+(30*86400)+"; path=/"; }
+})();
+
 </script>
 </body></html>
 """
-HTML_TEMPLATE = HTML_TEMPLATE.replace("__OWNER_ID__", str(OWNER_ID))
 
-# ---------- OAuth & Session Routes ----------
-def _discord_avatar_url(user: dict) -> str:
-    uid = user.get("id")
-    avatar = user.get("avatar")
-    if uid and avatar:
-        return f"https://cdn.discordapp.com/avatars/{uid}/{avatar}.png"
-    # default avatar (computed from discriminator hash if absent)
-    try:
-        i = int(uid) % 5 if uid else 0
-    except Exception:
-        i = 0
-    return f"https://cdn.discordapp.com/embed/avatars/{i}.png"
+# ---------- OAuth & Utility ----------
+
+def _discord_oauth_url(scopes: List[str], redirect_uri: str) -> str:
+    params = {
+        "client_id": CLIENT_ID,
+        "response_type": "code",
+        "redirect_uri": redirect_uri,
+        "scope": " ".join(scopes),
+        "prompt": "consent"
+    }
+    return f"{DISCORD_API}/oauth2/authorize?{urlencode(params)}"
+
+async def _exchange_code(code: str, redirect_uri: str) -> dict:
+    async with httpx.AsyncClient(timeout=20) as cx:
+        resp = await cx.post(f"{DISCORD_API}/oauth2/token",
+                             data={
+                                 "client_id": CLIENT_ID,
+                                 "client_secret": CLIENT_SECRET,
+                                 "grant_type": "authorization_code",
+                                 "code": code,
+                                 "redirect_uri": redirect_uri,
+                             },
+                             headers={"Content-Type": "application/x-www-form-urlencoded"})
+        resp.raise_for_status()
+        return resp.json()
+
+async def _discord_me(access_token: str) -> dict:
+    async with httpx.AsyncClient(timeout=20) as cx:
+        r = await cx.get(f"{DISCORD_API}/users/@me",
+                         headers={"Authorization": f"Bearer {access_token}"})
+        r.raise_for_status()
+        return r.json()
+
+async def _guild_add_member(user_id: str, access_token: str) -> bool:
+    if not (GUILD_ID and BOT_TOKEN):
+        return False
+    async with httpx.AsyncClient(timeout=20) as cx:
+        r = await cx.put(f"{DISCORD_API}/guilds/{GUILD_ID}/members/{user_id}",
+                         json={"access_token": access_token},
+                         headers={"Authorization": f"Bot {BOT_TOKEN}"})
+        # 201 created or 204 no content are success; 200 can also occur
+        return r.status_code in (200, 201, 204)
+
+# ---------- Routes ----------
 
 @app.get("/", response_class=HTMLResponse)
-async def home():
+async def home(request: Request):
     return HTML_TEMPLATE
 
 @app.get("/login")
 async def login():
-    if not CLIENT_ID or not OAUTH_REDIRECT:
-        raise HTTPException(500, "OAuth not configured")
-    params = {
-        "client_id": CLIENT_ID,
-        "response_type": "code",
-        "redirect_uri": OAUTH_REDIRECT,
-        "scope": "identify",
-        "prompt": "none"
-    }
-    return RedirectResponse(f"{DISCORD_API}/oauth2/authorize?{urlencode(params)}")
+    return RedirectResponse(_discord_oauth_url(["identify"], OAUTH_REDIRECT or ""))
+
+@app.get("/login/join")
+async def login_join():
+    # Ask for identify + guilds.join, callback to OAUTH_JOIN_REDIRECT
+    if not (OAUTH_JOIN_REDIRECT and GUILD_ID and BOT_TOKEN):
+        # Fallback to invite if configured
+        if DISCORD_INVITE:
+            return RedirectResponse(DISCORD_INVITE)
+        raise HTTPException(400, "Join flow is not configured.")
+    return RedirectResponse(_discord_oauth_url(["identify","guilds.join"], OAUTH_JOIN_REDIRECT))
 
 @app.get("/oauth/callback")
-async def oauth_callback(request: Request, code: Optional[str] = None, error: Optional[str] = None):
-    if error: raise HTTPException(400, f"OAuth error: {error}")
-    if not code: raise HTTPException(400, "Missing code")
-    async with httpx.AsyncClient(timeout=15) as client:
-        token_r = await client.post(f"{DISCORD_API}/oauth2/token",
-            data={
-                "client_id": CLIENT_ID,
-                "client_secret": CLIENT_SECRET,
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": OAUTH_REDIRECT,
-            },
-            headers={"Content-Type":"application/x-www-form-urlencoded"})
-        token_r.raise_for_status()
-        tok = token_r.json()
-        me_r = await client.get(f"{DISCORD_API}/users/@me", headers={"Authorization": f"Bearer {tok['access_token']}"})
-        me_r.raise_for_status()
-        user = me_r.json()
+async def oauth_callback(request: Request, code: str = Query(...)):
+    tok = await _exchange_code(code, OAUTH_REDIRECT or "")
+    user = await _discord_me(tok["access_token"])
     uid = str(user["id"])
+    uname = user.get("username","user")
     ensure_profile_row(uid)
+    # If referral cookie exists, try to attach
+    ref_src = request.cookies.get("ref_src")
+    if ref_src:
+        ref_uid = find_user_id_by_name_lower(ref_src.lower())
+        if ref_uid and ref_uid != uid:
+            add_referral(ref_uid, get_profile_name(ref_uid) or ref_src, uid)
     resp = RedirectResponse("/")
-    _set_session(resp, {"id": uid, "username": user.get("username"), "avatar_url": _discord_avatar_url(user)})
+    _set_session(resp, {"id": uid, "username": uname, "token_hint": "set"})
+    return resp
+
+@app.get("/oauth/join")
+async def oauth_join(request: Request, code: str = Query(...)):
+    if not (OAUTH_JOIN_REDIRECT and GUILD_ID and BOT_TOKEN):
+        raise HTTPException(400, "Join flow is not configured.")
+    tok = await _exchange_code(code, OAUTH_JOIN_REDIRECT)
+    user = await _discord_me(tok["access_token"])
+    uid = str(user["id"])
+    uname = user.get("username","user")
+    ensure_profile_row(uid)
+    joined = await _guild_add_member(uid, tok["access_token"])
+    resp = RedirectResponse("/?joined="+("1" if joined else "0"))
+    _set_session(resp, {"id": uid, "username": uname, "token_hint": "set"})
     return resp
 
 @app.get("/logout")
@@ -1681,306 +1513,231 @@ async def logout():
     _clear_session(resp)
     return resp
 
-# ---------- API route helpers ----------
-def _get_me(request: Request) -> dict:
+# -------- Helper: auto-advance crash state on poll --------
+def _advance_crash_state():
+    r = load_round()
+    if not r:
+        ensure_betting_round()
+        return
+    now = now_utc()
+    if r["status"] == "betting" and now >= r["betting_ends_at"]:
+        begin_running(r["id"])
+        r = load_round()
+    if r["status"] == "running" and now >= r["expected_end_at"]:
+        finish_round(r["id"])
+        create_next_betting()
+
+# -------- API: Me / Profile --------
+@app.get("/me")
+async def me(request: Request):
+    try:
+        sess = _require_session(request)
+    except HTTPException:
+        raise
+    uid = str(sess["id"])
+    ensure_profile_row(uid)
+    name = get_profile_name(uid) or f"user_{uid[-4:]}"
+    info = profile_info(uid)
+    # Include name_lower for referral link convenience
+    return {
+        "id": uid,
+        "username": sess.get("username") or name,
+        "display_name": name,
+        "name_lower": name.lower(),
+        **info
+    }
+
+class NameModel(BaseModel):
+    name: str
+
+@app.post("/name")
+async def set_name(request: Request, body: NameModel):
     sess = _require_session(request)
-    return {"id": str(sess["id"]), "username": sess.get("username","user"), "avatar_url": sess.get("avatar_url","")}
+    r = set_profile_name(str(sess["id"]), body.name.strip())
+    return r
 
-def _id_from_identifier(identifier: str) -> str:
-    identifier = (identifier or "").strip()
-    m = re.match(r"<@!?(\d+)>", identifier)
-    if m: return m.group(1)
-    m = re.match(r"^(\d{6,30})$", identifier)
-    if m: return m.group(1)
-    raise HTTPException(400, "Invalid identifier")
+class AnonModel(BaseModel):
+    toggle: bool = True
 
-# ---------- API: Me / Balance / Profile ----------
-@app.get("/api/me")
-async def api_me(request: Request):
-    return _get_me(request)
+@app.post("/anon")
+async def anon(request: Request, body: AnonModel):
+    sess = _require_session(request)
+    cur = public_profile(str(sess["id"]))  # ensures row exists
+    new = set_profile_is_anon(str(sess["id"]), not bool(cur and cur.get("is_anon")))
+    return new
 
-@app.get("/api/balance")
-async def api_balance(request: Request):
-    uid = _require_session(request)["id"]
-    return {"balance": float(get_balance(uid))}
-
-@app.get("/api/profile")
-async def api_profile(request: Request):
-    uid = _require_session(request)["id"]
-    return profile_info(uid)
-
-@app.get("/api/public_profile")
-async def api_public_profile(user_id: str = Query(...)):
-    p = public_profile(user_id)
-    if not p: raise HTTPException(404, "Not found")
-    return p
-
-# ---------- API: Settings ----------
-class AnonIn(BaseModel):
-    is_anon: bool
-
-@app.get("/api/settings/get")
-async def api_settings_get(request: Request):
-    uid = _require_session(request)["id"]
-    cur = profile_info(uid)  # includes is_anon
-    return {"is_anon": bool(cur.get("is_anon", False))}
-
-@app.post("/api/settings/set_anon")
-async def api_settings_set_anon(request: Request, body: AnonIn):
-    uid = _require_session(request)["id"]
-    return set_profile_is_anon(uid, body.is_anon)
-
-# ---------- API: Promo ----------
-class PromoIn(BaseModel):
+# -------- API: Promo --------
+class PromoRedeem(BaseModel):
     code: str
 
-@app.post("/api/promo/redeem")
-async def api_promo_redeem(request: Request, body: PromoIn):
-    uid = _require_session(request)["id"]
+@app.post("/promo/redeem")
+async def promo_redeem(request: Request, body: PromoRedeem):
+    sess = _require_session(request)
     try:
-        new_bal = redeem_promo(uid, body.code)
-        return {"ok": True, "new_balance": float(new_bal)}
+        bal = redeem_promo(str(sess["id"]), body.code)
+        return {"ok": True, "balance": float(bal)}
+    except PromoAlreadyRedeemed as e:
+        raise HTTPException(400, str(e))
     except PromoInvalid as e:
         raise HTTPException(400, str(e))
     except PromoExpired as e:
         raise HTTPException(400, str(e))
     except PromoExhausted as e:
         raise HTTPException(400, str(e))
-    except PromoAlreadyRedeemed as e:
-        raise HTTPException(400, str(e))
 
-@app.get("/api/promo/my")
-async def api_promo_my(request: Request):
-    uid = _require_session(request)["id"]
-    @with_conn
-    def _rows(cur, user_id):
-        cur.execute("SELECT code, redeemed_at FROM promo_redemptions WHERE user_id=%s ORDER BY redeemed_at DESC LIMIT 50", (user_id,))
-        return [{"code": r[0], "redeemed_at": r[1].isoformat()} for r in cur.fetchall()]
-    return {"rows": _rows(uid)}
+# -------- API: Referrals --------
+@app.get("/ref/{name_lower}")
+async def ref_touch(name_lower: str):
+    # Set a cookie and bounce home
+    resp = RedirectResponse("/")
+    resp.set_cookie("ref_src", value=name_lower.lower(), max_age=30*86400, samesite="lax")
+    return resp
 
-# ---------- API: Referral (stub) ----------
-@app.get("/api/referral/state")
-async def api_referral_state(request: Request):
-    uid = _require_session(request)["id"]
-    name = get_profile_name(uid)
-    return {"name": name}
-
-# ---------- API: Crash ----------
-class PlaceBetIn(BaseModel):
-    bet: str
-    cashout: Optional[float] = None
-
-@app.get("/api/crash/state")
-async def api_crash_state(request: Request):
-    uid = _require_session(request)["id"]
-    # progress engine
-    rd = load_round()
-    now = now_utc()
-    if not rd:
-        ensure_betting_round()  # creates a betting round
-        rd = load_round()
-    # transition if needed
-    if rd["status"] == "betting" and now >= rd["betting_ends_at"]:
-        begin_running(rd["id"])
-        rd = load_round()
-    if rd["status"] == "running" and now >= rd["expected_end_at"]:
-        finish_round(rd["id"])
-        create_next_betting()
-        rd = load_round()
-
-    phase = "betting" if rd["status"]=="betting" else ("running" if rd["status"]=="running" else "ended")
-    current = None
-    if phase=="running":
-        current = current_multiplier(rd["started_at"], rd["expected_end_at"], rd["bust"], now)
-    yb = your_bet(rd["id"], uid) if rd["id"] else None
-    return {
-        "phase": phase,
-        "bust": rd.get("bust"),
-        "current_multiplier": current,
-        "last_busts": last_busts(15),
-        "your_bet": yb
-    }
-
-@app.post("/api/crash/place")
-async def api_crash_place(request: Request, body: PlaceBetIn):
-    uid = _require_session(request)["id"]
-    bet = q2(D(body.bet))
-    cash = float(body.cashout or 2.0)
-    if cash < 1.01: raise HTTPException(400, "Cashout must be ≥ 1.01×")
-    try:
-        r = place_bet(uid, bet, cash)
-        return {"ok": True, "round_id": r["round_id"]}
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-
-@app.post("/api/crash/cashout")
-async def api_crash_cashout(request: Request):
-    uid = _require_session(request)["id"]
-    try:
-        r = cashout_now(uid)
-        return r
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-
-@app.get("/api/crash/history")
-async def api_crash_history(request: Request):
-    uid = _require_session(request)["id"]
-    return {"rows": your_history(uid)}
-
-# ---------- API: Mines ----------
-class MinesStartIn(BaseModel):
-    bet: str
-    mines: int
-
-@app.get("/api/mines/state")
-async def api_mines_state(request: Request):
-    uid = _require_session(request)["id"]
-    s = mines_state(uid)
-    return s or {}
-
-@app.post("/api/mines/start")
-async def api_mines_start(request: Request, body: MinesStartIn):
-    uid = _require_session(request)["id"]
-    try:
-        r = mines_start(uid, q2(D(body.bet)), int(body.mines))
-        return r
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-
-@app.post("/api/mines/pick")
-async def api_mines_pick(request: Request, index: int = Query(..., ge=0, le=24)):
-    uid = _require_session(request)["id"]
-    try:
-        return mines_pick(uid, index)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-
-@app.post("/api/mines/cashout")
-async def api_mines_cashout(request: Request):
-    uid = _require_session(request)["id"]
-    try:
-        return mines_cashout(uid)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-
-@app.get("/api/mines/history")
-async def api_mines_history(request: Request, limit: int = Query(15, ge=1, le=100)):
-    uid = _require_session(request)["id"]
-    return {"rows": mines_history(uid, limit)}
-
-# ---------- API: Chat ----------
-class ChatIn(BaseModel):
-    text: str
-
-@app.get("/api/chat/fetch")
-async def api_chat_fetch(request: Request, since: int = Query(0, ge=0), limit: int = Query(50, ge=1, le=200)):
-    maybe = request.cookies.get("session")
-    uid = None
-    if maybe:
-        try:
-            uid = SER.loads(maybe).get("id")
-        except BadSignature:
-            uid = None
-    rows = chat_fetch(since, limit, uid)
-    return {"rows": rows}
-
-@app.post("/api/chat/send")
-async def api_chat_send(request: Request, body: ChatIn):
+@app.get("/referrals/count")
+async def referrals_count(request: Request):
     sess = _require_session(request)
-    uid = sess["id"]; username = sess.get("username","user")
-    txt = (body.text or "").strip()
-    # Quick command: .tip <uid> <amount>
-    if txt.startswith(".tip "):
-        parts = txt.split()
-        if len(parts) >= 3:
-            target = parts[1]; amt = parts[2]
-            try:
-                tip_transfer(uid, _id_from_identifier(target), q2(D(amt)))
-                return {"ok": True, "tip": True}
-            except Exception as e:
-                raise HTTPException(400, f"Tip failed: {e}")
+    cnt = referrals_count_for(str(sess["id"]))
+    return {"count": cnt}
+
+# -------- API: Chat --------
+@app.get("/chat")
+async def chat_get(request: Request, since_id: int = 0, limit: int = 50):
+    uid = None
     try:
-        r = chat_insert(uid, username, txt)
+        uid = str(_require_session(request)["id"])
+    except HTTPException:
+        uid = None
+    return chat_fetch(since_id, min(200, max(1, limit)), uid)
+
+class ChatMsg(BaseModel):
+    text: str
+    private_to: Optional[str] = None
+
+@app.post("/chat")
+async def chat_post(request: Request, body: ChatMsg):
+    sess = _require_session(request)
+    name = get_profile_name(str(sess["id"])) or sess.get("username") or "user"
+    try:
+        r = chat_insert(str(sess["id"]), name, body.text, body.private_to)
         return r
     except PermissionError as e:
         raise HTTPException(403, str(e))
     except ValueError as e:
         raise HTTPException(400, str(e))
 
-@app.post("/api/chat/delete")
-async def api_chat_delete(request: Request, id: int = Query(..., ge=1)):
-    uid = _require_session(request)["id"]
-    role = get_role(uid)
-    if role not in ("admin","owner"): raise HTTPException(403, "Admin only")
-    return chat_delete(id)
+# -------- API: Crash --------
+@app.get("/crash/state")
+async def crash_state(request: Request):
+    _advance_crash_state()
+    r = load_round()
+    if not r:
+        rid, _ = ensure_betting_round()
+        r = load_round()
+    now = now_utc()
+    status = r["status"]
+    mult = None
+    if status == "running":
+        mult = current_multiplier(r["started_at"], r["expected_end_at"], r["bust"], now)
+    msg = "Place your bets!" if status=="betting" else ("Flying…" if status=="running" else f"Busted at {r['bust']:.2f}x")
+    time_label = ""
+    if status=="betting":
+        secs = int((r["betting_ends_at"] - now).total_seconds())
+        time_label = f"bets close in {max(0,secs)}s"
+    elif status=="running":
+        secs = int((r["expected_end_at"] - now).total_seconds())
+        time_label = f"~{max(0,secs)}s to bust"
+    else:
+        time_label = "ended"
+    sess = None
+    try: sess = _require_session(request)
+    except HTTPException: pass
+    history = your_history(str(sess["id"])) if sess else []
+    return {
+        "id": r["id"],
+        "status": status,
+        "multiplier": mult,
+        "message": msg,
+        "time_label": time_label,
+        "last_busts": last_busts(),
+        "history": history
+    }
 
-# ---------- API: Admin ----------
-class AdjustIn(BaseModel):
-    identifier: str
-    amount: str
-    reason: Optional[str] = None
+class CrashBet(BaseModel):
+    bet: float
+    cashout: float
 
-class RoleIn(BaseModel):
-    identifier: str
-    role: str
-
-class TimeoutIn(BaseModel):
-    identifier: str
-    seconds: int
-    reason: Optional[str] = None
-
-class PromoCreateIn(BaseModel):
-    code: Optional[str] = None
-    amount: str
-    max_uses: int = 1
-    expires_at: Optional[str] = None
-
-def _assert_owner(request: Request) -> str:
-    uid = _require_session(request)["id"]
-    if str(uid) != str(OWNER_ID): raise HTTPException(403, "Owner only")
-    return uid
-
-@app.post("/api/admin/adjust")
-async def api_admin_adjust(request: Request, body: AdjustIn):
-    actor = _assert_owner(request)
-    target = _id_from_identifier(body.identifier)
+@app.post("/crash/bet")
+async def crash_bet(request: Request, body: CrashBet):
+    sess = _require_session(request)
     try:
-        new_bal = adjust_balance(actor, target, q2(D(body.amount)), body.reason)
-        return {"ok": True, "new_balance": float(new_bal)}
-    except Exception as e:
+        r = place_bet(str(sess["id"]), D(body.bet), float(body.cashout))
+        return r
+    except ValueError as e:
         raise HTTPException(400, str(e))
 
-@app.post("/api/admin/role")
-async def api_admin_role(request: Request, body: RoleIn):
-    _assert_owner(request)
-    target = _id_from_identifier(body.identifier)
-    return set_role(target, body.role.lower())
+@app.post("/crash/cashout")
+async def crash_cashout(request: Request):
+    sess = _require_session(request)
+    try:
+        r = cashout_now(str(sess["id"]))
+        return r
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
-@app.post("/api/admin/timeout_site")
-async def api_admin_timeout_site(request: Request, body: TimeoutIn):
-    actor = _assert_owner(request)
-    target = _id_from_identifier(body.identifier)
-    return chat_timeout_set(actor, target, max(1, int(body.seconds)), body.reason)
+# -------- API: Mines --------
+class MinesStart(BaseModel):
+    bet: float
+    mines: int
 
-@app.post("/api/admin/timeout_both")
-async def api_admin_timeout_both(request: Request, body: TimeoutIn):
-    # For now identical to site timeout; Discord moderation not implemented here.
-    actor = _assert_owner(request)
-    target = _id_from_identifier(body.identifier)
-    return chat_timeout_set(actor, target, max(1, int(body.seconds)), (body.reason or "") + " (site+discord requested)")
+class MinesPick(BaseModel):
+    index: int
 
-@app.post("/api/admin/promo/create")
-async def api_admin_promo_create(request: Request, body: PromoCreateIn):
-    actor = _assert_owner(request)
-    r = create_promo(actor, body.code, body.amount, max_uses=int(body.max_uses or 1), expires_at=body.expires_at)
-    return r
+@app.post("/mines/start")
+async def api_mines_start(request: Request, body: MinesStart):
+    sess = _require_session(request)
+    try:
+        r = mines_start(str(sess["id"]), D(body.bet), int(body.mines))
+        return r
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
-# ---------- API: Leaderboard ----------
-@app.get("/api/leaderboard")
-async def api_leaderboard(period: str = Query("daily"), limit: int = Query(50, ge=1, le=200)):
-    rows = leaderboard_rows(period, limit)
-    return {"rows": rows}
+@app.post("/mines/pick")
+async def api_mines_pick(request: Request, body: MinesPick):
+    sess = _require_session(request)
+    try:
+        r = mines_pick(str(sess["id"]), int(body.index))
+        return r
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+@app.post("/mines/cashout")
+async def api_mines_cashout(request: Request):
+    sess = _require_session(request)
+    try:
+        r = mines_cashout(str(sess["id"]))
+        return r
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+@app.get("/mines/state")
+async def api_mines_state(request: Request):
+    try:
+        sess = _require_session(request)
+    except HTTPException:
+        raise HTTPException(401, "Login required")
+    return mines_state(str(sess["id"]))
+
+@app.get("/mines/history")
+async def api_mines_history(request: Request, limit: int = 10):
+    try:
+        sess = _require_session(request)
+    except HTTPException:
+        raise HTTPException(401, "Login required")
+    return mines_history(str(sess["id"]), min(50, max(1, limit)))
+
+# ---------- Static referral utility (already handled via /ref/{name}) ----------
 
 # ---------- Run ----------
+
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=PORT)
+    uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=bool(os.getenv("RELOAD")))

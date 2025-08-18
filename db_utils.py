@@ -5,7 +5,7 @@ import psycopg
 
 getcontext().prec = 28
 
-# DB connection string
+# Environment / DB
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 # Decimal helpers
@@ -13,13 +13,16 @@ TWO = Decimal("0.01")
 def D(x):
     if isinstance(x, Decimal): return x
     return Decimal(str(x))
+
 def q2(x: Decimal) -> Decimal:
-    return D(x).quantize(TWO)
+    return D(x).quantize(TWO, rounding=ROUND_DOWN)
 
 # Time helpers
 UTC = datetime.timezone.utc
+
 def now_utc() -> datetime.datetime:
     return datetime.datetime.now(UTC)
+
 def iso(dt):
     if dt is None: return None
     return dt.astimezone(UTC).isoformat()
@@ -36,7 +39,7 @@ def with_conn(fn):
                 return res
     return wrapper
 
-# Used by games to make sure profile row exists inside their transactions
+# Ensure a profile row exists (to be used INSIDE existing transactions)
 def ensure_profile_row_cur(cur, user_id: str, owner_id_env: str = None):
     owner_id_env = str(owner_id_env or os.getenv("OWNER_ID", ""))
     role = 'owner' if str(user_id) == owner_id_env else 'member'

@@ -1,4 +1,4 @@
-# app/main.py — games removed (Crash & Mines imported from separate modules)
+# app/main.py — games removed from inline (Crash & Mines imported), banners added
 
 import os, json, asyncio, re, random, string, math, secrets, datetime, hashlib
 from urllib.parse import urlencode
@@ -1069,10 +1069,9 @@ input::placeholder{color:var(--input-ph)}input:focus{border-color:#4c78ff;box-sh
 .brand .logo{
   width:28px;height:28px;border-radius:8px;
   background-image:url('/static/GrowCBnobackground.png');
-  background-size:contain;background-position:center;background-repeat:no-repeat;
-  box-shadow:0 0 0 1px var(--border), 0 4px 10px rgba(0,0,0,.35);
+  background-size:cover;background-position:center;background-repeat:no-repeat;
+  border:1px solid var(--border)
 }
-
 .tabs{display:flex;gap:4px;align-items:center;padding:4px;border-radius:14px;background:linear-gradient(180deg,#0f1a33,#0b1326);border:1px solid var(--border)}
 .tab{padding:8px 12px;border-radius:10px;cursor:pointer;font-weight:700;white-space:nowrap;color:#d8e6ff;opacity:.85;transition:all .15s ease;display:flex;align-items:center;gap:8px}
 .tab:hover{opacity:1;transform:translateY(-1px)}.tab.active{background:linear-gradient(135deg,#3b82f6,#22c1dc);color:#051326;box-shadow:0 6px 16px rgba(59,130,246,.25);opacity:1}
@@ -1088,7 +1087,9 @@ input::placeholder{color:var(--input-ph)}input:focus{border-color:#4c78ff;box-sh
 .btn.ok{background:linear-gradient(135deg,#22c55e,#16a34a);border-color:transparent}
 .big{font-size:22px;font-weight:900}.label{font-size:12px;color:var(--muted);letter-spacing:.2px;text-transform:uppercase}.muted{color:var(--muted)}
 .games-grid{display:grid;gap:14px;grid-template-columns:1fr}@media(min-width:700px){.games-grid{grid-template-columns:1fr 1fr}}@media(min-width:1020px){.games-grid{grid-template-columns:1fr 1fr 1fr}}
-.game-card{position:relative;min-height:130px;display:flex;flex-direction:column;justify-content:flex-end;gap:4px;background:linear-gradient(180deg,#0f1a33,#0c152a);border:1px solid var(--border);border-radius:16px;padding:16px;cursor:pointer;transition:transform .08s ease, box-shadow .12s ease, border-color .12s ease, background .18s ease;overflow:hidden}
+.game-card{position:relative;min-height:130px;display:flex;flex-direction:column;justify-content:flex-end;gap:4px;border:1px solid var(--border);border-radius:16px;padding:16px;cursor:pointer;transition:transform .08s ease, box-shadow .12s ease, border-color .12s ease, background .18s ease;overflow:hidden;
+  background-size:cover;background-position:center;background-repeat:no-repeat;
+}
 .game-card:hover{transform:translateY(-2px);box-shadow:0 8px 18px rgba(0,0,0,.25)}.game-card .title{font-size:20px;font-weight:800}
 .ribbon{position:absolute;top:12px;right:-32px;transform:rotate(35deg);background:linear-gradient(135deg,#f59e0b,#fb923c);color:#1a1206;font-weight:900;padding:6px 50px;border:1px solid rgba(0,0,0,.2)}
 .cr-graph-wrap{position:relative;height:240px;background:#0e1833;border:1px solid var(--border);border-radius:16px;overflow:hidden}
@@ -1133,7 +1134,6 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
           <a class="tab" id="tab-ref">Referral</a>
           <a class="tab" id="tab-promo">Promo Codes</a>
           <a class="tab" id="tab-lb">Leaderboard</a>
-          <!-- Settings tab intentionally hidden (open from avatar menu) -->
         </div>
       </div>
       <div class="right" id="authArea"></div>
@@ -1142,50 +1142,56 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
 
   <div class="container" style="padding-top:16px">
     <!-- Games -->
-<!-- Crash -->
-<div class="game-card" id="openCrash"
-     style="background:
-       linear-gradient(180deg, rgba(10,15,30,.0), rgba(10,15,30,.65)),
-       url('/static/crash.png') center/cover no-repeat;">
-  <div class="title">🚀 Crash</div>
-  <div class="muted">Shared rounds • 10s betting • Live cashout</div>
-</div>
+    <div id="page-games">
+      <div class="card">
+        <div class="hero">
+          <div class="big">Welcome to GROWCB</div>
+          <div class="discord-cta">
+            <button class="btn ghost" id="btnJoinDiscord">Join Discord</button>
+            <a class="chip" id="btnInvite" href="__INVITE__" target="_blank" rel="noopener">Invite Link</a>
+          </div>
+        </div>
+        <div class="games-grid" style="margin-top:12px">
+          <div class="game-card" id="openCrash" style="
+            background:
+              url('/static/crash.png') center/cover no-repeat,
+              radial-gradient(600px 280px at 10% -10%, rgba(59,130,246,.25), transparent 60%);
+          ">
+            <div class="title">🚀 Crash</div><div class="muted">Shared rounds • 10s betting • Live cashout</div>
+          </div>
+          <div class="game-card" id="openMines" style="
+            background:
+              url('/static/mines.png') center/cover no-repeat,
+              radial-gradient(600px 280px at 85% -20%, rgba(34,197,94,.25), transparent 60%);
+          ">
+            <div class="title">💣 Mines</div><div class="muted">5×5 board • Choose mines • Cash out anytime</div>
+          </div>
 
-<!-- Mines -->
-<div class="game-card" id="openMines"
-     style="background:
-       linear-gradient(180deg, rgba(10,15,30,.0), rgba(10,15,30,.65)),
-       url('/static/mines.png') center/cover no-repeat;">
-  <div class="title">💣 Mines</div>
-  <div class="muted">5×5 board • Choose mines • Cash out anytime</div>
-</div>
-
-<!-- Coinflip -->
-<div class="game-card" id="openCoinflip"
-     style="background:
-       linear-gradient(180deg, rgba(10,15,30,.0), rgba(10,15,30,.65)),
-       url('/static/coinflip.png') center/cover no-repeat;">
-  <div class="title">🪙 Coinflip</div>
-  <div class="muted">Quick 50/50 — coming soon</div>
-</div>
-
-<!-- Blackjack -->
-<div class="game-card" id="openBlackjack"
-     style="background:
-       linear-gradient(180deg, rgba(10,15,30,.0), rgba(10,15,30,.65)),
-       url('/static/blackjack.png') center/cover no-repeat;">
-  <div class="title">🃏 Blackjack</div>
-  <div class="muted">Beat the dealer — coming soon</div>
-</div>
-
-<!-- Pump -->
-<div class="game-card" id="openPump"
-     style="background:
-       linear-gradient(180deg, rgba(10,15,30,.0), rgba(10,15,30,.65)),
-       url('/static/pump.png') center/cover no-repeat;">
-  <div class="title">📈 Pump</div>
-  <div class="muted">Ride the spike — coming soon</div>
-</div>
+          <!-- New stubs -->
+          <div class="game-card" id="openCoinflip" style="
+            background:
+              url('/static/coinflip.png') center/cover no-repeat,
+              radial-gradient(600px 280px at 50% -20%, rgba(250,204,21,.22), transparent 60%);
+          ">
+            <div class="title">🪙 Coinflip</div><div class="muted">Quick 50/50 — coming soon</div>
+          </div>
+          <div class="game-card" id="openBlackjack" style="
+            background:
+              url('/static/blackjack.png') center/cover no-repeat,
+              radial-gradient(600px 280px at 30% -10%, rgba(16,185,129,.22), transparent 60%);
+          ">
+            <div class="title">🃏 Blackjack</div><div class="muted">Beat the dealer — coming soon</div>
+          </div>
+          <div class="game-card" id="openPump" style="
+            background:
+              url('/static/pump.png') center/cover no-repeat,
+              radial-gradient(600px 280px at 70% -10%, rgba(147,51,234,.22), transparent 60%);
+          ">
+            <div class="title">📈 Pump</div><div class="muted">Ride the spike — coming soon</div>
+          </div>
+        </div>
+      </div>
+    </div>
 
     <!-- Crash -->
     <div id="page-crash" style="display:none">
@@ -1209,7 +1215,7 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
       </div>
     </div>
 
-    <!-- Mines (show only Cash Out while active) -->
+    <!-- Mines -->
     <div id="page-mines" style="display:none">
       <div class="card">
         <div class="hero"><div class="big">💣 Mines</div><button class="chip" id="backToGames2">← Games</button></div>
@@ -1241,7 +1247,7 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
       </div>
     </div>
 
-    <!-- Coinflip / Blackjack / Pump placeholders -->
+    <!-- Placeholders -->
     <div id="page-coinflip" style="display:none"><div class="card"><div class="hero"><div class="big">🪙 Coinflip</div><button class="chip" id="backToGames_cf">← Games</button></div><div class="muted" style="margin-top:8px">Coming soon.</div></div></div>
     <div id="page-blackjack" style="display:none"><div class="card"><div class="hero"><div class="big">🃏 Blackjack</div><button class="chip" id="backToGames_bj">← Games</button></div><div class="muted" style="margin-top:8px">Coming soon.</div></div></div>
     <div id="page-pump" style="display:none"><div class="card"><div class="hero"><div class="big">📈 Pump</div><button class="chip" id="backToGames_pu">← Games</button></div><div class="muted" style="margin-top:8px">Coming soon.</div></div></div>
@@ -1324,7 +1330,7 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
       </div>
     </div>
 
-    <!-- Settings (open via avatar; logout at bottom) -->
+    <!-- Settings -->
     <div id="page-settings" style="display:none">
       <div class="card">
         <div class="label">Settings</div>
@@ -1341,7 +1347,7 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
       </div>
     </div>
 
-    <!-- Profile (open by clicking avatar) -->
+    <!-- Profile -->
     <div id="page-profile" style="display:none">
       <div class="card">
         <div class="label">Profile</div><div id="profileBox">Loading…</div>
@@ -1407,14 +1413,13 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
   const pages = ['page-games','page-crash','page-mines','page-coinflip','page-blackjack','page-pump','page-ref','page-promo','page-lb','page-settings','page-profile'];
   function showOnly(id){
     for(const p of pages){ const el = qs(p); if(el) el.style.display = (p===id) ? '' : 'none'; }
-    // Tabs highlight (settings/profile not in tabs)
     const map = {'page-games':'tab-games','page-ref':'tab-ref','page-promo':'tab-promo','page-lb':'tab-lb'};
     for(const t of ['tab-games','tab-ref','tab-promo','tab-lb']){
       const el = qs(t); if(el) el.classList.toggle('active', map[id]===t);
     }
   }
 
-  // Header / Auth (avatar opens menu with Profile/Settings)
+  // Header / Auth
   async function renderHeader(){
     try{
       const me = await j('/api/me');
@@ -1442,7 +1447,7 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
     }
   }
 
-  // Join Discord (buttons in multiple places)
+  // Join Discord
   async function joinDiscord(){
     try{
       await j('/api/discord/join', { method:'POST' });
@@ -1575,7 +1580,7 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
   });
 
   // ---------- Leaderboard ----------
-  const lbWrap = ()=> qs('lbWrap'); let lbPeriod = 'daily', lbMe = null;
+  let lbPeriod = 'daily';
   function setLbButtons(){
     const btns = Array.from(qs('lbSeg').querySelectorAll('button'));
     btns.forEach(b=> b.classList.toggle('active', b.dataset.period===lbPeriod));
@@ -1586,379 +1591,224 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
   }
   function endOfUtcMonth(){
     const now = new Date();
-    return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth()+1, 1, 0,0,0, 0,0)) }
-  function fmtCountdown(ms){
-    if(ms <= 0) return '—';
-    const s = Math.floor(ms/1000);
-    const hh = Math.floor(s/3600);
-    const mm = Math.floor((s%3600)/60);
-    const ss = s%60;
-    const p = n=> String(n).padStart(2,'0');
-    return `${p(hh)}:${p(mm)}:${p(ss)} until reset`;
+    return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth()+1, 1, 0,0,0));
   }
-  async function refreshLeaderboard(){
-    try{
-      setLbButtons();
-      const r = await j(`/api/leaderboard?period=${encodeURIComponent(lbPeriod)}&limit=50`);
-      const rows = r.rows||[];
-      lbWrap().innerHTML = rows.length ? (
-        '<table><thead><tr><th>#</th><th>Name</th><th>Total Wagered</th></tr></thead><tbody>' +
-        rows.map((row,i)=>{
-          const meCls = (lbMe && String(row.user_id)===String(lbMe)) ? ' class="me-row"' : '';
-          const anonCls = row.is_anon ? ' class="name anon"' : ' class="name"';
-          const name = row.is_anon ? 'Anonymous' : (row.display_name || 'User');
-          const amt = row.is_anon ? '—' : fmtDL(row.total_wagered||0);
-          return `<tr${meCls}><td>${i+1}</td><td${anonCls}>${name}</td><td>${amt}</td></tr>`;
-        }).join('') + '</tbody></table>'
-      ) : '—';
-      // countdown
-      const now = new Date();
-      let end = null;
-      if(lbPeriod==='daily') end = nextUtcMidnight();
-      else if(lbPeriod==='monthly') end = endOfUtcMonth();
-      qs('lbCountdown').textContent = end ? fmtCountdown(end - now) : '—';
-    }catch(_){
-      lbWrap().textContent = '—';
-    }
-  }
-  // periodic countdown tick
-  setInterval(()=>{
+  function renderLbCountdown(){
+    let target = lbPeriod==='daily' ? nextUtcMidnight() : (lbPeriod==='monthly' ? endOfUtcMonth() : null);
+    if(!target){ qs('lbCountdown').textContent = 'All-time'; return; }
     const now = new Date();
-    let end = null;
-    if(lbPeriod==='daily') end = nextUtcMidnight();
-    else if(lbPeriod==='monthly') end = endOfUtcMonth();
-    qs('lbCountdown').textContent = end ? fmtCountdown(end - now) : '—';
-  }, 1000);
-  // buttons
-  Array.from(qs('lbSeg').querySelectorAll('button')).forEach(b=>{
-    b.onclick = ()=>{ lbPeriod = b.dataset.period; refreshLeaderboard(); };
+    const diff = Math.max(0, target.getTime() - now.getTime());
+    const h = Math.floor(diff/3600000), m = Math.floor((diff%3600000)/60000), s = Math.floor((diff%60000)/1000);
+    qs('lbCountdown').textContent = `Resets in ${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+  }
+  setInterval(renderLbCountdown, 1000);
+
+  async function refreshLeaderboard(){
+    setLbButtons();
+    try{
+      const r = await j(`/api/leaderboard?period=${encodeURIComponent(lbPeriod)}`);
+      const rows = r.rows||[];
+      if(!rows.length){ qs('lbWrap').textContent='—'; return; }
+      qs('lbWrap').innerHTML = '<table><thead><tr><th>#</th><th>Name</th><th>Total Wagered</th></tr></thead><tbody>' +
+        rows.map((row,i)=>{
+          const name = row.is_anon ? 'Anonymous' : row.display_name;
+          const amt = row.is_anon ? '—' : fmtDL(row.total_wagered);
+          return `<tr class="${row.is_anon?'anon':''}"><td>${i+1}</td><td class="name">${name}</td><td>${amt}</td></tr>`;
+        }).join('') + '</tbody></table>';
+    }catch(e){ qs('lbWrap').textContent = e.message||'Error'; }
+  }
+  qs('lbSeg').addEventListener('click', (ev)=>{
+    const btn = ev.target.closest('button'); if(!btn) return;
+    lbPeriod = btn.dataset.period; refreshLeaderboard();
   });
 
-  // ---------- Crash ----------
-  let crPoll = null, crAnim = null, crLastState = null;
-  const crCanvas = ()=> qs('crCanvas');
-  function drawCrash(mult){
-    const cv = crCanvas(); if(!cv) return;
-    const dpr = window.devicePixelRatio||1;
-    const w = cv.clientWidth, h = cv.clientHeight;
-    if(cv.width !== Math.floor(w*dpr)) cv.width = Math.floor(w*dpr);
-    if(cv.height !== Math.floor(h*dpr)) cv.height = Math.floor(h*dpr);
-    const ctx = cv.getContext('2d'); ctx.save(); ctx.scale(dpr,dpr);
-    // clear bg
-    ctx.clearRect(0,0,w,h);
-    // axes-ish grid
-    ctx.globalAlpha = 0.15;
-    for(let i=0;i<=10;i++){
-      const x = (w/10)*i; ctx.fillRect(x,0,1,h);
-      const y = (h/10)*i; ctx.fillRect(0,y,w,1);
-    }
-    ctx.globalAlpha = 1.0;
-    // progress path: map multiplier 1.00x.. to width
-    const maxMult = Math.max(2, Math.min(20, Math.ceil(Math.max(2, mult))));
-    const xFrac = Math.min(1, (mult-1)/(maxMult-1));
-    const xEnd = 12 + xFrac*(w-24);
-    // curve
-    ctx.beginPath(); ctx.moveTo(12,h-18);
-    const steps = 120, m0 = Math.max(1, mult);
-    for(let i=1;i<=steps;i++){
-      const m = 1 + (i/steps)*(m0-1);
-      const xf = Math.min(1,(m-1)/(maxMult-1));
-      const x = 12 + xf*(w-24);
-      const yf = Math.min(0.92, Math.log(m)/Math.log(maxMult)); // compress
-      const y = (h-18) - yf*(h-40);
-      ctx.lineTo(x,y);
-    }
-    ctx.strokeStyle = 'rgba(255,255,255,0.9)';
-    ctx.lineWidth = 2; ctx.stroke();
-    // current dot
-    ctx.beginPath(); ctx.arc(xEnd, (h-18)-Math.min(0.92, Math.log(m0)/Math.log(maxMult))*(h-40), 4, 0, Math.PI*2);
-    ctx.fillStyle = 'rgba(255,255,255,0.95)'; ctx.fill();
-    ctx.restore();
+  // ---------- Crash UI ----------
+  const crCanvas = qs('crCanvas'); const crCtx = crCanvas.getContext('2d');
+  function sizeCanvas(){
+    const dpr = window.devicePixelRatio||1; const w = crCanvas.clientWidth; const h = crCanvas.clientHeight;
+    crCanvas.width = Math.floor(w*dpr); crCanvas.height = Math.floor(h*dpr); crCtx.setTransform(dpr,0,0,dpr,0,0);
   }
-  function setCrashHint(t){ qs('crHint').textContent = t||''; }
-  function setCrashNow(x){ qs('crNow').textContent = `${Number(x||0).toFixed(2)}×`; }
-  function setLastBusts(arr){
-    const el = qs('lastBusts');
-    if(!arr || !arr.length){ el.textContent = '—'; return; }
-    el.innerHTML = arr.map(v=>{
-      const bust = Number(v||0);
-      const good = bust>=2.0 ? 'good' : (bust<=1.1 ? 'bad':'');
-      return `<span class="${good}" style="display:inline-block;margin-right:8px;font-weight:800">${bust.toFixed(2)}×</span>`;
-    }).join('');
+  window.addEventListener('resize', sizeCanvas); sizeCanvas();
+
+  let crTimer = null, crPolling = null;
+  function setCrMsg(t){ qs('crMsg').textContent = t||''; }
+  function setCrHint(t){ qs('crHint').textContent = t||''; }
+
+  function drawMultiplier(mult){
+    const w = crCanvas.clientWidth, h = crCanvas.clientHeight;
+    crCtx.clearRect(0,0,w,h);
+    crCtx.beginPath();
+    crCtx.moveTo(12,h-18);
+    const x = Math.min(w-12, 12 + (mult*28)); const y = Math.max(18, h-18 - (mult*16));
+    crCtx.lineTo(x,y);
+    crCtx.strokeStyle = '#7fb3ff'; crCtx.lineWidth = 2; crCtx.stroke();
   }
-  function setCrashButtons(state){
-    const you = state.your_bet;
-    const place = qs('crPlace'), cash = qs('crCashout'), msg = qs('crMsg');
-    cash.style.display = (state.phase==='running' && you && !you.cashed_out) ? '' : 'none';
-    place.disabled = (state.phase!=='betting');
-    msg.textContent = you
-      ? (you.cashed_out ? `You cashed at ${Number(you.cashed_out).toFixed(2)}×` : `Your bet: ${fmtDL(you.bet)} @ ${Number(you.cashout||0).toFixed(2)}×`)
-      : '';
-  }
+
   async function pollCrash(){
     try{
       const st = await j('/api/crash/state');
-      crLastState = st;
-      setLastBusts(st.last_busts||[]);
-      setCrashButtons(st);
-      if(st.phase==='betting'){
-        const ends = new Date(st.betting_ends_at||Date.now());
-        const left = Math.max(0, Math.floor((ends - new Date())/1000));
-        setCrashHint(`Betting… ${left}s`);
-        setCrashNow(1.00);
-        drawCrash(1.00);
-      }else if(st.phase==='running'){
-        const m = Number(st.current_multiplier||1);
-        setCrashHint('Live!');
-        setCrashNow(m);
-        drawCrash(m);
-      }else{
-        setCrashHint('Ending…');
+      qs('lastBusts').textContent = (st.last_busts||[]).map(v=> (Number(v)||0).toFixed(2)+'×').join(' • ') || '—';
+      if(st.phase === 'betting'){
+        const end = new Date(st.betting_ends_at); const now = new Date(); const sec = Math.max(0, Math.floor((end-now)/1000));
+        setCrHint(`Betting: ${sec}s left`); qs('crCashout').style.display='none';
+        drawMultiplier(1.0);
+      }else if(st.phase === 'running'){
+        const mult = Number(st.current_multiplier||1.0); drawMultiplier(mult);
+        qs('crNow').textContent = (mult).toFixed(2)+'×';
+        setCrHint('Round live'); qs('crCashout').style.display='';
+      }else if(st.phase === 'ended'){
+        qs('crNow').textContent = Number(st.bust||0).toFixed(2)+'×';
+        setCrHint('Round ended'); qs('crCashout').style.display='none';
       }
-      // recent history for you
+      // your recent
       try{
-        const h = await j('/api/crash/history');
-        qs('crLast').innerHTML = (h.rows && h.rows.length)
-          ? h.rows.map(r=>{
-              const w = Number(r.win||0);
-              const bust = Number(r.bust||0).toFixed(2);
-              const mult = Number(r.cashout||0).toFixed(2);
-              const cls = w>0 ? 'good' : 'bad';
-              return `<div>Bet ${fmtDL(r.bet)} • Cashout ${mult}× • Bust ${bust}× • <strong class="${cls}">${fmtDL(w)}</strong></div>`;
-            }).join('') : '—';
+        const hist = await j('/api/crash/history');
+        qs('crLast').innerHTML = (hist.rows||[]).map(r=>`<div>${new Date(r.created_at).toLocaleString()} — Bet ${fmtDL(r.bet)} • Cash ${Number(r.cashout).toFixed(2)}× • Bust ${Number(r.bust).toFixed(2)}× • Win ${fmtDL(r.win)}</div>`).join('') || '—';
       }catch(_){}
     }catch(e){
-      setCrashHint('Error loading crash.');
+      setCrHint(e.message||'Error'); qs('crCashout').style.display='none';
     }
   }
-  function startCrash(){
-    stopCrash();
-    pollCrash();
-    crPoll = setInterval(pollCrash, 1000);
-  }
-  function stopCrash(){
-    if(crPoll){ clearInterval(crPoll); crPoll=null; }
-    if(crAnim){ cancelAnimationFrame(crAnim); crAnim=null; }
-  }
+  setInterval(pollCrash, 1000);
+
   qs('crPlace').onclick = async ()=>{
-    const bet = qs('crBet').value.trim();
-    const cash = qs('crCash').value.trim();
-    qs('crMsg').textContent='';
+    setCrMsg('');
     try{
-      const payload = { bet, cashout: cash ? Number(cash) : undefined };
-      const r = await j('/api/crash/place', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
-      qs('crMsg').textContent = r && r.ok ? 'Bet placed!' : (r.message||'Placed.');
-      pollCrash();
-    }catch(e){ qs('crMsg').textContent = e.message; }
+      const bet = qs('crBet').value; const cash = qs('crCash').value || null;
+      const r = await j('/api/crash/place', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ bet, cashout: cash?Number(cash):null })});
+      setCrMsg('Bet placed.'); renderHeader();
+    }catch(e){ setCrMsg(e.message); }
   };
   qs('crCashout').onclick = async ()=>{
-    qs('crMsg').textContent='';
+    setCrMsg('');
     try{
       const r = await j('/api/crash/cashout', { method:'POST' });
-      qs('crMsg').textContent = r && r.ok ? 'Cashed out!' : (r.message||'Cashed!');
-      renderHeader(); pollCrash();
-    }catch(e){ qs('crMsg').textContent = e.message; }
+      setCrMsg('Cashed out! +' + fmtDL(r.win));
+      renderHeader();
+    }catch(e){ setCrMsg(e.message); }
   };
 
-  // ---------- Mines ----------
-  const M_SIZE = 25;
-  function buildMinesGrid(){
-    const g = qs('mGrid'); g.innerHTML='';
-    for(let i=0;i<M_SIZE;i++){
+  // ---------- Mines UI ----------
+  const mGrid = qs('mGrid'); const mMsg = qs('mMsg'); const mCash = qs('mCash');
+  function buildGrid(){
+    mGrid.innerHTML=''; for(let i=0;i<25;i++){
       const b = document.createElement('button');
-      b.className='btn'; b.style.width='64px'; b.style.height='64px'; b.textContent = String(i+1);
-      b.dataset.index = String(i);
-      b.onclick = ()=> pickMine(i);
-      g.appendChild(b);
+      b.textContent = (i+1); b.className='btn'; b.style.minWidth='64px'; b.style.height='64px';
+      b.onclick = ()=> pick(i);
+      mGrid.appendChild(b);
     }
   }
-  function updateMinesUI(st){
-    const msg = qs('mMsg'), mult = qs('mMult'), pot = qs('mPotential');
-    const picks = qs('mPicks'), bombs = qs('mBombs'), hash = qs('mHash'), status = qs('mStatus');
-    const cash = qs('mCash'), setup = qs('mSetup');
-    if(!st || st.status==='idle' || st.status==='none'){
-      msg.textContent=''; mult.textContent='Multiplier: 1.0000×'; pot.textContent='Potential: —';
-      picks.textContent='Picks: 0'; bombs.textContent='Mines: 3'; hash.textContent='Commit: —'; status.textContent='Status: —';
-      cash.style.display='none'; setup.style.display='';
-      Array.from(qs('mGrid').children).forEach(b=>{ b.disabled=true; b.textContent=b.textContent.replace('💣','').replace('✅',''); });
-      return;
-    }
-    // Active or finished
-    setup.style.display = (st.status==='active') ? 'none' : '';
-    cash.style.display = (st.status==='active') ? '' : 'none';
-    mult.textContent = `Multiplier: ${(Number(st.multiplier||1)).toFixed(4)}×`;
-    pot.textContent = `Potential: ${st.potential!=null ? fmtDL(st.potential) : '—'}`;
-    picks.textContent = `Picks: ${st.picks||0}`;
-    bombs.textContent = `Mines: ${st.mines||3}`;
-    hash.textContent = `Commit: ${st.commit_hash || st.commit || '—'}`;
-    status.textContent = `Status: ${st.status}`;
-    // board reveals if provided
-    if(st.reveals && Array.isArray(st.reveals)){
-      st.reveals.forEach((v,i)=>{
-        const b = qs('mGrid').children[i]; if(!b) return;
-        b.disabled = st.status!=='active' || v!==null;
-        if(v===true) b.textContent = '✅';
-        else if(v===false) b.textContent = '💣';
-      });
-    }else{
-      // enable buttons during active
-      Array.from(qs('mGrid').children).forEach(b=>{ b.disabled = st.status!=='active'; });
-    }
-  }
+  buildGrid();
+
   async function refreshMines(){
     try{
       const st = await j('/api/mines/state');
-      updateMinesUI(st);
-    }catch(e){
-      // ignore
-    }
+      if(!st || !st.game){
+        qs('mSetup').style.display=''; mCash.style.display='none';
+        qs('mStatus').textContent='Status: —'; qs('mHash').textContent='Commit: —'; qs('mPicks').textContent='Picks: 0';
+        qs('mMult').textContent='Multiplier: 1.0000×'; qs('mPotential').textContent='Potential: —';
+        Array.from(mGrid.children).forEach((b)=>{ b.disabled=true; b.textContent='—'; b.className='btn'; });
+      }else{
+        const g = st.game;
+        qs('mSetup').style.display='none'; mCash.style.display='';
+        qs('mStatus').textContent='Status: ' + g.status;
+        qs('mHash').textContent='Commit: ' + (g.commit_hash||'');
+        qs('mPicks').textContent='Picks: ' + (g.picks||0);
+        qs('mBombs').textContent='Mines: ' + (g.mines||0);
+        qs('mMult').textContent='Multiplier: ' + Number(g.multiplier||1).toFixed(4) + '×';
+        qs('mPotential').textContent='Potential: ' + (g.potential_win ? fmtDL(g.potential_win) : '—');
+        Array.from(mGrid.children).forEach((b)=>{ b.disabled = (g.status!=='active'); b.textContent='?'; b.className='btn'; });
+        if(g.reveals && Array.isArray(g.reveals)){
+          g.reveals.forEach((rv)=>{
+            const b = mGrid.children[rv.index]; b.disabled=true;
+            b.textContent = rv.type==='bomb' ? '💣' : '💎';
+            b.className = 'btn ' + (rv.type==='bomb' ? '' : 'ok');
+          });
+        }
+      }
+      // history
+      try{
+        const h = await j('/api/mines/history');
+        qs('mHist').innerHTML = (h.rows||[]).map(r=>`<div>${new Date(r.started_at).toLocaleString()} — Bet ${fmtDL(r.bet)} • Mines ${r.mines} • Picks ${r.picks} • Win ${fmtDL(r.win)}</div>`).join('') || '—';
+      }catch(_){}
+    }catch(e){}
   }
+  setInterval(refreshMines, 1000);
+
   qs('mStart').onclick = async ()=>{
-    const bet = qs('mBet').value.trim();
-    const mines = parseInt(qs('mMines').value||'3',10);
-    qs('mMsg').textContent='';
+    mMsg.textContent='';
     try{
-      const r = await j('/api/mines/start', { method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ bet, mines }) });
-      qs('mMsg').textContent = r && r.ok ? 'Game started!' : (r.message||'Started.');
-      buildMinesGrid();
-      refreshMines();
-      renderMinesHistory();
-      renderHeader();
-    }catch(e){ qs('mMsg').textContent = e.message; }
+      const bet = qs('mBet').value; const mines = parseInt(qs('mMines').value||'3',10);
+      await j('/api/mines/start', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ bet, mines }) });
+      mMsg.textContent='Game started.'; refreshMines(); renderHeader();
+    }catch(e){ mMsg.textContent=e.message; }
   };
-  async function pickMine(i){
-    try{
-      await j(`/api/mines/pick?index=${i}`, { method:'POST' });
-      refreshMines();
-      renderHeader();
-    }catch(e){ qs('mMsg').textContent = e.message; }
+  async function pick(i){
+    try{ await j(`/api/mines/pick?index=${i}`, { method:'POST' }); refreshMines(); renderHeader(); }
+    catch(e){ mMsg.textContent = e.message; }
   }
-  qs('mCash').onclick = async ()=>{
-    try{
-      const r = await j('/api/mines/cashout', { method:'POST' });
-      qs('mMsg').textContent = r && r.ok ? 'Cashed out!' : (r.message||'Cashed!');
-      refreshMines();
-      renderMinesHistory();
-      renderHeader();
-    }catch(e){ qs('mMsg').textContent = e.message; }
+  mCash.onclick = async ()=>{
+    mMsg.textContent='';
+    try{ const r = await j('/api/mines/cashout', { method:'POST' }); mMsg.textContent = 'Cashed out: +' + fmtDL(r.win); refreshMines(); renderHeader(); }
+    catch(e){ mMsg.textContent = e.message; }
   };
-  async function renderMinesHistory(){
-    try{
-      const h = await j('/api/mines/history');
-      qs('mHist').innerHTML = (h.rows && h.rows.length)
-        ? h.rows.map(r=>{
-            const cls = Number(r.win||0)>0 ? 'good':'bad';
-            return `<div>${new Date(r.created_at||r.ended_at||Date.now()).toLocaleString()} • Bet ${fmtDL(r.bet)} • Mines ${r.mines} • <strong class="${cls}">${fmtDL(r.win||0)}</strong></div>`;
-          }).join('') : '—';
-    }catch(_){ qs('mHist').textContent = '—'; }
-  }
 
   // ---------- Chat ----------
-  let chatOpen = false, chatSince = 0, chatTimer = null;
-  function escapeHtml(s){ return (s||'').replace(/[&<>"']/g, m=> ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
-  function roleBadge(r){ return `<span class="badge ${r||'member'}">${(r||'member').toUpperCase()}</span>`; }
-  function addChatRows(rows){
-    const body = qs('chatBody');
-    for(const m of rows){
-      chatSince = Math.max(chatSince, m.id||0);
-      const who = `<span class="user-link" data-uid="${m.user_id||''}">${escapeHtml(m.username||'user')}</span>`;
-      const lvl = `<span class="level">Lv ${m.level||1}</span>`;
-      const rb = roleBadge(m.role||'member');
-      const time = new Date(m.created_at||Date.now()).toLocaleTimeString();
-      const priv = m.private_to ? `<span class="badge">DM</span>` : '';
-      const row = document.createElement('div'); row.className='msg';
-      row.innerHTML = `<div class="msghead">${who} ${lvl} ${rb} ${priv}<span class="time">${time}</span></div><div>${escapeHtml(m.text||'')}</div>`;
-      body.appendChild(row);
-    }
-    body.scrollTop = body.scrollHeight;
-  }
-  async function fetchChat(){
+  const drawer = qs('chatDrawer'); const fab = qs('fabChat'); const chatClose = qs('chatClose');
+  fab.onclick = ()=> drawer.classList.add('open'); chatClose.onclick = ()=> drawer.classList.remove('open');
+  let lastId = 0;
+  async function pullChat(){
     try{
-      const r = await j(`/api/chat/fetch?since=${chatSince}&limit=50`);
-      if(r && r.rows && r.rows.length) addChatRows(r.rows);
+      const r = await j(`/api/chat/fetch?since=${lastId}`);
+      const body = qs('chatBody');
+      (r.rows||[]).forEach(m=>{
+        lastId = Math.max(lastId, m.id);
+        const el = document.createElement('div'); el.className='msg';
+        el.innerHTML = `<div class="msghead">
+          <span class="user-link">${m.username}</span>
+          <span class="badge ${m.role}">${m.role.toUpperCase()}</span>
+          <span class="level">Lv ${m.level}</span>
+          <span class="time">${new Date(m.created_at).toLocaleTimeString()}</span>
+        </div>
+        <div>${m.text.replace(/[<>]/g, '')}</div>`;
+        body.appendChild(el); body.scrollTop = body.scrollHeight;
+      });
     }catch(_){}
   }
-  function openChat(){
-    if(chatOpen) return; chatOpen=true;
-    qs('chatDrawer').classList.add('open');
-    qs('chatBody').innerHTML='';
-    chatSince = 0;
-    fetchChat();
-    chatTimer = setInterval(fetchChat, 1500);
-    qs('chatText').focus();
-  }
-  function closeChat(){
-    chatOpen=false;
-    qs('chatDrawer').classList.remove('open');
-    if(chatTimer){ clearInterval(chatTimer); chatTimer=null; }
-  }
-  qs('fabChat').onclick = openChat;
-  qs('chatClose').onclick = closeChat;
+  setInterval(pullChat, 1500);
   qs('chatSend').onclick = async ()=>{
-    const txt = qs('chatText').value.trim();
-    if(!txt) return;
-    try{
-      await j('/api/chat/send', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ text: txt })});
-      qs('chatText').value=''; fetchChat();
-    }catch(e){ alert(e.message||'Could not send'); }
+    const t = qs('chatText'); const text = t.value.trim(); if(!text) return;
+    try{ await j('/api/chat/send', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ text })}); t.value=''; pullChat(); }
+    catch(e){ alert(e.message); }
   };
-  qs('chatText').addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ e.preventDefault(); qs('chatSend').click(); } });
 
-  // ---------- Simple navigation wiring ----------
-  function bindNav(){
-    const map = [
-      ['openCrash', ()=>{ showOnly('page-crash'); startCrash(); }],
-      ['openMines', ()=>{ showOnly('page-mines'); buildMinesGrid(); refreshMines(); renderMinesHistory(); }],
-      ['openCoinflip', ()=> showOnly('page-coinflip')],
-      ['openBlackjack', ()=> showOnly('page-blackjack')],
-      ['openPump', ()=> showOnly('page-pump')],
-      ['backToGames', ()=>{ showOnly('page-games'); stopCrash(); }],
-      ['backToGames2', ()=>{ showOnly('page-games'); }],
-      ['backToGames_cf', ()=> showOnly('page-games')],
-      ['backToGames_bj', ()=> showOnly('page-games')],
-      ['backToGames_pu', ()=> showOnly('page-games')],
-    ];
-    for(const [id,fn] of map){ const el=qs(id); if(el) el.onclick = fn; }
+  // ---------- Navigation ----------
+  function wireNav(){
+    qs('openCrash').onclick = ()=> { showOnly('page-crash'); };
+    qs('openMines').onclick = ()=> { showOnly('page-mines'); };
+    qs('openCoinflip').onclick = ()=> { showOnly('page-coinflip'); };
+    qs('openBlackjack').onclick = ()=> { showOnly('page-blackjack'); };
+    qs('openPump').onclick = ()=> { showOnly('page-pump'); };
+    qs('backToGames').onclick = ()=> showOnly('page-games');
+    qs('backToGames2').onclick = ()=> showOnly('page-games');
+    qs('backToGames_cf').onclick = ()=> showOnly('page-games');
+    qs('backToGames_bj').onclick = ()=> showOnly('page-games');
+    qs('backToGames_pu').onclick = ()=> showOnly('page-games');
   }
 
-  // ---------- Referral attach from cookie ----------
-  function getCookie(name){
-    const m = document.cookie.match(new RegExp('(?:^|; )'+name.replace(/([$?*|{}\]\\^])/g,'\\$1')+'=([^;]*)'));
-    return m ? decodeURIComponent(m[1]) : null;
-  }
-  async function attachReferralIfAny(){
-    const rn = getCookie('refname');
-    if(!rn) return;
-    try{ await j(`/api/referral/attach?refname=${encodeURIComponent(rn)}`); }
-    catch(_){}
-    // expire quickly
-    document.cookie = `refname=; Max-Age=0; path=/; samesite=lax`;
-  }
-
-  // ---------- Init ----------
-  window.addEventListener('load', async ()=>{
-    showOnly('page-games');
-    bindNav();
-    await renderHeader();
-    attachReferralIfAny();
-    // Try to detect my user id for lb highlight
-    try{ const me = await j('/api/me'); lbMe = String(me.id||''); }catch(_){}
-    refreshLeaderboard();
-  });
+  // ---------- Boot ----------
+  renderHeader(); wireNav(); refreshLeaderboard(); pollCrash(); refreshMines(); pullChat();
   </script>
 </body>
 </html>
 """
 
-# ---------- Root ----------
+# ---------- Home ----------
 @app.get("/", response_class=HTMLResponse)
-async def root():
-    html = HTML_TEMPLATE.replace("__INVITE__", DISCORD_INVITE or "__INVITE__")
-    html = html.replace("__OWNER_ID__", str(OWNER_ID))
+async def home():
+    html = HTML_TEMPLATE.replace("__INVITE__", DISCORD_INVITE or "__INVITE__").replace("__OWNER_ID__", str(OWNER_ID))
     return HTMLResponse(html)
 
-# ---------- Run ----------
+# ---------- Entrypoint ----------
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=bool(os.getenv("RELOAD","1")=="1"))
-
+    uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=bool(os.getenv("DEV") == "1"))

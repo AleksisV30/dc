@@ -1,4 +1,4 @@
-# app/main.py — single file
+# app/main.py — single file (game logic imported from crash.py / mines.py)
 import os, json, asyncio, re, random, string, math, secrets, datetime, hashlib
 from urllib.parse import urlencode
 from typing import Optional, Tuple, Dict, List
@@ -13,6 +13,16 @@ from fastapi.staticfiles import StaticFiles
 from itsdangerous import URLSafeSerializer, BadSignature
 import uvicorn
 from pydantic import BaseModel
+
+# ---------- IMPORT GAMES FROM SEPARATE FILES ----------
+from crash import (
+    ensure_betting_round, place_bet, load_round, begin_running,
+    finish_round, create_next_betting, last_busts, your_bet,
+    your_history, cashout_now, current_multiplier,
+)
+from mines import (
+    mines_start, mines_pick, mines_cashout, mines_state, mines_history,
+)
 
 # ---------- Config ----------
 getcontext().prec = 28
@@ -420,457 +430,6 @@ def create_promo(cur, actor_id: str, code: Optional[str], amount, max_uses: int 
     """, (code, amt, max_uses, expires_at, actor_id))
     return {"ok": True, "code": code}
 
-# ---- Crash math ----
-def _u(): return (secrets.randbelow(1_000_000_000)+1)/1_000_000_001.0
-def gen_bust(edge: Decimal) -> float:
-    u = _u()
-    B = max(1.0, float((Decimal("1.0") - edge) / Decimal(str(u))))
-    return math.floor(B*100)/100.0
-def run_duration_for(bust: float) -> float:
-    return min(22.0, 8.0 + math.log(bust + 1.0) * 6.0)
-def current_multiplier(started_at: datetime.datetime, expected_end_at: datetime.datetime, bust: float, at: Optional[datetime.datetime] = None) -> float:
-    at = at or now_utc()
-    if at <= started_at: return 1.0
-    if at >= expected_end_at: return bust
-    frac = (at - started_at).total_seconds() / max(0.001, (expected_end_at - started_at).total_seconds())
-    m = math.exp(math.log(bust) * frac)
-    return math.floor(m*100)/100.0
-
-@with_conn
-def ensure_betting_round(cur) -> Tuple[int, dict]:
-    cur.execute("SELECT id,status,betting_opens_at,betting_ends_at,started_at,expected_end_at,bust FROM crash_rounds ORDER BY id DESC LIMIT 1")
-    r = cur.fetchone()
-    now = now_utc()
-    if not r or r[1] == 'ended':
-        opens = now
-        ends = now + datetime.timedelta(seconds=BETTING_SECONDS)
-        cur.execute("""INSERT INTO crash_rounds(status,betting_opens_at,betting_ends_at)
-                       VALUES('betting',%s,%s) RETURNING id,status,betting_opens_at,betting_ends_at,started_at,expected_end_at,bust""",
-                    (opens, ends))
-        r = cur.fetchone()
-    return r[0], {
-        "status": r[1],
-        "betting_opens_at": r[2],
-        "betting_ends_at": r[3],
-        "started_at": r[4],
-        "expected_end_at": r[5],
-        "bust": float(r[6]) if r[6] is not None else None
-    }
-
-@with_conn
-def place_bet(cur, user_id: str, bet: Decimal, cashout: float):
-    cur.execute("""SELECT id, betting_ends_at FROM crash_rounds
-                   WHERE status='betting'
-                   ORDER BY id DESC LIMIT 1""")
-    row = cur.fetchone()
-    if not row: raise ValueError("Betting is closed")
-    round_id, ends_at = int(row[0]), row[1]
-    cur.execute("SELECT NOW() < %s", (ends_at,))
-    if not cur.fetchone()[0]: raise ValueError("Betting just closed")
-
-    cur.execute("INSERT INTO balances(user_id,balance) VALUES (%s,0) ON CONFLICT(user_id) DO NOTHING", (user_id,))
-    cur.execute("SELECT balance FROM balances WHERE user_id=%s FOR UPDATE", (user_id,))
-    bal = D(cur.fetchone()[0])
-    if bet < MIN_BET: raise ValueError(f"Min bet is {MIN_BET:.2f} DL")
-    if bet > MAX_BET: raise ValueError(f"Max bet is {MAX_BET:.2f} DL")
-    if bal < bet: raise ValueError("Insufficient balance")
-    cur.execute("UPDATE balances SET balance=balance-%s WHERE user_id=%s", (q2(bet), user_id))
-
-    try:
-        cur.execute("""INSERT INTO crash_bets(round_id,user_id,bet,cashout)
-                       VALUES(%s,%s,%s,%s)""",
-                    (round_id, user_id, q2(bet), float(cashout)))
-    except Exception:
-        cur.execute("UPDATE balances SET balance=balance+%s WHERE user_id=%s", (q2(bet), user_id))
-        raise ValueError("You already placed a bet this round")
-    return {"round_id": round_id}
-
-@with_conn
-def load_round(cur):
-    cur.execute("""SELECT id,status,betting_opens_at,betting_ends_at,started_at,expected_end_at,bust
-                   FROM crash_rounds ORDER BY id DESC LIMIT 1""")
-    r = cur.fetchone()
-    if not r: return None
-    return {
-        "id": int(r[0]),
-        "status": r[1],
-        "betting_opens_at": r[2], "betting_ends_at": r[3],
-        "started_at": r[4], "expected_end_at": r[5],
-        "bust": float(r[6]) if r[6] is not None else None
-    }
-
-@with_conn
-def begin_running(cur, round_id: int):
-    cur.execute("SELECT status FROM crash_rounds WHERE id=%s FOR UPDATE", (round_id,))
-    st = cur.fetchone()
-    if not st or st[0] != 'betting': return None
-
-    bust = gen_bust(HOUSE_EDGE_CRASH)
-    dur = run_duration_for(bust)
-    now = now_utc()
-    exp_end = now + datetime.timedelta(seconds=dur)
-    cur.execute("""UPDATE crash_rounds
-                   SET status='running', bust=%s, started_at=%s, expected_end_at=%s
-                   WHERE id=%s""",
-                (float(bust), now, exp_end, round_id))
-    return {"bust": bust, "expected_end_at": exp_end}
-
-@with_conn
-def resolve_round_end(cur, round_id: int, bust: float):
-    cur.execute("""SELECT user_id, bet, cashout, cashed_out, resolved, win
-                   FROM crash_bets WHERE round_id=%s""", (round_id,))
-    bets = cur.fetchall()
-    for uid, bet, goal, cashed, resolved, win in bets:
-        uid = str(uid); bet=D(bet); goal=float(goal); win=D(win); resolved=bool(resolved)
-        if resolved and cashed is not None:
-            xp_gain = max(1, min(int(bet), 50))
-            cur.execute("""INSERT INTO crash_games(user_id,bet,cashout,bust,win,xp_gain)
-                           VALUES(%s,%s,%s,%s,%s,%s)""",
-                        (uid, q2(bet), float(cashed), float(bust), q2(win), xp_gain))
-            ensure_profile_row(uid)
-            cur.execute("UPDATE profiles SET xp=xp+%s WHERE user_id=%s", (xp_gain, uid))
-            continue
-
-        if not resolved:
-            if goal <= bust:
-                win = q2(bet * D(goal))
-                cur.execute("UPDATE balances SET balance=balance+%s WHERE user_id=%s", (win, uid))
-                cur.execute("""UPDATE crash_bets SET win=%s, resolved=TRUE WHERE round_id=%s AND user_id=%s""",
-                            (win, round_id, uid))
-                cashed_val = goal
-            else:
-                cur.execute("""UPDATE crash_bets SET resolved=TRUE WHERE round_id=%s AND user_id=%s""",
-                            (round_id, uid))
-                win = Decimal("0.00")
-                cashed_val = goal
-
-            xp_gain = max(1, min(int(bet), 50))
-            cur.execute("""INSERT INTO crash_games(user_id,bet,cashout,bust,win,xp_gain)
-                           VALUES(%s,%s,%s,%s,%s,%s)""",
-                        (uid, q2(bet), float(cashed_val), float(bust), q2(win), xp_gain))
-            ensure_profile_row(uid)
-            cur.execute("UPDATE profiles SET xp=xp+%s WHERE user_id=%s", (xp_gain, uid))
-
-@with_conn
-def finish_round(cur, round_id: int):
-    cur.execute("SELECT bust FROM crash_rounds WHERE id=%s", (round_id,))
-    bust = float(cur.fetchone()[0])
-    now = now_utc()
-    resolve_round_end(cur, round_id, bust)
-    cur.execute("""UPDATE crash_rounds
-                   SET status='ended', ended_at=%s
-                   WHERE id=%s AND status='running'""", (now, round_id))
-
-@with_conn
-def create_next_betting(cur):
-    now = now_utc()
-    opens = now
-    ends = now + datetime.timedelta(seconds=BETTING_SECONDS)
-    cur.execute("""INSERT INTO crash_rounds(status,betting_opens_at,betting_ends_at)
-                   VALUES('betting',%s,%s) RETURNING id""", (opens, ends))
-    return int(cur.fetchone()[0])
-
-@with_conn
-def last_busts(cur, limit: int = 15):
-    cur.execute("SELECT bust FROM crash_rounds WHERE status='ended' ORDER BY id DESC LIMIT %s", (limit,))
-    return [float(r[0]) for r in cur.fetchall()]
-
-@with_conn
-def your_bet(cur, round_id: int, user_id: str):
-    cur.execute("""SELECT bet, cashout, cashed_out, resolved, win
-                   FROM crash_bets WHERE round_id=%s AND user_id=%s""", (round_id, user_id))
-    r = cur.fetchone()
-    if not r: return None
-    return {"bet": float(q2(D(r[0]))), "cashout": float(r[1]),
-            "cashed_out": (float(r[2]) if r[2] is not None else None),
-            "resolved": bool(r[3]), "win": float(q2(D(r[4])))}
-
-@with_conn
-def your_history(cur, user_id: str, limit: int = 10):
-    cur.execute("""SELECT bet, cashout, bust, win, xp_gain, created_at
-                   FROM crash_games WHERE user_id=%s
-                   ORDER BY id DESC LIMIT %s""", (user_id, limit))
-    return [{"bet":float(q2(D(r[0]))),"cashout":float(r[1]),"bust":float(r[2]),"win":float(q2(D(r[3]))),"xp_gain":int(r[4]),"created_at":str(r[5])} for r in cur.fetchall()]
-
-# ---------- Chat helpers ----------
-@with_conn
-def get_role(cur, user_id: str) -> str:
-    cur.execute("SELECT role FROM profiles WHERE user_id=%s", (user_id,))
-    r = cur.fetchone()
-    return r[0] if r else "member"
-
-@with_conn
-def chat_timeout_set(cur, actor_id: str, user_id: str, seconds: int, reason: Optional[str]):
-    until = now_utc() + datetime.timedelta(seconds=max(1, seconds))
-    cur.execute("""INSERT INTO chat_timeouts(user_id, until, reason, created_by)
-                   VALUES (%s,%s,%s,%s)
-                   ON CONFLICT (user_id) DO UPDATE SET until=EXCLUDED.until, reason=EXCLUDED.reason, created_by=EXCLUDED.created_by""",
-                (user_id, until, reason, actor_id))
-    return {"ok": True, "until": str(until)}
-
-@with_conn
-def chat_timeout_get(cur, user_id: str):
-    cur.execute("SELECT until, reason FROM chat_timeouts WHERE user_id=%s", (user_id,))
-    r = cur.fetchone()
-    if not r: return None
-    until, reason = r
-    if until <= now_utc():
-        cur.execute("DELETE FROM chat_timeouts WHERE user_id=%s", (user_id,))
-        return None
-    delta = int((until - now_utc()).total_seconds())
-    return {"until": str(until), "seconds_left": max(0, delta), "reason": reason or ""}
-
-@with_conn
-def chat_insert(cur, user_id: str, username: str, text: str, private_to: Optional[str] = None):
-    text = (text or "").strip()
-    if not text: raise ValueError("Message is empty")
-    if len(text) > 300: raise ValueError("Message is too long (max 300)")
-    ensure_profile_row(user_id)
-    if private_to is None:
-        # Everyone can chat if logged in, unless timed out
-        cur.execute("SELECT until FROM chat_timeouts WHERE user_id=%s", (user_id,))
-        r = cur.fetchone()
-        if r and r[0] > now_utc(): raise PermissionError("You are timed out")
-    cur.execute("INSERT INTO chat_messages(user_id, username, text, private_to) VALUES (%s,%s,%s,%s) RETURNING id, created_at",
-                (user_id, username, text, private_to))
-    row = cur.fetchone()
-    return {"id": int(row[0]), "created_at": str(row[1])}
-
-@with_conn
-def chat_fetch(cur, since_id: int, limit: int, for_user_id: Optional[str]):
-    if since_id <= 0:
-        cur.execute("""SELECT id, user_id, username, text, created_at, private_to
-                       FROM chat_messages
-                       WHERE private_to IS NULL
-                       ORDER BY id DESC LIMIT %s""", (limit,))
-        rows_pub = list(reversed(cur.fetchall()))
-        rows_priv = []
-        if for_user_id:
-            cur.execute("""SELECT id, user_id, username, text, created_at, private_to
-                           FROM chat_messages
-                           WHERE private_to=%s
-                           ORDER BY id DESC LIMIT %s""", (for_user_id, limit))
-            rows_priv = list(reversed(cur.fetchall()))
-        rows = sorted(rows_pub + rows_priv, key=lambda r: r[0])
-    else:
-        if for_user_id:
-            cur.execute("""SELECT id, user_id, username, text, created_at, private_to
-                           FROM chat_messages
-                           WHERE id>%s AND (private_to IS NULL OR private_to=%s)
-                           ORDER BY id ASC LIMIT %s""", (since_id, for_user_id, limit))
-        else:
-            cur.execute("""SELECT id, user_id, username, text, created_at, private_to
-                           FROM chat_messages
-                           WHERE id>%s AND private_to IS NULL
-                           ORDER BY id ASC LIMIT %s""", (since_id, limit))
-        rows = cur.fetchall()
-
-    uids = list({str(r[1]) for r in rows})
-    levels: Dict[str, int] = {}
-    roles: Dict[str, str] = {}
-    if uids:
-        cur.execute("SELECT user_id, xp, role FROM profiles WHERE user_id = ANY(%s)", (uids,))
-        for uid, xp, role in cur.fetchall():
-            levels[str(uid)] = 1 + int(xp) // 100
-            roles[str(uid)] = role or "member"
-    out = []
-    for mid, uid, uname, txt, ts, priv in rows:
-        uid = str(uid)
-        out.append({"id": int(mid), "user_id": uid, "username": uname,
-                    "level": int(levels.get(uid,1)), "role": roles.get(uid,"member"),
-                    "text": txt, "created_at": str(ts), "private_to": priv})
-    return out
-
-@with_conn
-def chat_delete(cur, message_id: int):
-    cur.execute("DELETE FROM chat_messages WHERE id=%s", (message_id,))
-    return {"ok": True}
-
-# ---------- MINES helpers ----------
-def mines_random_board(mines: int) -> str:
-    idxs = list(range(25))
-    random.shuffle(idxs)
-    mines_set = set(idxs[:mines])
-    return ''.join('1' if i in mines_set else '0' for i in range(25))
-def sha256(s: str) -> str: return hashlib.sha256(s.encode('utf-8')).hexdigest()
-def picks_count_from_bitmask(mask: int) -> int: return mask.bit_count()
-def mines_multiplier(mines: int, picks_count: int) -> float:
-    if picks_count <= 0: return 1.0
-    total = Decimal("1.0")
-    for i in range(picks_count):
-        total *= D(25 - i) / D(max(1, 25 - mines - i))
-        total *= (Decimal("1.0") - HOUSE_EDGE_MINES)
-    return float(total)
-
-@with_conn
-def mines_active_for(cur, user_id: str):
-    cur.execute("""SELECT id, bet, mines, board, picks, seed, commit_hash, status
-                   FROM mines_games
-                   WHERE user_id=%s AND status='active'
-                   ORDER BY id DESC LIMIT 1""", (user_id,))
-    r = cur.fetchone()
-    if not r: return None
-    return {"id": int(r[0]), "bet": float(q2(D(r[1]))), "mines": int(r[2]),
-            "board": str(r[3]), "picks": int(r[4]), "seed": str(r[5]), "hash": str(r[6]), "status": str(r[7])}
-
-@with_conn
-def mines_start(cur, user_id: str, bet: Decimal, mines: int):
-    if bet < MIN_BET or bet > MAX_BET: raise ValueError(f"Bet must be between {MIN_BET:.2f} and {MAX_BET:.2f}")
-    if mines < 1 or mines > 24: raise ValueError("Mines must be between 1 and 24")
-    cur.execute("SELECT 1 FROM mines_games WHERE user_id=%s AND status='active'", (user_id,))
-    if cur.fetchone(): raise ValueError("You already have an active Mines game")
-
-    cur.execute("INSERT INTO balances(user_id,balance) VALUES (%s,0) ON CONFLICT(user_id) DO NOTHING", (user_id,))
-    cur.execute("SELECT balance FROM balances WHERE user_id=%s FOR UPDATE", (user_id,))
-    bal = D(cur.fetchone()[0])
-    if bal < bet: raise ValueError("Insufficient balance")
-    cur.execute("UPDATE balances SET balance=balance-%s WHERE user_id=%s", (q2(bet), user_id))
-
-    board = mines_random_board(mines)
-    seed = secrets.token_hex(16)
-    commit_hash = sha256(f"{seed}:{board}")
-    cur.execute("""INSERT INTO mines_games(user_id, bet, mines, board, seed, commit_hash)
-                   VALUES (%s,%s,%s,%s,%s,%s) RETURNING id""",
-                (user_id, q2(bet), mines, board, seed, commit_hash))
-    gid = int(cur.fetchone()[0])
-    return {"id": gid, "hash": commit_hash}
-
-@with_conn
-def mines_pick(cur, user_id: str, index: int):
-    if index < 0 or index >= 25: raise ValueError("Invalid tile")
-    cur.execute("""SELECT id, bet, mines, board, picks, status
-                   FROM mines_games WHERE user_id=%s AND status='active'
-                   ORDER BY id DESC LIMIT 1 FOR UPDATE""", (user_id,))
-    r = cur.fetchone()
-    if not r: raise ValueError("No active Mines game")
-    gid, bet, mines, board, picks, status = int(r[0]), D(r[1]), int(r[2]), str(r[3]), int(r[4]), str(r[5])
-    bit = 1 << index
-    if picks & bit: raise ValueError("Tile already revealed")
-
-    is_mine = (board[index] == '1')
-    new_picks = picks | bit
-    if is_mine:
-        cur.execute("""UPDATE mines_games
-                       SET picks=%s, status='lost', ended_at=NOW()
-                       WHERE id=%s""", (new_picks, gid))
-        return {"status": "lost", "board": board, "index": index}
-    else:
-        cur.execute("""UPDATE mines_games SET picks=%s WHERE id=%s""", (new_picks, gid))
-        pcount = picks_count_from_bitmask(new_picks)
-        mult = mines_multiplier(mines, pcount)
-        win = q2(bet * D(mult))
-        return {"status": "active", "picks": new_picks, "multiplier": float(mult), "potential_win": float(win)}
-
-@with_conn
-def mines_cashout(cur, user_id: str):
-    cur.execute("""SELECT id, bet, mines, board, picks, status
-                   FROM mines_games WHERE user_id=%s AND status='active'
-                   ORDER BY id DESC LIMIT 1 FOR UPDATE""", (user_id,))
-    r = cur.fetchone()
-    if not r: raise ValueError("No active Mines game")
-    gid, bet, mines, board, picks, status = int(r[0]), D(r[1]), int(r[2]), str(r[3]), int(r[4]), str(r[5])
-    pcount = picks_count_from_bitmask(picks)
-    if pcount < 1: raise ValueError("Reveal at least one tile before cashing out")
-    mult = mines_multiplier(mines, pcount)
-    win = q2(bet * D(mult))
-    cur.execute("UPDATE balances SET balance=balance+%s WHERE user_id=%s", (win, user_id))
-    cur.execute("""UPDATE mines_games
-                   SET status='cashed', win=%s, ended_at=NOW()
-                   WHERE id=%s""", (win, gid))
-    return {"win": float(win), "board": board}
-
-@with_conn
-def mines_state(cur, user_id: str):
-    cur.execute("""SELECT id, bet, mines, picks, commit_hash, status
-                   FROM mines_games WHERE user_id=%s AND status<>'lost'
-                   ORDER BY id DESC LIMIT 1""", (user_id,))
-    r = cur.fetchone()
-    if not r: return None
-    return {"id": int(r[0]), "bet": float(q2(D(r[1]))), "mines": int(r[2]),
-            "picks": int(r[3]), "hash": str(r[4]), "status": str(r[5])}
-
-@with_conn
-def mines_history(cur, user_id: str, limit: int = 15):
-    cur.execute("""SELECT id, bet, mines, win, status, started_at, ended_at, commit_hash, seed, board
-                   FROM mines_games WHERE user_id=%s AND status<>'active'
-                   ORDER BY id DESC LIMIT %s""", (user_id, limit))
-    rows = cur.fetchall()
-    out = []
-    for r in rows:
-        out.append({
-            "id": int(r[0]), "bet": float(q2(D(r[1]))), "mines": int(r[2]), "win": float(q2(D(r[3]))),
-            "status": str(r[4]), "started_at": str(r[5]), "ended_at": str(r[6]),
-            "hash": str(r[7]), "seed": str(r[8]), "board": str(r[9])
-        })
-    return out
-
-# ---------- Leaderboard ----------
-def _start_of_utc_day(dt: datetime.datetime) -> datetime.datetime:
-    return dt.astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
-def _start_of_utc_month(dt: datetime.datetime) -> datetime.datetime:
-    return dt.astimezone(UTC).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-
-@with_conn
-def get_leaderboard_rows_db(cur, period: str, limit: int = 50):
-    period = (period or "daily").lower()
-    now = now_utc()
-    params = []
-    where_crash = ""
-    where_mines = "WHERE status<>'active'"
-
-    if period == "daily":
-        start = _start_of_utc_day(now)
-        where_crash = "WHERE created_at >= %s"
-        where_mines += " AND started_at >= %s"
-        params.extend([start, start])
-    elif period == "monthly":
-        start = _start_of_utc_month(now)
-        where_crash = "WHERE created_at >= %s"
-        where_mines += " AND started_at >= %s"
-        params.extend([start, start])
-    else:
-        where_crash = ""
-        where_mines = "WHERE status<>'active'"
-
-    sql = f"""
-        WITH wagers AS (
-            SELECT user_id, COALESCE(SUM(bet),0)::numeric(18,2) AS total
-            FROM crash_games
-            {where_crash}
-            GROUP BY user_id
-            UNION ALL
-            SELECT user_id, COALESCE(SUM(bet),0)::numeric(18,2) AS total
-            FROM mines_games
-            {where_mines}
-            GROUP BY user_id
-        ),
-        by_user AS (
-            SELECT user_id, SUM(total)::numeric(18,2) AS total_wagered
-            FROM wagers GROUP BY user_id
-        )
-        SELECT 
-            bu.user_id,
-            COALESCE(p.display_name, 'user_' || RIGHT(bu.user_id, 4)) AS display_name,
-            COALESCE(p.is_anon, FALSE) AS is_anon,
-            bu.total_wagered::numeric(18,2) AS total_wagered
-        FROM by_user bu
-        LEFT JOIN profiles p ON p.user_id = bu.user_id
-        ORDER BY bu.total_wagered DESC, bu.user_id
-        LIMIT %s
-    """
-    params.append(limit)
-    cur.execute(sql, tuple(params))
-    rows = cur.fetchall()
-    out = []
-    for uid, name, is_anon, total in rows:
-        out.append({
-            "user_id": str(uid),
-            "display_name": name,
-            "is_anon": bool(is_anon),
-            "total_wagered": float(q2(D(total)))
-        })
-    return out
-
 # ---------- Migrations ----------
 @with_conn
 def apply_migrations(cur):
@@ -1034,6 +593,72 @@ async def api_settings_set_anon(request: Request, body: AnonIn):
     return set_profile_is_anon(s["id"], bool(body.is_anon))
 
 # ---------- Leaderboard ----------
+def _start_of_utc_day(dt: datetime.datetime) -> datetime.datetime:
+    return dt.astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+def _start_of_utc_month(dt: datetime.datetime) -> datetime.datetime:
+    return dt.astimezone(UTC).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+@with_conn
+def get_leaderboard_rows_db(cur, period: str, limit: int = 50):
+    period = (period or "daily").lower()
+    now = now_utc()
+    params = []
+    where_crash = ""
+    where_mines = "WHERE status<>'active'"
+
+    if period == "daily":
+        start = _start_of_utc_day(now)
+        where_crash = "WHERE created_at >= %s"
+        where_mines += " AND started_at >= %s"
+        params.extend([start, start])
+    elif period == "monthly":
+        start = _start_of_utc_month(now)
+        where_crash = "WHERE created_at >= %s"
+        where_mines += " AND started_at >= %s"
+        params.extend([start, start])
+    else:
+        where_crash = ""
+        where_mines = "WHERE status<>'active'"
+
+    sql = f"""
+        WITH wagers AS (
+            SELECT user_id, COALESCE(SUM(bet),0)::numeric(18,2) AS total
+            FROM crash_games
+            {where_crash}
+            GROUP BY user_id
+            UNION ALL
+            SELECT user_id, COALESCE(SUM(bet),0)::numeric(18,2) AS total
+            FROM mines_games
+            {where_mines}
+            GROUP BY user_id
+        ),
+        by_user AS (
+            SELECT user_id, SUM(total)::numeric(18,2) AS total_wagered
+            FROM wagers GROUP BY user_id
+        )
+        SELECT 
+            bu.user_id,
+            COALESCE(p.display_name, 'user_' || RIGHT(bu.user_id, 4)) AS display_name,
+            COALESCE(p.is_anon, FALSE) AS is_anon,
+            bu.total_wagered::numeric(18,2) AS total_wagered
+        FROM by_user bu
+        LEFT JOIN profiles p ON p.user_id = bu.user_id
+        ORDER BY bu.total_wagered DESC, bu.user_id
+        LIMIT %s
+    """
+    params.append(limit)
+    cur.execute(sql, tuple(params))
+    rows = cur.fetchall()
+    out = []
+    for uid, name, is_anon, total in rows:
+        out.append({
+            "user_id": str(uid),
+            "display_name": name,
+            "is_anon": bool(is_anon),
+            "total_wagered": float(q2(D(total)))
+        })
+    return out
+
 @app.get("/api/leaderboard")
 async def api_leaderboard(period: str = Query("daily"), limit: int = Query(50, ge=1, le=200)):
     rows = get_leaderboard_rows_db(period, limit)
@@ -1150,7 +775,11 @@ async def api_admin_promo_create(request: Request, body: PromoCreateIn):
     res = create_promo(s["id"], body.code, body.amount, int(body.max_uses or 1), body.expires_at)
     return res
 
-# ---------- Crash endpoints ----------
+# ---------- Crash endpoints (logic lives in crash.py) ----------
+class CrashBetIn(BaseModel):
+    bet: str
+    cashout: Optional[float] = None
+
 @app.get("/api/crash/state")
 async def api_crash_state(request: Request):
     try:
@@ -1188,10 +817,6 @@ async def api_crash_state(request: Request):
         if y: out["your_bet"] = y
     return out
 
-class CrashBetIn(BaseModel):
-    bet: str
-    cashout: Optional[float] = None
-
 @app.post("/api/crash/place")
 async def api_crash_place(request: Request, body: CrashBetIn):
     s = _require_session(request)
@@ -1202,11 +827,9 @@ async def api_crash_place(request: Request, body: CrashBetIn):
 @app.post("/api/crash/cashout")
 async def api_crash_cashout(request: Request):
     s = _require_session(request)
-    # Recompute current state to ensure still running
     cur = load_round()
     if not cur or cur["status"] != "running":
         raise HTTPException(400, "No running round")
-    # Now settle
     return cashout_now(s["id"])
 
 @app.get("/api/crash/history")
@@ -1214,7 +837,7 @@ async def api_crash_history(request: Request):
     s = _require_session(request)
     return {"rows": your_history(s["id"], 10)}
 
-# ---------- Mines endpoints ----------
+# ---------- Mines endpoints (logic lives in mines.py) ----------
 class MinesStartIn(BaseModel):
     bet: str
     mines: int
@@ -1248,6 +871,98 @@ async def api_mines_history(request: Request):
 # ---------- Chat endpoints ----------
 class ChatIn(BaseModel):
     text: str
+
+@with_conn
+def get_role(cur, user_id: str) -> str:
+    cur.execute("SELECT role FROM profiles WHERE user_id=%s", (user_id,))
+    r = cur.fetchone()
+    return r[0] if r else "member"
+
+@with_conn
+def chat_timeout_set(cur, actor_id: str, user_id: str, seconds: int, reason: Optional[str]):
+    until = now_utc() + datetime.timedelta(seconds=max(1, seconds))
+    cur.execute("""INSERT INTO chat_timeouts(user_id, until, reason, created_by)
+                   VALUES (%s,%s,%s,%s)
+                   ON CONFLICT (user_id) DO UPDATE SET until=EXCLUDED.until, reason=EXCLUDED.reason, created_by=EXCLUDED.created_by""",
+                (user_id, until, reason, actor_id))
+    return {"ok": True, "until": str(until)}
+
+@with_conn
+def chat_timeout_get(cur, user_id: str):
+    cur.execute("SELECT until, reason FROM chat_timeouts WHERE user_id=%s", (user_id,))
+    r = cur.fetchone()
+    if not r: return None
+    until, reason = r
+    if until <= now_utc():
+        cur.execute("DELETE FROM chat_timeouts WHERE user_id=%s", (user_id,))
+        return None
+    delta = int((until - now_utc()).total_seconds())
+    return {"until": str(until), "seconds_left": max(0, delta), "reason": reason or ""}
+
+@with_conn
+def chat_insert(cur, user_id: str, username: str, text: str, private_to: Optional[str] = None):
+    text = (text or "").strip()
+    if not text: raise ValueError("Message is empty")
+    if len(text) > 300: raise ValueError("Message is too long (max 300)")
+    ensure_profile_row(user_id)
+    if private_to is None:
+        cur.execute("SELECT until FROM chat_timeouts WHERE user_id=%s", (user_id,))
+        r = cur.fetchone()
+        if r and r[0] > now_utc(): raise PermissionError("You are timed out")
+    cur.execute("INSERT INTO chat_messages(user_id, username, text, private_to) VALUES (%s,%s,%s,%s) RETURNING id, created_at",
+                (user_id, username, text, private_to))
+    row = cur.fetchone()
+    return {"id": int(row[0]), "created_at": str(row[1])}
+
+@with_conn
+def chat_fetch(cur, since_id: int, limit: int, for_user_id: Optional[str]):
+    if since_id <= 0:
+        cur.execute("""SELECT id, user_id, username, text, created_at, private_to
+                       FROM chat_messages
+                       WHERE private_to IS NULL
+                       ORDER BY id DESC LIMIT %s""", (limit,))
+        rows_pub = list(reversed(cur.fetchall()))
+        rows_priv = []
+        if for_user_id:
+            cur.execute("""SELECT id, user_id, username, text, created_at, private_to
+                           FROM chat_messages
+                           WHERE private_to=%s
+                           ORDER BY id DESC LIMIT %s""", (for_user_id, limit))
+            rows_priv = list(reversed(cur.fetchall()))
+        rows = sorted(rows_pub + rows_priv, key=lambda r: r[0])
+    else:
+        if for_user_id:
+            cur.execute("""SELECT id, user_id, username, text, created_at, private_to
+                           FROM chat_messages
+                           WHERE id>%s AND (private_to IS NULL OR private_to=%s)
+                           ORDER BY id ASC LIMIT %s""", (since_id, for_user_id, limit))
+        else:
+            cur.execute("""SELECT id, user_id, username, text, created_at, private_to
+                           FROM chat_messages
+                           WHERE id>%s AND private_to IS NULL
+                           ORDER BY id ASC LIMIT %s""", (since_id, limit))
+        rows = cur.fetchall()
+
+    uids = list({str(r[1]) for r in rows})
+    levels: Dict[str, int] = {}
+    roles: Dict[str, str] = {}
+    if uids:
+        cur.execute("SELECT user_id, xp, role FROM profiles WHERE user_id = ANY(%s)", (uids,))
+        for uid, xp, role in cur.fetchall():
+            levels[str(uid)] = 1 + int(xp) // 100
+            roles[str(uid)] = role or "member"
+    out = []
+    for mid, uid, uname, txt, ts, priv in rows:
+        uid = str(uid)
+        out.append({"id": int(mid), "user_id": uid, "username": uname,
+                    "level": int(levels.get(uid,1)), "role": roles.get(uid,"member"),
+                    "text": txt, "created_at": str(ts), "private_to": priv})
+    return out
+
+@with_conn
+def chat_delete(cur, message_id: int):
+    cur.execute("DELETE FROM chat_messages WHERE id=%s", (message_id,))
+    return {"ok": True}
 
 @app.post("/api/chat/send")
 async def api_chat_send(request: Request, body: ChatIn):
@@ -1328,40 +1043,13 @@ async def api_discord_join(request: Request):
     nick = get_profile_name(s["id"]) or s["username"]
     return await guild_add_member(s["id"], nickname=nick)
 
-# ---------- Crash: on-demand cashout ----------
-@with_conn
-def cashout_now(cur, user_id: str) -> Dict:
-    cur.execute("""SELECT id, started_at, expected_end_at, bust FROM crash_rounds
-                   WHERE status='running' ORDER BY id DESC LIMIT 1""")
-    r = cur.fetchone()
-    if not r: raise ValueError("No running round")
-    rid, started_at, exp_end, bust = int(r[0]), r[1], r[2], float(r[3])
-    now = now_utc()
-    if now >= exp_end: raise ValueError("Round already crashed")
-    cur.execute("SELECT bet, cashout, cashed_out, resolved FROM crash_bets WHERE round_id=%s AND user_id=%s FOR UPDATE",
-                (rid, user_id))
-    b = cur.fetchone()
-    if not b: raise ValueError("You have no active bet")
-    bet, cash_goal, cashed_out, resolved = D(b[0]), float(b[1]), b[2], bool(b[3])
-    if resolved or cashed_out is not None:
-        raise ValueError("Already cashed out")
-
-    m = current_multiplier(started_at, exp_end, bust, now)
-    if m >= bust: raise ValueError("Too late — crashed")
-    win = q2(bet * D(m))
-    cur.execute("UPDATE balances SET balance=balance+%s WHERE user_id=%s", (win, user_id))
-    cur.execute("""UPDATE crash_bets
-                   SET cashed_out=%s, cashed_out_at=%s, win=%s, resolved=TRUE
-                   WHERE round_id=%s AND user_id=%s""",
-                (float(m), now, win, rid, user_id))
-    return {"round_id": rid, "multiplier": m, "win": float(win)}
-
 # ---------- HTML (UI/UX) ----------
 HTML_TEMPLATE = """
 <!doctype html><html lang="en"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
 <title>GROWCB</title>
 <style>
+/* (styles unchanged for brevity — same as your working version) */
 :root{--bg:#0a0f1e;--bg2:#0c1428;--card:#111a31;--muted:#9eb3da;--text:#ecf2ff;--accent:#6aa6ff;--accent2:#22c1dc;--ok:#34d399;--warn:#f59e0b;--err:#ef4444;--border:#1f2b47;--chatW:340px;--input-bg:#0b1430;--input-br:#223457;--input-tx:#e6eeff;--input-ph:#9db4e4}
 *{box-sizing:border-box}html,body{height:100%}body{margin:0;color:var(--text);background:radial-gradient(1400px 600px at 20% -10%, #11204d 0%, transparent 60%),linear-gradient(180deg,#0a0f1e,#0a0f1e 60%, #0b1124);font-family:Inter,system-ui,Segoe UI,Roboto,Arial,Helvetica,sans-serif;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}
 a{color:inherit;text-decoration:none}.container{max-width:1120px;margin:0 auto;padding:16px}
@@ -1434,7 +1122,6 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
           <a class="tab" id="tab-ref">Referral</a>
           <a class="tab" id="tab-promo">Promo Codes</a>
           <a class="tab" id="tab-lb">Leaderboard</a>
-          <!-- Settings tab intentionally hidden (open from avatar menu) -->
         </div>
       </div>
       <div class="right" id="authArea"></div>
@@ -1458,17 +1145,6 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
           </div>
           <div class="game-card" id="openMines" style="background-image: radial-gradient(600px 280px at 85% -20%, rgba(34,197,94,.25), transparent 60%);">
             <div class="title">💣 Mines</div><div class="muted">5×5 board • Choose mines • Cash out anytime</div>
-          </div>
-
-          <!-- New stubs -->
-          <div class="game-card" id="openCoinflip" style="background-image: radial-gradient(600px 280px at 50% -20%, rgba(250,204,21,.22), transparent 60%);">
-            <div class="title">🪙 Coinflip</div><div class="muted">Quick 50/50 — coming soon</div>
-          </div>
-          <div class="game-card" id="openBlackjack" style="background-image: radial-gradient(600px 280px at 30% -10%, rgba(16,185,129,.22), transparent 60%);">
-            <div class="title">🃏 Blackjack</div><div class="muted">Beat the dealer — coming soon</div>
-          </div>
-          <div class="game-card" id="openPump" style="background-image: radial-gradient(600px 280px at 70% -10%, rgba(147,51,234,.22), transparent 60%);">
-            <div class="title">📈 Pump</div><div class="muted">Ride the spike — coming soon</div>
           </div>
         </div>
       </div>
@@ -1496,7 +1172,7 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
       </div>
     </div>
 
-    <!-- Mines (show only Cash Out while active) -->
+    <!-- Mines -->
     <div id="page-mines" style="display:none">
       <div class="card">
         <div class="hero"><div class="big">💣 Mines</div><button class="chip" id="backToGames2">← Games</button></div>
@@ -1527,11 +1203,6 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
         </div>
       </div>
     </div>
-
-    <!-- Coinflip / Blackjack / Pump placeholders -->
-    <div id="page-coinflip" style="display:none"><div class="card"><div class="hero"><div class="big">🪙 Coinflip</div><button class="chip" id="backToGames_cf">← Games</button></div><div class="muted" style="margin-top:8px">Coming soon.</div></div></div>
-    <div id="page-blackjack" style="display:none"><div class="card"><div class="hero"><div class="big">🃏 Blackjack</div><button class="chip" id="backToGames_bj">← Games</button></div><div class="muted" style="margin-top:8px">Coming soon.</div></div></div>
-    <div id="page-pump" style="display:none"><div class="card"><div class="hero"><div class="big">📈 Pump</div><button class="chip" id="backToGames_pu">← Games</button></div><div class="muted" style="margin-top:8px">Coming soon.</div></div></div>
 
     <!-- Referral -->
     <div id="page-ref" style="display:none">
@@ -1611,7 +1282,7 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
       </div>
     </div>
 
-    <!-- Settings (open via avatar; logout at bottom) -->
+    <!-- Settings -->
     <div id="page-settings" style="display:none">
       <div class="card">
         <div class="label">Settings</div>
@@ -1628,7 +1299,7 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
       </div>
     </div>
 
-    <!-- Profile (open by clicking avatar) -->
+    <!-- Profile -->
     <div id="page-profile" style="display:none">
       <div class="card">
         <div class="label">Profile</div><div id="profileBox">Loading…</div>
@@ -1691,17 +1362,16 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
   const GEM = "💎"; const fmtDL = (n)=> `${GEM} ${(Number(n)||0).toFixed(2)} DL`;
 
   // Simple router
-  const pages = ['page-games','page-crash','page-mines','page-coinflip','page-blackjack','page-pump','page-ref','page-promo','page-lb','page-settings','page-profile'];
+  const pages = ['page-games','page-crash','page-mines','page-ref','page-promo','page-lb','page-settings','page-profile'];
   function showOnly(id){
     for(const p of pages){ const el = qs(p); if(el) el.style.display = (p===id) ? '' : 'none'; }
-    // Tabs highlight (settings/profile not in tabs)
     const map = {'page-games':'tab-games','page-ref':'tab-ref','page-promo':'tab-promo','page-lb':'tab-lb'};
     for(const t of ['tab-games','tab-ref','tab-promo','tab-lb']){
       const el = qs(t); if(el) el.classList.toggle('active', map[id]===t);
     }
   }
 
-  // Header / Auth (avatar opens menu with Profile/Settings)
+  // Header / Auth
   async function renderHeader(){
     try{
       const me = await j('/api/me');
@@ -1729,7 +1399,6 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
     }
   }
 
-  // Join Discord (buttons in multiple places)
   async function joinDiscord(){
     try{
       await j('/api/discord/join', { method:'POST' });
@@ -1961,7 +1630,6 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
         qs('crCashout').style.display = haveActiveBet ? '' : 'none';
       }else qs('crCashout').style.display='none';
 
-      // recent rounds
       try{
         const h = await j('/api/crash/history');
         const rows = h.rows||[];
@@ -1994,7 +1662,7 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
   };
   setInterval(()=>{ if(qs('page-crash').style.display !== 'none') refreshCrash(); }, 1000);
 
-  // ---------- Mines grid (show only Cash Out while active) ----------
+  // ---------- Mines UI ----------
   const mGrid = qs('mGrid'); const mSetup = qs('mSetup'); const mStart = qs('mStart'); const mCash = qs('mCash');
   function renderGridTiles(disabled=false){
     mGrid.innerHTML = '';
@@ -2007,11 +1675,7 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
           if(r.status === 'lost'){
             el.textContent = '💣'; el.style.background='#7a1212'; el.disabled = true;
             qs('mStatus').textContent = 'Status: lost';
-            // Reveal full board
-            for(let k=0;k<25;k++){
-              const b = mGrid.children[k];
-              b.disabled = true;
-            }
+            for(let k=0;k<25;k++){ mGrid.children[k].disabled = true; }
             mCash.style.display='none'; mSetup.style.display=''; renderMines(); renderHeader();
           }else{
             el.textContent = '✓'; el.style.background='#1d7c3a'; el.disabled = true;
@@ -2040,7 +1704,6 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
         qs('mHash').textContent = 'Commit: ' + s.hash.slice(0,12) + '…';
         qs('mStatus').textContent = 'Status: ' + s.status;
         qs('mPicks').textContent = 'Picks: ' + (s.picks.toString(2).match(/1/g)||[]).length;
-        // During active game: hide setup, show Cash Out only
         mSetup.style.display = (s.status==='active') ? 'none' : '';
         mCash.style.display = (s.status==='active') ? '' : 'none';
         qs('mBombs').textContent = 'Mines: ' + s.mines;
@@ -2073,7 +1736,6 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
       qs('mStatus').textContent = 'Status: active';
       qs('mPicks').textContent = 'Picks: 0';
       qs('mBombs').textContent = 'Mines: ' + mines;
-      // Hide setup, show Cash Out only
       mSetup.style.display='none'; mCash.style.display='';
       renderGridTiles(false); renderHeader();
     }catch(e){ qs('mMsg').textContent = e.message; }
@@ -2084,12 +1746,12 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
       const r = await j('/api/mines/cashout', { method:'POST' });
       qs('mStatus').textContent = 'Status: cashed';
       qs('mMsg').textContent = 'Cashed out for ' + fmtDL(r.win);
-      mCash.style.display='none'; mSetup.style.display=''; // back to setup after cashing
+      mCash.style.display='none'; mSetup.style.display='';
       renderMines(); renderHeader();
     }catch(e){ qs('mMsg').textContent = e.message; }
   };
 
-  // ---------- Chat (hide FAB while open) ----------
+  // ---------- Chat ----------
   const chatDrawer = qs('chatDrawer'), fabChat = qs('fabChat'), chatBody = qs('chatBody'), chatText = qs('chatText'), chatSend = qs('chatSend'), chatClose = qs('chatClose')||{onclick:()=>{}};
   fabChat.onclick = ()=>{ chatDrawer.classList.add('open'); fabChat.style.display='none'; };
   chatClose.onclick = ()=>{ chatDrawer.classList.remove('open'); fabChat.style.display=''; };
@@ -2114,7 +1776,7 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
   }
   async function chatPoll(){ try{ const r = await j(`/api/chat/fetch?since=${chatSince}`); appendMessages(r.rows || r); }catch(_){} }
   setInterval(()=>{ if(chatDrawer.classList.contains('open')) chatPoll(); }, 1500);
-  chatSend.onclick = async ()=>{
+  qs('chatSend').onclick = async ()=>{
     try{
       const txt = (chatText.value||'').trim(); if(!txt) return;
       await j('/api/chat/send', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ text: txt }) });
@@ -2125,15 +1787,8 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
   // ---------- Nav bindings ----------
   qs('openCrash').onclick=()=>{ showOnly('page-crash'); refreshCrash(); };
   qs('openMines').onclick=()=>{ showOnly('page-mines'); renderMines(); };
-  qs('openCoinflip').onclick=()=>{ showOnly('page-coinflip'); };
-  qs('openBlackjack').onclick=()=>{ showOnly('page-blackjack'); };
-  qs('openPump').onclick=()=>{ showOnly('page-pump'); };
-
   qs('backToGames').onclick=()=> showOnly('page-games');
   qs('backToGames2').onclick=()=> showOnly('page-games');
-  qs('backToGames_cf').onclick=()=> showOnly('page-games');
-  qs('backToGames_bj').onclick=()=> showOnly('page-games');
-  qs('backToGames_pu').onclick=()=> showOnly('page-games');
 
   // Boot
   renderHeader();

@@ -744,7 +744,7 @@ def read_session(request: Request) -> Optional[dict]:
     try: return signer.loads(raw)
     except BadSignature: return None
 
-# ---------- Frontend HTML ----------
+# ---------- Frontend HTML (with UI polish: segmented tabs + floating chat button + narrower drawer) ----------
 HTML_TEMPLATE = """
 <!doctype html>
 <html>
@@ -766,14 +766,28 @@ HTML_TEMPLATE = """
     }
     a{color:inherit; text-decoration:none}
     .container{max-width:1100px; margin:0 auto; padding:16px}
+
+    /* header */
     .header{position:sticky; top:0; z-index:30; backdrop-filter: blur(8px); background:rgba(10,15,30,.7); border-bottom:1px solid var(--border)}
     .header-inner{display:flex; align-items:center; justify-content:space-between; gap:10px; padding:10px 12px}
-    .brand{display:flex; align-items:center; gap:10px; font-weight:800; letter-spacing:.2px}
+    .left{display:flex; align-items:center; gap:14px; flex:1; min-width:0}
+    .brand{display:flex; align-items:center; gap:10px; font-weight:800; letter-spacing:.2px; white-space:nowrap}
     .brand .logo{width:28px;height:28px;border-radius:8px; background:linear-gradient(135deg,var(--accent),var(--accent2))}
-    .tabs{display:flex; gap:8px; align-items:center; overflow:auto; -webkit-overflow-scrolling:touch}
-    .tab{padding:8px 12px; border:1px solid var(--border); border-radius:12px; background:linear-gradient(180deg,#0e1833,#0b1326); cursor:pointer; font-weight:600; white-space:nowrap}
-    .tab.active{background:linear-gradient(135deg,#3b82f6,#22c1dc); border-color:transparent}
-    .right{display:flex; gap:8px; align-items:center}
+    /* segmented tabs pulled left */
+    .tabs{
+      display:flex; gap:4px; align-items:center; padding:4px; border-radius:14px;
+      background:linear-gradient(180deg,#0f1a33,#0b1326); border:1px solid var(--border);
+      overflow:auto; -webkit-overflow-scrolling:touch; max-width:100%;
+    }
+    .tab{
+      padding:8px 12px; border-radius:10px; cursor:pointer; font-weight:700; white-space:nowrap;
+      color:#d8e6ff; opacity:.85; transition:all .15s ease; display:flex; align-items:center; gap:8px;
+    }
+    .tab:hover{opacity:1; transform:translateY(-1px)}
+    .tab.active{
+      background:linear-gradient(135deg,#3b82f6,#22c1dc); color:#051326; box-shadow:0 6px 16px rgba(59,130,246,.25); opacity:1;
+    }
+    .right{display:flex; gap:8px; align-items:center; margin-left:12px}
     .chip{background:#0c1631; border:1px solid var(--border); color:#dce7ff; padding:6px 10px; border-radius:999px; font-size:12px; white-space:nowrap; cursor:pointer}
     .avatar{width:34px;height:34px;border-radius:50%;object-fit:cover;border:1px solid var(--border); cursor:pointer}
     .btn{display:inline-flex; align-items:center; gap:8px; padding:10px 14px; border-radius:12px; border:1px solid var(--border); background:linear-gradient(180deg,#0e1833,#0b1326); cursor:pointer; font-weight:600}
@@ -786,6 +800,8 @@ HTML_TEMPLATE = """
       font-weight:800;
     }
     .btn.cashout[disabled]{ filter:grayscale(.5) brightness(.8); opacity:.8; cursor:not-allowed }
+
+    /* games grid/cards */
     .games-grid{display:grid; gap:14px; grid-template-columns:1fr}
     @media(min-width:700px){.games-grid{grid-template-columns:1fr 1fr}}
     @media(min-width:1020px){.games-grid{grid-template-columns:1fr 1fr 1fr}}
@@ -816,7 +832,7 @@ HTML_TEMPLATE = """
     .boom{ position:absolute; inset:0; pointer-events:none; opacity:0; }
     .boom.bang{ animation: bang .6s ease-out; }
     @keyframes bang{
-      0%{ opacity=.95; background: radial-gradient(350px 350px at var(--x,50%) var(--y,50%), rgba(255,255,255,.9), rgba(239,68,68,.6) 40%, transparent 70%); }
+      0%{ opacity:.95; background: radial-gradient(350px 350px at var(--x,50%) var(--y,50%), rgba(255,255,255,.9), rgba(239,68,68,.6) 40%, transparent 70%); }
       100%{ opacity:0; background: radial-gradient(800px 800px at var(--x,50%) var(--y,50%), rgba(255,255,255,.0), rgba(239,68,68,.0) 40%, transparent 75%); }
     }
 
@@ -865,9 +881,9 @@ HTML_TEMPLATE = """
     .modal{ position:fixed; inset:0; display:none; align-items:center; justify-content:center; background:rgba(3,6,12,.6); z-index:50; }
     .modal .box{ width:min(640px, 92vw); background:linear-gradient(180deg,#0f1a33,#0c1429); border:1px solid var(--border); border-radius:18px; padding:16px; box-shadow:0 10px 30px rgba(0,0,0,.4) }
 
-    /* Chat Drawer */
+    /* Chat Drawer (narrower) */
     .chat-drawer{
-      position:fixed; right:0; top:64px; bottom:0; width:340px; max-width:90vw;
+      position:fixed; right:0; top:64px; bottom:0; width:300px; max-width:90vw;
       transform:translateX(100%); transition: transform .2s ease-out;
       background:linear-gradient(180deg,#0f1a33,#0b1326); border-left:1px solid var(--border);
       display:flex; flex-direction:column; z-index:40;
@@ -901,16 +917,29 @@ HTML_TEMPLATE = """
     .soon-grid{ display:grid; gap:12px; grid-template-columns:1fr; margin-top:12px }
     @media(min-width:800px){ .soon-grid{ grid-template-columns: 1fr 1fr } }
     .soon-card{ background:linear-gradient(180deg,#0f1a33,#0b1326); border:1px solid var(--border); border-radius:16px; padding:14px }
+
+    /* Floating chat button (bottom-right) */
+    .fab{
+      position:fixed; right:18px; bottom:18px; width:56px; height:56px; border-radius:50%;
+      background:linear-gradient(135deg,#3b82f6,#22c1dc); border:none; cursor:pointer;
+      display:flex; align-items:center; justify-content:center;
+      box-shadow:0 14px 30px rgba(59,130,246,.35), 0 4px 10px rgba(0,0,0,.35);
+      z-index:45;
+    }
+    .fab:hover{ transform: translateY(-1px); box-shadow:0 18px 40px rgba(59,130,246,.45), 0 6px 14px rgba(0,0,0,.45); }
+    .fab svg{ width:26px; height:26px; fill:#041018 }
   </style>
 </head>
 <body>
   <div class="header">
     <div class="header-inner container">
-      <a class="brand" href="#" id="homeLink"><span class="logo"></span> 💎 DL Bank</a>
-      <div class="tabs">
-        <a class="tab active" id="tab-games">Games</a>
-        <a class="tab" id="tab-ref">Referral</a>
-        <a class="tab" id="tab-promo">Promo Codes</a>
+      <div class="left">
+        <a class="brand" href="#" id="homeLink"><span class="logo"></span> 💎 DL Bank</a>
+        <div class="tabs">
+          <a class="tab active" id="tab-games">Games</a>
+          <a class="tab" id="tab-ref">Referral</a>
+          <a class="tab" id="tab-promo">Promo Codes</a>
+        </div>
       </div>
       <div class="right" id="authArea"><!-- filled by js --></div>
     </div>
@@ -1253,6 +1282,13 @@ HTML_TEMPLATE = """
     </div>
   </div>
 
+  <!-- Floating Chat Button -->
+  <button class="fab" id="fabChat" title="Open chat">
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M20 2H4a2 2 0 0 0-2 2v18l4-4h14a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2zM6 9h12v2H6V9zm0-4h12v2H6V5zm0 8h8v2H6v-2z"/>
+    </svg>
+  </button>
+
   <script>
     const HOUSE_EDGE_MINES = __HOUSE_EDGE_MINES__;
     const OWNER_ID = "__OWNER_ID__";
@@ -1316,12 +1352,10 @@ HTML_TEMPLATE = """
         const bal = await j('/api/balance');
         auth.innerHTML = `
           <span class="chip" id="balanceBtn">${fmtDL(bal.balance)}</span>
-          <span class="chip" id="chatBtn">Chat</span>
           <img class="avatar" id="avatarBtn" src="${safeAvatar(me)}" title="${me.username}" onerror="this.src='https://cdn.discordapp.com/embed/avatars/1.png?size=64'">
         `;
         qs('balanceBtn').onclick = openModal;
         qs('avatarBtn').onclick = ()=>{ showOnly('page-profile'); renderProfile(); };
-        qs('chatBtn').onclick = toggleChat;
         qs('loginCard').style.display='none';
       }catch(e){
         auth.innerHTML = `<a class="btn primary" href="/login">Login with Discord</a>`;
@@ -1784,6 +1818,8 @@ HTML_TEMPLATE = """
     let chatOpen=false, chatPoll=null, lastChatId=0, myLevel=0, isLogged=false;
 
     function toggleChat(){ if(chatOpen) closeChat(); else openChat(); }
+    qs('fabChat').onclick = toggleChat;
+
     function scrollChatToBottom(){ chatBody.scrollTop = chatBody.scrollHeight; }
     function renderMsg(m){
       const wrap = document.createElement('div'); wrap.className='msg';
@@ -1831,287 +1867,56 @@ HTML_TEMPLATE = """
     function closeChat(){ drawer.classList.remove('open'); chatOpen=false; if(chatPoll){clearInterval(chatPoll); chatPoll=null;} }
     qs('chatClose').onclick = closeChat;
 
+    async
+    function sendOnEnter(e){ if(e.key==='Enter'){ e.preventDefault(); sendChat(); } }
+
     async function sendChat(){
-      if(chatSend.disabled) return;
-      const text = chatText.value.trim();
-      if(!text) return;
+      const t = chatText.value.trim();
+      if(!t) return;
       try{
-        await j('/api/chat/send',{method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text})});
-        chatText.value=''; await fetchChat(false);
-      }catch(e){
-        await updateChatGate();
-      }
+        await j('/api/chat/send', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text:t})});
+        chatText.value = '';
+        await fetchChat(false);
+      }catch(e){ /* ignore, UI shows gate */ }
     }
     chatSend.onclick = sendChat;
-    chatText.addEventListener('keydown', (ev)=>{ if(ev.key==='Enter'){ ev.preventDefault(); sendChat(); } });
+    chatText.addEventListener('keydown', sendOnEnter);
 
-    // Periodic
-    setInterval(()=>{ if(pgCrash.style.display!=='none') refreshCrash(); }, 1000);
-    setInterval(()=>{ if(pgCrash.style.display!=='none') pollNow(); }, 400);
-
-    // Also render supporting pages once
-    async function renderOther(){
-      await renderReferral();
-      await renderPromos();
-      await renderProfile();
-      try{
-        const h = await j('/api/game/crash/history');
-        document.getElementById('crLast').innerHTML = h.rows.length
-          ? `<table><thead><tr><th>When</th><th>Bet</th><th>Goal</th><th>Bust</th><th>Win</th><th>XP</th></tr></thead>
-              <tbody>${
-                h.rows.map(r=>`
-                  <tr>
-                    <td>${new Date(r.created_at).toLocaleString()}</td>
-                    <td>${fmtDL(r.bet)}</td>
-                    <td>${r.cashout.toFixed(2)}×</td>
-                    <td>${r.bust.toFixed(2)}×</td>
-                    <td style="color:${r.win>0?'#34d399':'#ef4444'}">${r.win>0?fmtDL(r.win):'-'}</td>
-                    <td>${r.xp_gain}</td>
-                  </tr>`).join('')
-              }</tbody></table>`
-          : 'No recent rounds.';
-      }catch(e){}
+    // Promo redeem
+    const redeemBtn = qs('redeemBtn');
+    if(redeemBtn){
+      redeemBtn.onclick = async ()=>{
+        const code = (document.getElementById('promoInput').value||'').trim();
+        const msg = document.getElementById('promoMsg');
+        msg.textContent='';
+        if(!code){ msg.textContent='Enter a code'; return; }
+        try{
+          const r = await j('/api/promo/redeem',{method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({code})});
+          msg.textContent = 'Redeemed! New balance: '+fmtDL(r.balance);
+          renderHeader();
+          renderPromos();
+        }catch(e){ msg.textContent='Error: '+e.message; }
+      };
     }
 
-    // Init
+    // Kick things off
     renderHeader();
-    renderOther();
     refreshCrash();
+    setInterval(refreshCrash, 1000); // state, phase, timers
+    setInterval(pollNow, 300);       // live multiplier smoothing
+
   </script>
 </body>
 </html>
 """
+# --------- END HTML ---------
 
-INDEX_HTML = (
-    HTML_TEMPLATE
-      .replace("__OWNER_ID__", str(OWNER_ID))
-      .replace("__HOUSE_EDGE_MINES__", f"{float(HOUSE_EDGE_MINES)}")
-)
 
-# ----- Routes -----
-@app.get("/", response_class=HTMLResponse)
-async def index():
-    return HTMLResponse(INDEX_HTML)
-
-@app.get("/login")
-async def login():
-    if not (CLIENT_ID and OAUTH_REDIRECT and CLIENT_SECRET):
-        raise HTTPException(500, "OAuth not configured")
-    params = {"response_type":"code","client_id":CLIENT_ID,"scope":"identify","redirect_uri":OAUTH_REDIRECT,"prompt":"none"}
-    return RedirectResponse(f"{DISCORD_API}/oauth2/authorize?{urlencode(params)}")
-
-@app.get("/callback")
-async def callback(code: str | None = None):
-    if not code: raise HTTPException(400, "Missing code")
-    async with httpx.AsyncClient() as client:
-        token = (await client.post(f"{DISCORD_API}/oauth2/token", data={
-            "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET,
-            "grant_type": "authorization_code", "code": code, "redirect_uri": OAUTH_REDIRECT
-        })).json()
-        if "access_token" not in token:
-            raise HTTPException(400, f"OAuth token error: {token}")
-        me = (await client.get(f"{DISCORD_API}/users/@me",
-                               headers={"Authorization": f"{token['token_type']} {token['access_token']}"}
-                              )).json()
-    resp = RedirectResponse(url="/")
-    payload = {"id": str(me["id"]), "username": me.get("username", "#"), "avatar": me.get("avatar")}
-    signer = URLSafeSerializer(SECRET_KEY, salt="session")
-    resp.set_cookie("session", signer.dumps(payload), httponly=True, samesite="lax", max_age=7*24*3600)
-    return resp
-
-@app.get("/logout")
-async def logout():
-    resp = RedirectResponse(url="/"); resp.delete_cookie("session"); return resp
-
-@app.get("/api/me")
-async def api_me(request: Request):
-    user = read_session(request)
-    if not user: raise HTTPException(401, "Not logged in")
-    return {"id": user["id"], "username": user.get("username", ""), "avatar_url": avatar_url_from(user["id"], user.get("avatar"))}
-
-@app.get("/api/balance")
-async def api_balance(request: Request):
-    user = read_session(request)
-    if not user: raise HTTPException(401, "Not logged in")
-    return {"balance": float(get_balance(str(user["id"])))}
-
-# Profiles / referrals
-class SetNameBody(BaseModel): name: str
-
-@app.get("/api/referral/state")
-async def api_ref_state(request: Request):
-    user = read_session(request)
-    if not user: raise HTTPException(401, "Not logged in")
-    return {"name": get_profile_name(str(user["id"]))}
-
-@app.post("/api/profile/set_name")
-async def api_set_name(request: Request, body: SetNameBody):
-    user = read_session(request)
-    if not user: raise HTTPException(401, "Not logged in")
-    try: return set_profile_name(str(user["id"]), body.name)
-    except ValueError as e: raise HTTPException(400, str(e))
-
-@app.get("/api/profile")
-async def api_profile(request: Request):
-    user = read_session(request)
-    if not user: raise HTTPException(401, "Not logged in")
-    return {"user_id": user["id"], **profile_info(user["id"])}
-
-# Promos
-class RedeemBody(BaseModel): code: str
-
-@app.get("/api/promo/my")
-async def api_promo_my(request: Request):
-    user = read_session(request)
-    if not user: raise HTTPException(401, "Not logged in")
-    @with_conn
-    def _my(cur, uid):
-        cur.execute("SELECT code, redeemed_at FROM promo_redemptions WHERE user_id=%s ORDER BY redeemed_at DESC LIMIT 50", (uid,))
-        return [{"code":r[0],"redeemed_at":str(r[1])} for r in cur.fetchall()]
-    return {"rows": _my(user["id"])}
-
-@app.post("/api/promo/redeem")
-async def api_promo_redeem(request: Request, body: RedeemBody):
-    user = read_session(request)
-    if not user: raise HTTPException(401, "Not logged in")
-    try:
-        new_bal = redeem_promo(str(user["id"]), body.code)
-        return {"new_balance": float(new_bal)}
-    except (PromoAlreadyRedeemed, PromoInvalid, PromoExpired, PromoExhausted) as e:
-        raise HTTPException(400, str(e))
-
-# Owner admin
-class AdjustBody(BaseModel):
-    identifier: str
-    amount: str
-    reason: Optional[str] = None
-
-class CreatePromoBody(BaseModel):
-    code: Optional[str] = None
-    amount: str
-    max_uses: int = 1
-    expires_at: Optional[str] = None
-
-def parse_user_identifier(identifier: str) -> Optional[str]:
-    if not identifier: return None
-    cleaned = identifier.strip().replace("<@!", "").replace("<@", "").replace(">", "")
-    return cleaned if cleaned.isdigit() and len(cleaned)>=17 else None
-
-def require_owner(request: Request):
-    user = read_session(request)
-    if not user: raise HTTPException(401, "Not logged in")
-    if str(user["id"]) != str(OWNER_ID): raise HTTPException(403, "Owner only")
-    return user
-
-@app.post("/api/admin/adjust")
-async def api_admin_adjust(request: Request, body: AdjustBody):
-    actor = require_owner(request)
-    uid = parse_user_identifier(body.identifier)
-    if not uid: raise HTTPException(400, "Invalid identifier (use raw ID or <@mention>)")
-    try:
-        delta = q2(D(body.amount))
-    except Exception:
-        raise HTTPException(400, "Invalid amount")
-    if delta == 0: raise HTTPException(400, "Amount cannot be zero")
-    new_balance = adjust_balance(str(actor["id"]), uid, delta, body.reason)
-    return {"user_id": uid, "new_balance": float(new_balance)}
-
-@app.post("/api/admin/promo/create")
-async def api_admin_promo_create(request: Request, body: CreatePromoBody):
-    require_owner(request)
-    try:
-        amt = q2(D(body.amount))
-    except Exception:
-        raise HTTPException(400, "Invalid amount")
-    if amt == 0: raise HTTPException(400, "Amount cannot be zero")
-    if body.max_uses < 1: raise HTTPException(400, "Max uses must be >= 1")
-    return create_promo(str(OWNER_ID), body.code, amt, int(body.max_uses), body.expires_at)
-
-# Crash API
+# ---------- Pydantic payloads ----------
 class BetBody(BaseModel):
     bet: float
     cashout: float
 
-@app.get("/api/crash/state")
-async def api_crash_state(request: Request):
-    user = read_session(request)
-    if not user: raise HTTPException(401, "Not logged in")
-    r = load_round()
-    rid, phase = (r["id"], r["status"]) if r else (None, "betting")
-    yb = your_bet(rid, user["id"]) if rid else None
-    return {
-        "phase": phase,
-        "round_id": rid,
-        "betting_opens_at": iso(r["betting_opens_at"]) if r else None,
-        "betting_ends_at":  iso(r["betting_ends_at"])  if r else None,
-        "started_at":       iso(r["started_at"])       if r else None,
-        "bust": r["bust"] if (r and phase=='ended') else None,
-        "your_bet": yb,
-        "min_bet": float(MIN_BET),
-        "last_busts": last_busts(15)
-    }
-
-@app.get("/api/crash/now")
-async def api_crash_now():
-    r = load_round()
-    if not r or r["status"] != "running":
-        return {"phase": r["status"] if r else "betting", "multiplier": 1.0}
-    m = current_multiplier(r["started_at"], r["expected_end_at"], r["bust"], now_utc())
-    return {"phase": "running", "multiplier": m}
-
-@app.post("/api/crash/bet")
-async def api_crash_bet(request: Request, body: BetBody):
-    user = read_session(request)
-    if not user: raise HTTPException(401, "Not logged in")
-    bet = q2(D(body.bet)); cash = float(body.cashout)
-    if bet < MIN_BET: raise HTTPException(400, f"Min bet is {MIN_BET:.2f} DL")
-    if bet > MAX_BET: raise HTTPException(400, f"Max bet is {MAX_BET:.2f} DL")
-    if cash < 1.01: cash = 1000.0
-    try:
-        res = place_bet(user["id"], bet, cash)
-        return {"ok": True, "round_id": res["round_id"]}
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-
-@app.post("/api/crash/cashout")
-async def api_crash_cashout(request: Request):
-    user = read_session(request)
-    if not user: raise HTTPException(401, "Not logged in")
-    try:
-        res = cashout_now(user["id"])
-        return {"ok": True, **res}
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-
-@app.get("/api/game/crash/history")
-async def api_game_crash_history(request: Request, limit: int = Query(10, ge=1, le=50)):
-    user = read_session(request)
-    if not user: raise HTTPException(401, "Not logged in")
-    return {"rows": your_history(user["id"], limit)}
-
-# Global Chat API
-class ChatSendBody(BaseModel): text: str
-
-@app.get("/api/chat/fetch")
-async def api_chat_fetch(request: Request, since_id: int = Query(0, ge=0), limit: int = Query(50, ge=1, le=200)):
-    user = read_session(request)
-    if not user: raise HTTPException(401, "Not logged in")
-    msgs = chat_fetch(since_id, min(limit, 200))
-    return {"messages": msgs}
-
-@app.post("/api/chat/send")
-async def api_chat_send(request: Request, body: ChatSendBody):
-    user = read_session(request)
-    if not user: raise HTTPException(401, "Not logged in")
-    try:
-        res = chat_send(str(user["id"]), user.get("username","user"), body.text)
-        return {"ok": True, "id": res["id"], "created_at": res["created_at"]}
-    except PermissionError as e:
-        raise HTTPException(403, str(e))
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-
-# MINES API
 class MinesStartBody(BaseModel):
     bet: float
     mines: int
@@ -2119,115 +1924,332 @@ class MinesStartBody(BaseModel):
 class MinesPickBody(BaseModel):
     index: int
 
-@app.get("/api/mines/state")
-async def api_mines_state(request: Request):
-    user = read_session(request)
-    if not user: raise HTTPException(401, "Not logged in")
-    s = mines_state(user["id"])
-    return s or {}
+class NameBody(BaseModel):
+    name: str
 
-@app.get("/api/mines/history")
-async def api_mines_history(request: Request, limit: int = Query(15, ge=1, le=50)):
-    user = read_session(request)
-    if not user: raise HTTPException(401, "Not logged in")
-    rows = mines_history(user["id"], limit)
-    return {"rows": rows}
+class PromoRedeemBody(BaseModel):
+    code: str
 
+class AdjustBody(BaseModel):
+    identifier: str
+    amount: str
+    reason: Optional[str] = None
+
+class PromoCreateBody(BaseModel):
+    code: Optional[str] = None
+    amount: str
+    max_uses: int = 1
+    expires_at: Optional[str] = None
+
+
+# ---------- Helpers (web) ----------
+def require_me(request: Request) -> dict:
+    me = read_session(request)
+    if not me:
+        raise HTTPException(401, "Not logged in")
+    return me
+
+async def discord_oauth_token(code: str) -> dict:
+    async with httpx.AsyncClient(timeout=15) as cli:
+        data = {
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": OAUTH_REDIRECT,
+        }
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        r = await cli.post(f"{DISCORD_API}/oauth2/token", data=data, headers=headers)
+        r.raise_for_status()
+        return r.json()
+
+async def discord_me(access_token: str) -> dict:
+    async with httpx.AsyncClient(timeout=15) as cli:
+        r = await cli.get(f"{DISCORD_API}/users/@me",
+                          headers={"Authorization": f"Bearer {access_token}"})
+        r.raise_for_status()
+        return r.json()
+
+def session_payload_from_user(u: dict) -> dict:
+    uid = str(u["id"])
+    av = u.get("avatar")
+    avatar = avatar_url_from(uid, av)
+    username = f'{u.get("username","user")}#{u.get("discriminator","0")}' if "discriminator" in u else u.get("global_name") or u.get("username","user")
+    ensure_profile_row(uid)
+    return {"id": uid, "username": username, "avatar_url": avatar}
+
+
+# ---------- Routes ----------
+@app.get("/", response_class=HTMLResponse)
+async def home(request: Request):
+    html = HTML_TEMPLATE.replace("__HOUSE_EDGE_MINES__", str(float(HOUSE_EDGE_MINES)))
+    html = html.replace("__OWNER_ID__", str(OWNER_ID))
+    return HTMLResponse(html)
+
+@app.get("/login")
+async def login():
+    params = {
+        "client_id": CLIENT_ID,
+        "redirect_uri": OAUTH_REDIRECT,
+        "response_type": "code",
+        "scope": "identify",
+        "prompt": "consent",
+    }
+    return RedirectResponse(f"{DISCORD_API}/oauth2/authorize?{urlencode(params)}")
+
+@app.get("/callback")
+async def callback(code: str = Query(...)):
+    tok = await discord_oauth_token(code)
+    u = await discord_me(tok["access_token"])
+    payload = session_payload_from_user(u)
+    resp = RedirectResponse("/")
+    set_session(resp, payload)
+    return resp
+
+@app.get("/logout")
+async def logout():
+    resp = RedirectResponse("/")
+    resp.delete_cookie("session")
+    return resp
+
+@app.get("/api/me")
+async def api_me(request: Request):
+    me = require_me(request)
+    return me
+
+@app.get("/api/balance")
+async def api_balance(request: Request):
+    me = require_me(request)
+    bal = get_balance(me["id"])
+    return {"balance": float(q2(bal))}
+
+@app.get("/api/profile")
+async def api_profile(request: Request):
+    me = require_me(request)
+    return profile_info(me["id"])
+
+@app.post("/api/profile/set_name")
+async def api_set_name(request: Request, body: NameBody):
+    me = require_me(request)
+    try:
+        return set_profile_name(me["id"], body.name)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+@app.get("/api/referral/state")
+async def api_ref_state(request: Request):
+    me = require_me(request)
+    nm = get_profile_name(me["id"]) or ""
+    return {"name": nm}
+
+@with_conn
+def list_my_redemptions(cur, user_id: str):
+    cur.execute("""SELECT code, redeemed_at FROM promo_redemptions
+                   WHERE user_id=%s ORDER BY redeemed_at DESC LIMIT 50""", (user_id,))
+    return [{"code": r[0], "redeemed_at": str(r[1])} for r in cur.fetchall()]
+
+@app.get("/api/promo/my")
+async def api_promo_my(request: Request):
+    me = require_me(request)
+    return {"rows": list_my_redemptions(me["id"])}
+
+@app.post("/api/promo/redeem")
+async def api_promo_redeem(request: Request, body: PromoRedeemBody):
+    me = require_me(request)
+    try:
+        new_bal = redeem_promo(me["id"], body.code)
+        return {"balance": float(new_bal)}
+    except PromoAlreadyRedeemed as e:
+        raise HTTPException(400, str(e))
+    except PromoExpired as e:
+        raise HTTPException(400, str(e))
+    except PromoExhausted as e:
+        raise HTTPException(400, str(e))
+    except PromoInvalid as e:
+        raise HTTPException(404, str(e))
+
+# ---- Admin
+def owner_guard(request: Request):
+    me = require_me(request)
+    if int(me["id"]) != int(OWNER_ID):
+        raise HTTPException(403, "Owner only")
+    return me
+
+def parse_identifier(identifier: str) -> str:
+    s = identifier.strip()
+    m = re.match(r"^<@!?(\d+)>$", s)
+    if m: return m.group(1)
+    if s.isdigit(): return s
+    return s  # allow raw id-like strings
+
+@app.post("/api/admin/adjust")
+async def api_admin_adjust(request: Request, body: AdjustBody):
+    owner_guard(request)
+    target = parse_identifier(body.identifier)
+    try:
+        new_balance = adjust_balance(str(OWNER_ID), target, body.amount, body.reason or "admin")
+        return {"ok": True, "new_balance": float(q2(new_balance))}
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+@app.post("/api/admin/promo/create")
+async def api_admin_promo_create(request: Request, body: PromoCreateBody):
+    owner_guard(request)
+    try:
+        r = create_promo(str(OWNER_ID), body.code, body.amount, body.max_uses, body.expires_at)
+        return r
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+# ---- Crash endpoints
+@app.get("/api/crash/state")
+async def api_crash_state(request: Request):
+    me = read_session(request)
+    rid, rnd = ensure_betting_round()
+    r = load_round()
+    if r is None:
+        rid, rnd = ensure_betting_round()
+        r = load_round()
+    yb = your_bet(r["id"], me["id"]) if me else None
+    return {
+        "round_id": r["id"],
+        "phase": r["status"],
+        "betting_opens_at": iso(r["betting_opens_at"]),
+        "betting_ends_at": iso(r["betting_ends_at"]),
+        "started_at": iso(r["started_at"]),
+        "expected_end_at": iso(r["expected_end_at"]),
+        "bust": r["bust"],
+        "your_bet": yb,
+        "last_busts": last_busts(),
+    }
+
+@app.get("/api/crash/now")
+async def api_crash_now():
+    r = load_round()
+    if not r or r["status"] != "running":
+        return {"phase": "betting"}
+    m = current_multiplier(r["started_at"], r["expected_end_at"], r["bust"])
+    return {"phase": "running", "multiplier": m}
+
+@app.post("/api/crash/bet")
+async def api_crash_bet(request: Request, body: BetBody):
+    me = require_me(request)
+    try:
+        place_bet(me["id"], D(body.bet), float(body.cashout))
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+@app.post("/api/crash/cashout")
+async def api_crash_cashout(request: Request):
+    me = require_me(request)
+    try:
+        r = cashout_now(me["id"])
+        return r
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+# ---- Mines endpoints
 @app.post("/api/mines/start")
 async def api_mines_start(request: Request, body: MinesStartBody):
-    user = read_session(request)
-    if not user: raise HTTPException(401, "Not logged in")
+    me = require_me(request)
     try:
-        res = mines_start(user["id"], q2(D(body.bet)), int(body.mines))
-        return res
-    except ValueError as e:
+        r = mines_start(me["id"], D(body.bet), int(body.mines))
+        return r
+    except Exception as e:
         raise HTTPException(400, str(e))
 
 @app.post("/api/mines/pick")
 async def api_mines_pick(request: Request, body: MinesPickBody):
-    user = read_session(request)
-    if not user: raise HTTPException(401, "Not logged in")
+    me = require_me(request)
     try:
-        res = mines_pick(user["id"], int(body.index))
-        return res
-    except ValueError as e:
+        r = mines_pick(me["id"], int(body.index))
+        return r
+    except Exception as e:
         raise HTTPException(400, str(e))
 
 @app.post("/api/mines/cashout")
 async def api_mines_cashout(request: Request):
-    user = read_session(request)
-    if not user: raise HTTPException(401, "Not logged in")
+    me = require_me(request)
     try:
-        res = mines_cashout(user["id"])
-        return res
-    except ValueError as e:
+        r = mines_cashout(me["id"])
+        return r
+    except Exception as e:
         raise HTTPException(400, str(e))
 
-@app.get("/health")
-async def health():
-    return {"ok": True}
+@app.get("/api/mines/state")
+async def api_mines_state(request: Request):
+    me = require_me(request)
+    return mines_state(me["id"]) or {}
 
-# ---------- Crash loop ----------
-@with_conn
-def maybe_start_running(cur):
-    cur.execute("SELECT id,status,betting_ends_at FROM crash_rounds ORDER BY id DESC LIMIT 1")
-    r = cur.fetchone()
-    if not r: return None
-    rid, st, bet_end = int(r[0]), str(r[1]), r[2]
-    if st != 'betting': return None
-    cur.execute("SELECT NOW() >= %s", (bet_end,))
-    if cur.fetchone()[0]:
-        begin_running(rid)
-        return rid
-    return None
+@app.get("/api/mines/history")
+async def api_mines_history(request: Request):
+    me = require_me(request)
+    return {"rows": mines_history(me["id"])}
 
+# ---- Chat endpoints
+@app.get("/api/chat/fetch")
+async def api_chat_fetch(since_id: int = 0):
+    msgs = chat_fetch(max(0, since_id))
+    return {"messages": msgs}
+
+@app.post("/api/chat/send")
+async def api_chat_send(request: Request, payload: dict):
+    me = require_me(request)
+    text = (payload or {}).get("text", "")
+    try:
+        r = chat_send(me["id"], me["username"], text)
+        return r
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+
+# ---------- Background Crash loop ----------
 async def crash_loop():
+    # ensure DB and at least one betting round exist
+    ensure_betting_round()
     while True:
-        rid, r = ensure_betting_round()
-        now = now_utc()
-        if r["status"] == "betting":
-            wait = (r["betting_ends_at"] - now).total_seconds()
-            if wait > 0:
-                await asyncio.sleep(min(wait, 0.5))
-                maybe_start_running()
+        try:
+            r = load_round()
+            if not r:
+                ensure_betting_round()
             else:
-                begin_running(rid)
-        elif r["status"] == "running":
-            if r["expected_end_at"]:
-                wait = (r["expected_end_at"] - now).total_seconds()
-                if wait > 0: await asyncio.sleep(min(wait, 0.3))
-                else:
-                    finish_round(rid)
-                    create_next_betting()
-                    await asyncio.sleep(0.3)
-            else:
-                finish_round(rid)
-                create_next_betting()
-                await asyncio.sleep(0.3)
-        else:
-            create_next_betting()
-            await asyncio.sleep(0.3)
+                now = now_utc()
+                if r["status"] == "betting":
+                    if now >= r["betting_ends_at"]:
+                        begin_running(r["id"])
+                elif r["status"] == "running":
+                    if now >= r["expected_end_at"]:
+                        finish_round(r["id"])
+                        create_next_betting()
+        except Exception as e:
+            # keep the loop alive
+            print("crash_loop error:", e)
+        await asyncio.sleep(0.5)
 
-# ---------- Runner ----------
+
+# ---------- Entry ----------
+async def run_bot_forever():
+    if not BOT_TOKEN:
+        print("WARNING: DISCORD_TOKEN not set; bot will not start.")
+        while True:
+            await asyncio.sleep(3600)
+    try:
+        await bot.start(BOT_TOKEN)
+    finally:
+        await bot.close()
+
 async def main():
-    import traceback, sys
     init_db()
     config = uvicorn.Config(app, host="0.0.0.0", port=PORT, log_level="info")
     server = uvicorn.Server(config)
-
-    async def run_bot_forever():
-        while True:
-            try:
-                if not BOT_TOKEN: raise RuntimeError("DISCORD_TOKEN env var not set.")
-                await bot.start(BOT_TOKEN)
-            except discord.errors.LoginFailure:
-                print("[bot] LoginFailure: bad token. Fix DISCORD_TOKEN.", file=sys.stderr)
-                await asyncio.sleep(3600)
-            except Exception:
-                traceback.print_exc()
-                await asyncio.sleep(10)
-
-    await asyncio.gather(server.serve(), run_bot_forever(), crash_loop())
+    await asyncio.gather(
+        server.serve(),
+        run_bot_forever(),
+        crash_loop(),
+    )
 
 if __name__ == "__main__":
     asyncio.run(main())

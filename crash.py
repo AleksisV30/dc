@@ -183,7 +183,7 @@ def your_bet(cur, round_id: int, user_id: str):
     if not r: return None
     return {"bet": float(q2(D(r[0]))), "cashout": float(r[1]),
             "cashed_out": (float(r[2]) if r[2] is not None else None),
-            "resolved": bool(r[3]), "win": float(q2(D(r[4])))}
+            "resolved": bool(r[3]), "win": float(q2(Dr[4]))}
 
 @with_conn
 def your_history(cur, user_id: str, limit: int = 10):

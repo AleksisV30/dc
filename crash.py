@@ -1,7 +1,7 @@
 # crash.py
-import os, math, secrets, random, datetime
+import os, math, secrets, datetime
 from decimal import Decimal
-from typing import Optional, Tuple, Dict, List
+from typing import Optional, Tuple, Dict
 
 from db_utils import with_conn, D, q2, now_utc, ensure_profile_row_cur
 
@@ -68,16 +68,13 @@ def place_bet(cur, user_id: str, bet: Decimal, cashout: float):
     cur.execute("SELECT NOW() < %s", (ends_at,))
     if not cur.fetchone()[0]: raise ValueError("Betting just closed")
 
-    # funds and limits
     if bet < MIN_BET: raise ValueError(f"Min bet is {MIN_BET:.2f} DL")
     if bet > MAX_BET: raise ValueError(f"Max bet is {MAX_BET:.2f} DL")
 
-    # ensure balance row & lock balance
     cur.execute("INSERT INTO balances(user_id,balance) VALUES (%s,0) ON CONFLICT(user_id) DO NOTHING", (user_id,))
     cur.execute("SELECT balance FROM balances WHERE user_id=%s FOR UPDATE", (user_id,))
     bal = D(cur.fetchone()[0])
     if bal < bet: raise ValueError("Insufficient balance")
-
     cur.execute("UPDATE balances SET balance=balance-%s WHERE user_id=%s", (q2(bet), user_id))
 
     try:
@@ -85,7 +82,6 @@ def place_bet(cur, user_id: str, bet: Decimal, cashout: float):
                        VALUES(%s,%s,%s,%s)""",
                     (round_id, user_id, q2(bet), float(cashout)))
     except Exception:
-        # refund on duplicate
         cur.execute("UPDATE balances SET balance=balance+%s WHERE user_id=%s", (q2(bet), user_id))
         raise ValueError("You already placed a bet this round")
     return {"round_id": round_id}
@@ -126,11 +122,7 @@ def resolve_round_end(cur, round_id: int, bust: float):
                    FROM crash_bets WHERE round_id=%s""", (round_id,))
     bets = cur.fetchall()
     for uid, bet, goal, cashed, resolved, win in bets:
-        uid = str(uid)
-        bet = D(bet)
-        goal = float(goal)
-        resolved = bool(resolved)
-
+        uid = str(uid); bet = D(bet); goal = float(goal); resolved = bool(resolved)
         if resolved and cashed is not None:
             xp_gain = max(1, min(int(bet), 50))
             cur.execute("""INSERT INTO crash_games(user_id,bet,cashout,bust,win,xp_gain)

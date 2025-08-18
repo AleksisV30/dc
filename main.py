@@ -1,6 +1,6 @@
-# app/main.py — fixed: banners + static, chat.private_to migration, games imported
+# app/main.py — single-file site; images can sit next to main.py (no /static folder required)
 
-import os, json, asyncio, re, random, string, datetime
+import os, json, asyncio, re, random, string, datetime, base64
 from urllib.parse import urlencode
 from typing import Optional, Tuple, Dict, List
 from decimal import Decimal, ROUND_DOWN, getcontext
@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 import httpx
 import psycopg
 from fastapi import FastAPI, Request, HTTPException, Query
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from itsdangerous import URLSafeSerializer, BadSignature
 from pydantic import BaseModel
@@ -61,9 +61,13 @@ def iso(dt: Optional[datetime.datetime]) -> Optional[str]:
 
 # ---------- App / Lifespan / Static ----------
 def _get_static_dir():
+    # We'll still mount /static as a fallback, but images can live right next to main.py.
     base = os.path.dirname(os.path.abspath(__file__))
     static_dir = os.path.join(base, "static")
-    os.makedirs(static_dir, exist_ok=True)
+    try:
+        os.makedirs(static_dir, exist_ok=True)
+    except Exception:
+        pass
     return static_dir
 
 @asynccontextmanager
@@ -73,7 +77,26 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(lifespan=lifespan)
+# Optional fallback for anyone who still wants /static
 app.mount("/static", StaticFiles(directory=_get_static_dir()), name="static")
+
+# Serve images from the SAME directory as main.py (or fallback to /static).
+# If not found, we return a tiny transparent PNG so the UI never breaks.
+_TRANSPARENT_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
+)
+
+@app.get("/img/{filename}")
+async def serve_img(filename: str):
+    base = os.path.dirname(os.path.abspath(__file__))
+    # Try same folder as main.py first
+    p1 = os.path.join(base, filename)
+    # Then /static as backup
+    p2 = os.path.join(base, "static", filename)
+    for p in (p1, p2):
+        if os.path.isfile(p):
+            return FileResponse(p)
+    return Response(content=_TRANSPARENT_PNG, media_type="image/png")
 
 # ---------- Sessions ----------
 SER = URLSafeSerializer(SECRET_KEY, salt="session-v1")
@@ -490,7 +513,7 @@ def apply_migrations(cur):
     cur.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS is_anon BOOLEAN NOT NULL DEFAULT FALSE")
     cur.execute("CREATE INDEX IF NOT EXISTS ix_crash_games_created_at ON crash_games (created_at)")
     cur.execute("CREATE INDEX IF NOT EXISTS ix_mines_games_started_at ON mines_games (started_at)")
-    # IMPORTANT: add private_to column for chat if missing
+    # private messages column (already present in init but keep safe)
     cur.execute("ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS private_to TEXT")
 
 # ---------- OAuth token store & Discord join ----------
@@ -788,7 +811,7 @@ async def api_crash_state(request: Request):
         begin_running(rid)
         info = load_round()
     if info and info["status"] == "running" and info["expected_end_at"] and now >= info["expected_end_at"]:
-        finish_round(rid)        # NOTE: internal function must not pass cur when calling decorators
+        finish_round(rid)
         create_next_betting()
         info = load_round()
 
@@ -892,7 +915,7 @@ def chat_timeout_get(cur, user_id: str):
 
 @with_conn
 def chat_insert(cur, user_id: str, username: str, text: str, private_to: Optional[str] = None):
-    text = (text or "").trim()
+    text = (text or "").strip()  # FIX: use strip() (not .trim())
     if not text: raise ValueError("Message is empty")
     if len(text) > 300: raise ValueError("Message is too long (max 300)")
     ensure_profile_row(user_id)
@@ -1093,7 +1116,7 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
 .chat-drawer.open{transform:translateX(0)}.chat-head{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border-bottom:1px solid var(--border)}
 .chat-body{flex:1;overflow:auto;padding:10px 12px}.chat-input{display:flex;gap:8px;padding:10px 12px;border-top:1px solid var(--border)}.chat-input input{flex:1}
 .msg{margin-bottom:12px;padding-bottom:8px;border-bottom:1px dashed rgba(255,255,255,.04);position:relative}
-.msghead{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.msghead .time{margin-left:auto;color:var(--muted);font-size:12px}
+.msghead{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.msghead .time{margin-left:auto;color:#9eb3da;font-size:12px}
 .badge{font-size:10px;padding:3px 7px;border-radius:999px;border:1px solid var(--border);letter-spacing:.2px}
 .badge.member{background:#0c1631;color:#cfe6ff}.badge.admin{background:linear-gradient(135deg,#f59e0b,#fb923c);color:#1a1206;border-color:rgba(0,0,0,.2);font-weight:900}.badge.owner{background:linear-gradient(135deg,#3b82f6,#22c1dc);color:#041018;border-color:transparent;font-weight:900}
 .level{font-size:10px;padding:3px 7px;border-radius:999px;background:#0b1f3a;color:#cfe6ff;border:1px solid var(--border)}
@@ -1107,7 +1130,7 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
     <div class="header-inner container">
       <div class="left">
         <a class="brand" href="#" id="homeLink">
-          <img class="logo" src="/static/GrowCBnobackground.png" alt="GROWCB" onerror="this.style.display='none'"/>
+          <img class="logo" src="/img/GrowCBnobackground.png" alt="GROWCB" onerror="this.style.display='none'"/>
           GROWCB
         </a>
         <div class="tabs">
@@ -1134,24 +1157,24 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
         </div>
         <div class="games-grid" style="margin-top:12px">
           <div class="game-card" id="openCrash">
-            <img class="banner" src="/static/crash.png" alt="Crash" onerror="this.style.display='none'"/>
+            <img class="banner" src="/img/crash.png" alt="Crash" onerror="this.style.display='none'"/>
             <div class="title">🚀 Crash</div><div class="muted">Shared rounds • 10s betting • Live cashout</div>
           </div>
           <div class="game-card" id="openMines">
-            <img class="banner" src="/static/mines.png" alt="Mines" onerror="this.style.display='none'"/>
+            <img class="banner" src="/img/mines.png" alt="Mines" onerror="this.style.display='none'"/>
             <div class="title">💣 Mines</div><div class="muted">5×5 board • Choose mines • Cash out anytime</div>
           </div>
 
           <div class="game-card" id="openCoinflip">
-            <img class="banner" src="/static/coinflip.png" alt="Coinflip" onerror="this.style.display='none'"/>
+            <img class="banner" src="/img/coinflip.png" alt="Coinflip" onerror="this.style.display='none'"/>
             <div class="title">🪙 Coinflip</div><div class="muted">Quick 50/50 — coming soon</div>
           </div>
           <div class="game-card" id="openBlackjack">
-            <img class="banner" src="/static/blackjack.png" alt="Blackjack" onerror="this.style.display='none'"/>
+            <img class="banner" src="/img/blackjack.png" alt="Blackjack" onerror="this.style.display='none'"/>
             <div class="title">🃏 Blackjack</div><div class="muted">Beat the dealer — coming soon</div>
           </div>
           <div class="game-card" id="openPump">
-            <img class="banner" src="/static/pump.png" alt="Pump" onerror="this.style.display='none'"/>
+            <img class="banner" src="/img/pump.png" alt="Pump" onerror="this.style.display='none'"/>
             <div class="title">📈 Pump</div><div class="muted">Ride the spike — coming soon</div>
           </div>
         </div>
@@ -1370,11 +1393,12 @@ const j = async (url, init) => {
     catch{ throw new Error(t || r.statusText); }
   }
   const ct = r.headers.get('content-type')||'';
-  return ct.includes('application/json') ? r.json() : r.text();
+  return ct.includes('application/json
+/json') ? r.json() : r.text();
 };
 const GEM = "💎"; const fmtDL = (n)=> `${GEM} ${(Number(n)||0).toFixed(2)} DL`;
 
-// Simple router
+// -------- Simple router --------
 const pages = ['page-games','page-crash','page-mines','page-coinflip','page-blackjack','page-pump','page-ref','page-promo','page-lb','page-settings','page-profile'];
 function showOnly(id){
   for(const p of pages){ const el = qs(p); if(el) el.style.display = (p===id) ? '' : 'none'; }
@@ -1384,7 +1408,7 @@ function showOnly(id){
   }
 }
 
-// Header / Auth
+// -------- Header / Auth --------
 async function renderHeader(){
   try{
     const me = await j('/api/me');
@@ -1397,6 +1421,7 @@ async function renderHeader(){
         <div id="userMenu" class="menu">
           <div class="item" id="menuProfile">Profile</div>
           <div class="item" id="menuSettings">Settings</div>
+          <a class="item" href="/logout">Logout</a>
         </div>
       </div>
     `;
@@ -1411,7 +1436,7 @@ async function renderHeader(){
   }
 }
 
-// Join Discord
+// -------- Discord join --------
 async function joinDiscord(){
   try{
     await j('/api/discord/join', { method:'POST' });
@@ -1426,14 +1451,14 @@ for(const id of ['btnInvite','btnInvite2','btnInvite3']){
   const a = qs(id); if(a && a.getAttribute('href') === '__INVITE__'){ a.style.display='none'; }
 }
 
-// Tabs / navigation
+// -------- Tabs / navigation --------
 qs('homeLink').onclick = (e)=>{ e.preventDefault(); showOnly('page-games'); };
 qs('tab-games').onclick = ()=> showOnly('page-games');
 qs('tab-ref').onclick = ()=> { showOnly('page-ref'); loadReferral(); };
 qs('tab-promo').onclick = ()=> { showOnly('page-promo'); renderPromo(); };
 qs('tab-lb').onclick = ()=> { showOnly('page-lb'); refreshLeaderboard(); };
 
-// ---------- Referral ----------
+// -------- Referral --------
 async function loadReferral(){
   try{
     const st = await j('/api/referral/state');
@@ -1453,7 +1478,7 @@ qs('copyRef').onclick = ()=>{
   const inp = qs('refLink'); inp.select(); inp.setSelectionRange(0, 99999); document.execCommand('copy');
 };
 
-// ---------- Promo ----------
+// -------- Promo --------
 async function renderPromo(){
   try{
     const my = await j('/api/promo/my');
@@ -1461,7 +1486,7 @@ async function renderPromo(){
       ? '<table><thead><tr><th>Code</th><th>Redeemed</th></tr></thead><tbody>' +
         my.rows.map(r=>`<tr><td>\${r.code}</td><td>\${new Date(r.redeemed_at).toLocaleString()}</td></tr>`).join('') +
         '</tbody></table>' : '—';
-  }catch(_){}
+  }catch(_){ qs('myCodes').textContent = '—'; }
 }
 qs('redeemBtn').onclick = async ()=>{
   const code = qs('promoInput').value.trim();
@@ -1473,7 +1498,7 @@ qs('redeemBtn').onclick = async ()=>{
   }catch(e){ qs('promoMsg').textContent = e.message; }
 };
 
-// ---------- Profile / Admin ----------
+// -------- Profile / Admin --------
 async function renderProfile(){
   try{
     const p = await j('/api/profile');
@@ -1530,7 +1555,7 @@ async function renderProfile(){
   }catch(_){ qs('profileBox').textContent = '—'; }
 }
 
-// ---------- Settings ----------
+// -------- Settings --------
 async function loadSettings(){
   qs('setMsg').textContent='';
   try{ const r = await j('/api/settings/get'); qs('anonToggle').checked = !!(r && r.is_anon); }catch(_){}
@@ -1543,7 +1568,7 @@ qs('anonToggle')?.addEventListener('change', async (e)=>{
   }catch(err){ qs('setMsg').textContent = err.message; }
 });
 
-// ---------- Leaderboard ----------
+// -------- Leaderboard --------
 let lbPeriod = 'daily';
 function nextUtcMidnight(){
   const now = new Date();
@@ -1595,20 +1620,18 @@ async function refreshLeaderboard(){
   });
 }
 
-// ---------- Crash UI ----------
+// -------- Crash UI --------
 const crCanvas = ()=> qs('crCanvas');
-let crPollTimer=null, crStartAt=null, crExpAt=null, crBust=null, crPhase='betting';
-let lastBusts=[];
+let crPollTimer=null, crBust=null, crPhase='betting';
 function drawCrash(mult){
   const c = crCanvas(); if(!c) return; const ctx = c.getContext('2d');
   const w = c.width = c.clientWidth || 600; const h = c.height = c.clientHeight || 240;
   ctx.fillStyle='#0e1833'; ctx.fillRect(0,0,w,h);
   ctx.strokeStyle='#9eb3da'; ctx.lineWidth=2; ctx.beginPath();
-  const maxX = w-20, maxY = h-20; const base=20;
-  // simple curve render
+  const maxX = w-40, base=20, maxY=h-20;
   const maxMult = Math.max(2, mult);
   for(let x=0; x<=maxX; x++){
-    const t = x/maxX; const m = 1 + (maxMult-1)*t*t; // ease
+    const t = x/maxX; const m = 1 + (maxMult-1)*t*t;
     const y = maxY - (m-1)/(maxMult-1+1e-9) * (maxY-base);
     if(x===0) ctx.moveTo(base, y); else ctx.lineTo(base+x, y);
   }
@@ -1619,17 +1642,11 @@ async function pollCrash(){
     const st = await j('/api/crash/state');
     crPhase = st.phase;
     crBust = st.bust;
-    crStartAt = st.started_at? new Date(st.started_at): null;
-    crExpAt = st.expected_end_at? new Date(st.expected_end_at): null;
-    lastBusts = st.last_busts || [];
-    qs('lastBusts').textContent = lastBusts.map(v=> (Number(v)||0).toFixed(2)+'×').join(' • ') || '—';
+    qs('lastBusts').textContent = (st.last_busts||[]).map(v=> (Number(v)||0).toFixed(2)+'×').join(' • ') || '—';
     const cashBtn = qs('crCashout');
     const you = st.your_bet;
-    if(you && crPhase==='running' && !you.cashed_out){
-      cashBtn.style.display='';
-    }else{
-      cashBtn.style.display='none';
-    }
+    cashBtn.style.display = (you && crPhase==='running' && !you.cashed_out) ? '' : 'none';
+
     if(crPhase==='running' && st.current_multiplier){
       const m = Number(st.current_multiplier)||1.0;
       qs('crNow').textContent = m.toFixed(2)+'×';
@@ -1659,7 +1676,7 @@ qs('crPlace').onclick = async ()=>{
   const cash = qs('crCash').value || null;
   qs('crMsg').textContent = '';
   try{
-    const r = await j('/api/crash/place', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ bet, cashout: cash? Number(cash): null })});
+    await j('/api/crash/place', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ bet, cashout: cash? Number(cash): null })});
     qs('crMsg').textContent = 'Bet placed.';
   }catch(e){ qs('crMsg').textContent = e.message; }
 };
@@ -1675,159 +1692,134 @@ function openCrash(){
   if(crPollTimer) clearTimeout(crPollTimer);
   pollCrash();
 }
-qs('openCrash').onclick = openCrash; qs('backToGames').onclick = ()=>{ showOnly('page-games'); if(crPollTimer) clearTimeout(crPollTimer); };
 
-// ---------- Mines UI ----------
+// -------- Mines UI --------
 function buildMinesGrid(){
   const grid = qs('mGrid'); grid.innerHTML='';
   for(let i=0;i<25;i++){
     const b = document.createElement('button');
     b.textContent = '?';
-    b.style.width = '64px';
-    b.style.height = '64px';
-    b.style.borderRadius = '12px';
-    b.style.border = '1px solid var(--border)';
-    b.style.background = '#0c1631';
-    b.style.color = '#e6eeff';
-    b.style.fontWeight = '800';
-    b.style.fontSize = '18px';
-    b.style.cursor = 'pointer';
-    b.dataset.idx = String(i);
-    b.onclick = () => minesPick(i);
+    b.style.width='64px'; b.style.height='64px'; b.style.borderRadius='12px';
+    b.style.border='1px solid var(--border)'; b.style.background='#0f1a33'; b.style.color='#cfe6ff';
+    b.dataset.index = i;
+    b.onclick = ()=> pickCell(i);
     grid.appendChild(b);
   }
 }
-
-function setMinesGridEnabled(enabled){
-  const grid = qs('mGrid');
-  Array.from(grid.children).forEach(btn => btn.disabled = !enabled);
-}
-
-async function minesHistory(){
+async function pickCell(i){
   try{
-    const r = await j('/api/mines/history');
-    const rows = r.rows || [];
-    qs('mHist').innerHTML = rows.length ? (
-      '<table><thead><tr><th>When</th><th>Bet</th><th>Mines</th><th>Win</th><th>Status</th></tr></thead><tbody>' +
-      rows.map(x => {
-        const when = new Date(x.created_at || x.ended_at || Date.now()).toLocaleString();
-        const bet = fmtDL(x.bet ?? x.amount ?? 0);
-        const mines = x.mines ?? (x.config?.mines ?? '-');
-        const win = fmtDL(x.win ?? 0);
-        const status = (x.status || (Number(x.win||0) > 0 ? 'cashed' : 'busted')).toUpperCase();
-        return `<tr><td>${when}</td><td>${bet}</td><td>${mines}</td><td>${win}</td><td>${status}</td></tr>`;
-      }).join('') + '</tbody></table>'
-    ) : '—';
-  }catch{ qs('mHist').textContent = '—'; }
+    await j('/api/mines/pick?index='+i, { method:'POST' });
+    await refreshMines();
+  }catch(e){ alert(e.message); }
 }
-
-function updateMinesUI(st){
-  const active = !!(st && (st.status==='active' || st.active));
-  qs('mSetup').style.display = active ? 'none' : '';
-  qs('mCash').style.display  = active ? '' : 'none';
-  qs('mStatus').textContent  = 'Status: ' + (st?.status ? st.status : (active ? 'active' : (st ? st.status||'idle' : 'idle')));
-  qs('mPicks').textContent   = 'Picks: ' + (st?.picks ?? st?.revealed_count ?? 0);
-  qs('mBombs').textContent   = 'Mines: ' + (st?.mines ?? st?.config?.mines ?? qs('mMines').value || 3);
-  qs('mHash').textContent    = 'Commit: ' + (st?.commit_hash ?? st?.commit ?? '—');
-
-  const mult = Number(st?.multiplier ?? st?.mult ?? 1).toFixed(4);
-  qs('mMult').textContent = 'Multiplier: ' + (isFinite(mult) ? mult : '1.0000') + '×';
-
-  const pot = st?.potential ?? st?.potential_win ?? st?.cashout_value ?? null;
-  qs('mPotential').textContent = 'Potential: ' + (pot != null ? fmtDL(pot) : '—');
-
-  // Update grid visuals if we have any reveal info
-  const grid = qs('mGrid');
-  const revealed = new Set((st?.revealed ?? st?.safe_indices ?? [] as number[]).map(Number));
-  const mines = new Set((st?.mines_indices ?? st?.mines_positions ?? [] as number[]).map(Number));
-
-  Array.from(grid.children).forEach((btn) => {
-    const i = Number(btn.dataset.idx);
-    btn.textContent = '?';
-    btn.style.background = '#0c1631';
-    if(revealed.has(i)){
-      btn.textContent = '💎';
-      btn.style.background = '#10305f';
-    }
-    if(st && st.status && st.status!=='active'){
-      // round ended; if we know mine locations, show them
-      if(mines.has(i)){
-        btn.textContent = '💥';
-        btn.style.background = '#3a0f1f';
-      }
-    }
-  });
-
-  setMinesGridEnabled(active);
+async function startMines(){
+  const bet = qs('mBet').value || '0';
+  const mines = parseInt(qs('mMines').value||'3',10);
+  qs('mMsg').textContent='';
+  try{
+    await j('/api/mines/start', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ bet, mines })});
+    await refreshMines();
+  }catch(e){ qs('mMsg').textContent = e.message; }
 }
-
-async function minesRefresh(){
+async function cashoutMines(){
+  try{
+    await j('/api/mines/cashout', { method:'POST' });
+    await refreshMines();
+  }catch(e){ alert(e.message); }
+}
+async function refreshMines(){
   try{
     const st = await j('/api/mines/state');
-    updateMinesUI(st || {});
-  }catch(e){
-    qs('mMsg').textContent = e.message || 'Could not load state';
+    const grid = qs('mGrid');
+    const status = st?.status || 'idle';
+    qs('mStatus').textContent = 'Status: ' + status;
+    qs('mPicks').textContent = 'Picks: ' + (st?.picks||0);
+    qs('mBombs').textContent = 'Mines: ' + (st?.mines|| (qs('mMines').value||3));
+    qs('mHash').textContent = 'Commit: ' + (st?.commit_hash || '—');
+    qs('mMult').textContent = 'Multiplier: ' + (st?.multiplier ? (Number(st.multiplier)||1).toFixed(4)+'×' : '1.0000×');
+    qs('mPotential').textContent = 'Potential: ' + (st?.potential_win ? fmtDL(st.potential_win) : '—');
+
+    // toggle controls
+    const playing = status==='active';
+    qs('mCash').style.display = playing ? '' : 'none';
+    qs('mSetup').style.display = playing ? 'none' : '';
+
+    if(grid.children.length!==25) buildMinesGrid();
+
+    if(st?.reveals && Array.isArray(st.reveals)){
+      st.reveals.forEach((cell, idx)=>{
+        const b = grid.children[idx];
+        if(!b) return;
+        if(cell === 'u'){ b.textContent = '?'; b.disabled = false; b.style.background='#0f1a33'; }
+        else if(cell === 'g'){ b.textContent = '✅'; b.disabled = true; b.style.background='#163a2a'; }
+        else if(cell === 'b'){ b.textContent = '💣'; b.disabled = true; b.style.background='#3a1620'; }
+      });
+    }
+    // history
+    const h = await j('/api/mines/history');
+    qs('mHist').innerHTML = (h.rows && h.rows.length)
+      ? '<table><thead><tr><th>Time</th><th>Bet</th><th>Mines</th><th>Win</th><th>Status</th></tr></thead><tbody>' +
+        h.rows.map(r=>`<tr><td>\${new Date(r.started_at).toLocaleString()}</td><td>\${fmtDL(r.bet)}</td><td>\${r.mines}</td><td>\${fmtDL(r.win)}</td><td>\${r.status}</td></tr>`).join('') +
+        '</tbody></table>' : '—';
+  }catch(_){}
+}
+qs('mStart').onclick = startMines;
+qs('mCash').onclick = cashoutMines;
+
+// -------- Chat UI --------
+let chatOpen = false, chatTimer=null, lastChatId=0;
+function toggleChat(open){
+  chatOpen = open;
+  qs('chatDrawer').classList.toggle('open', open);
+  if(open){ pollChat(); } else { if(chatTimer) clearTimeout(chatTimer); }
+}
+qs('fabChat').onclick = ()=> toggleChat(true);
+qs('chatClose').onclick = ()=> toggleChat(false);
+
+async function pollChat(){
+  try{
+    const r = await j('/api/chat/fetch?since='+lastChatId+'&limit=50');
+    const arr = r.rows||[];
+    if(arr.length){
+      const body = qs('chatBody');
+      for(const m of arr){
+        lastChatId = Math.max(lastChatId, m.id||0);
+        const row = document.createElement('div'); row.className='msg';
+        row.innerHTML = `
+          <div class="msghead">
+            <span class="user-link">\${m.username}</span>
+            <span class="badge \${m.role}">\${m.role}</span>
+            <span class="level">Lv \${m.level}</span>
+            <span class="time">\${new Date(m.created_at).toLocaleTimeString()}</span>
+          </div>
+          <div>\${escapeHtml(m.text)}</div>
+        `;
+        body.appendChild(row);
+      }
+      qs('chatBody').scrollTop = qs('chatBody').scrollHeight;
+    }
+  }catch(_){}
+  finally{
+    chatTimer = setTimeout(pollChat, 1200);
   }
 }
-
-qs('mStart').onclick = async ()=>{
-  const bet = qs('mBet').value || '0';
-  const mines = parseInt(qs('mMines').value || '3', 10);
-  qs('mMsg').textContent = '';
+function escapeHtml(s){
+  return String(s||'').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+qs('chatSend').onclick = async ()=>{
+  const t = qs('chatText').value.trim();
+  if(!t) return;
   try{
-    await j('/api/mines/start', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ bet, mines })
-    });
-    buildMinesGrid();
-    await minesRefresh();
-    await minesHistory();
-    qs('mMsg').textContent = 'Game started.';
-  }catch(e){
-    qs('mMsg').textContent = e.message || 'Could not start game';
-  }
+    await j('/api/chat/send', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ text: t })});
+    qs('chatText').value = '';
+  }catch(e){ alert(e.message); }
 };
 
-async function minesPick(index){
-  qs('mMsg').textContent = '';
-  try{
-    const r = await j('/api/mines/pick?index='+index, { method:'POST' });
-    await minesRefresh();
-    if(r && (r.status==='busted' || r.busted)){
-      qs('mMsg').textContent = 'Boom! You hit a mine.';
-      await minesHistory();
-    }
-    if(r && (r.status==='cashed' || r.cashed)){
-      qs('mMsg').textContent = 'Cashed!';
-      await minesHistory();
-    }
-  }catch(e){
-    qs('mMsg').textContent = e.message || 'Pick failed';
-  }
-}
-
-qs('mCash').onclick = async ()=>{
-  qs('mMsg').textContent = '';
-  try{
-    const r = await j('/api/mines/cashout', { method:'POST' });
-    await minesRefresh();
-    await minesHistory();
-    qs('mMsg').textContent = r && r.win ? ('Cashed ' + fmtDL(r.win)) : 'Cashed!';
-  }catch(e){
-    qs('mMsg').textContent = e.message || 'Cashout failed';
-  }
-};
-
-function openMines(){
-  showOnly('page-mines');
-  buildMinesGrid();
-  minesRefresh();
-  minesHistory();
-}
-qs('openMines').onclick = openMines;
+// -------- Games navigation --------
+qs('openCrash').onclick = openCrash;
+qs('backToGames').onclick = ()=>{ showOnly('page-games'); if(crPollTimer) clearTimeout(crPollTimer); };
+qs('openMines').onclick = ()=>{ showOnly('page-mines'); refreshMines(); };
 qs('backToGames2').onclick = ()=> showOnly('page-games');
-
 qs('openCoinflip').onclick = ()=> showOnly('page-coinflip');
 qs('backToGames_cf').onclick = ()=> showOnly('page-games');
 qs('openBlackjack').onclick = ()=> showOnly('page-blackjack');
@@ -1835,108 +1827,26 @@ qs('backToGames_bj').onclick = ()=> showOnly('page-games');
 qs('openPump').onclick = ()=> showOnly('page-pump');
 qs('backToGames_pu').onclick = ()=> showOnly('page-games');
 
-// ---------- Chat UI ----------
-let chatOpen = false;
-let chatSince = 0;
-let chatTimer = null;
-const chatNote = qs('chatNote');
-
-function escapeHtml(s){
-  return String(s||'')
-    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
-    .replace(/"/g,'&quot;').replace(/'/g,'&#039;');
-}
-
-function renderMsg(m){
-  const role = (m.role||'member').toLowerCase();
-  const when = new Date(m.created_at || Date.now()).toLocaleTimeString();
-  return `
-    <div class="msg">
-      <div class="msghead">
-        <span class="user-link" title="${escapeHtml(m.user_id)}">${escapeHtml(m.username||'user')}</span>
-        <span class="badge ${role}">${role.toUpperCase()}</span>
-        <span class="level">Lv ${m.level||1}</span>
-        <span class="time">${when}</span>
-      </div>
-      <div>${escapeHtml(m.text)}</div>
-    </div>
-  `;
-}
-
-async function pollChat(){
-  try{
-    const r = await j(`/api/chat/fetch?since=${chatSince}&limit=50`);
-    const rows = r.rows || [];
-    if(rows.length){
-      const body = qs('chatBody');
-      body.insertAdjacentHTML('beforeend', rows.map(renderMsg).join(''));
-      chatSince = rows[rows.length-1].id;
-      body.scrollTop = body.scrollHeight;
-    }
-    chatNote.textContent = '';
-  }catch(e){
-    chatNote.textContent = e.message || 'Error';
-  }finally{
-    if(chatOpen) chatTimer = setTimeout(pollChat, 1000);
-  }
-}
-
-qs('chatSend').onclick = async ()=>{
-  const t = qs('chatText').value;
-  if(!t.trim()) return;
-  try{
-    await j('/api/chat/send', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ text: t }) });
-    qs('chatText').value = '';
-    await pollChat();
-  }catch(e){
-    alert(e.message || 'Could not send');
-  }
-};
-qs('chatText').addEventListener('keydown', e=>{
-  if(e.key === 'Enter'){ e.preventDefault(); qs('chatSend').click(); }
-});
-
-qs('fabChat').onclick = ()=>{
-  const dr = qs('chatDrawer');
-  chatOpen = !chatOpen;
-  dr.classList.toggle('open', chatOpen);
-  if(chatOpen){
-    qs('chatBody').innerHTML = '';
-    chatSince = 0;
-    pollChat();
-  }else{
-    if(chatTimer) clearTimeout(chatTimer);
-  }
-};
-qs('chatClose').onclick = ()=> qs('fabChat').click();
-
-// ---------- Crash nav ----------
-qs('openCrash').onclick = openCrash;
-qs('backToGames').onclick = ()=>{ showOnly('page-games'); if(crPollTimer) clearTimeout(crPollTimer); };
-
-// ---------- Init ----------
-renderHeader();
-showOnly('page-games');
-refreshLeaderboard();
+// -------- Boot --------
+(async function boot(){
+  buildMinesGrid();
+  showOnly('page-games');
+  renderHeader();
+  refreshLeaderboard();
+})();
 </script>
-</body></html>
+</body>
+</html>
 """
 
-# ---------------- Root page ----------------
+# ---------- Root page ----------
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    invite = DISCORD_INVITE if DISCORD_INVITE else "__INVITE__"
-    html = (HTML_TEMPLATE
-            .replace("__INVITE__", invite)
-            .replace("__OWNER_ID__", str(OWNER_ID)))
+    html = HTML_TEMPLATE.replace("__INVITE__", DISCORD_INVITE or "__INVITE__") \
+                        .replace("__OWNER_ID__", str(OWNER_ID))
     return HTMLResponse(html)
 
-# Optional health check
-@app.get("/healthz")
-async def healthz():
-    return {"ok": True}
-
+# ---------- Utility: run local (optional) ----------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=os.getenv("RELOAD","0")=="1")
-
+    uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=True)

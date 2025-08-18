@@ -1,4 +1,4 @@
-# app/main.py — games removed from inline (Crash & Mines imported), banners added
+# app/main.py — games removed (Crash & Mines imported from separate modules) + banners + chat fix
 
 import os, json, asyncio, re, random, string, math, secrets, datetime, hashlib
 from urllib.parse import urlencode
@@ -16,7 +16,7 @@ import uvicorn
 from pydantic import BaseModel
 
 # ---------- Import games from separate files ----------
-# Make sure crash.py and mines.py are in the same directory and expose these functions.
+# Make sure crash.py and mines.py are in the app directory and expose these functions.
 from crash import (
     ensure_betting_round, place_bet, load_round, begin_running,
     finish_round, create_next_betting, last_busts, your_bet,
@@ -67,13 +67,13 @@ def iso(dt: Optional[datetime.datetime]) -> Optional[str]:
 def _get_static_dir():
     base = os.path.dirname(os.path.abspath(__file__))
     static_dir = os.path.join(base, "static")
-    os.makedirs(static_dir, exist_ok=True)
+    os.makedirs(static_dir, exist_ok=True)  # ensure exists so Railway / Heroku don't error
     return static_dir
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    apply_migrations()
+    apply_migrations()  # auto-heal old schemas
     yield
 
 app = FastAPI(lifespan=lifespan)
@@ -242,7 +242,7 @@ def init_db(cur):
     cur.execute("ALTER TABLE crash_games ALTER COLUMN bet TYPE NUMERIC(18,2) USING bet::numeric")
     cur.execute("ALTER TABLE crash_games ALTER COLUMN win TYPE NUMERIC(18,2) USING win::numeric")
 
-    # chat
+    # chat (includes private_to for DMs / notices)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS chat_messages (
             id BIGSERIAL PRIMARY KEY,
@@ -499,12 +499,15 @@ def get_leaderboard_rows_db(cur, period: str, limit: int = 50):
         })
     return out
 
-# ---------- Migrations ----------
+# ---------- Migrations (auto-heal older DBs) ----------
 @with_conn
 def apply_migrations(cur):
     cur.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS is_anon BOOLEAN NOT NULL DEFAULT FALSE")
     cur.execute("CREATE INDEX IF NOT EXISTS ix_crash_games_created_at ON crash_games (created_at)")
     cur.execute("CREATE INDEX IF NOT EXISTS ix_mines_games_started_at ON mines_games (started_at)")
+    # Ensure chat columns exist (fixes 'private_to does not exist')
+    cur.execute("ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS private_to TEXT")
+    cur.execute("ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS username TEXT")
 
 # ---------- OAuth token store & Discord join ----------
 @with_conn
@@ -1049,11 +1052,12 @@ async def api_discord_join(request: Request):
     nick = get_profile_name(s["id"]) or s["username"]
     return await guild_add_member(s["id"], nickname=nick)
 
-# ---------- HTML (UI/UX) ----------
+# ---------- HTML (UI/UX) with banner images ----------
 HTML_TEMPLATE = """
 <!doctype html><html lang="en"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
 <title>GROWCB</title>
+<link rel="icon" href="/static/GrowCBnobackground.png"/>
 <style>
 :root{--bg:#0a0f1e;--bg2:#0c1428;--card:#111a31;--muted:#9eb3da;--text:#ecf2ff;--accent:#6aa6ff;--accent2:#22c1dc;--ok:#34d399;--warn:#f59e0b;--err:#ef4444;--border:#1f2b47;--chatW:340px;--input-bg:#0b1430;--input-br:#223457;--input-tx:#e6eeff;--input-ph:#9db4e4}
 *{box-sizing:border-box}html,body{height:100%}body{margin:0;color:var(--text);background:radial-gradient(1400px 600px at 20% -10%, #11204d 0%, transparent 60%),linear-gradient(180deg,#0a0f1e,#0a0f1e 60%, #0b1124);font-family:Inter,system-ui,Segoe UI,Roboto,Arial,Helvetica,sans-serif;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}
@@ -1065,13 +1069,10 @@ input::placeholder{color:var(--input-ph)}input:focus{border-color:#4c78ff;box-sh
 .card{background:linear-gradient(180deg,#0f1a33,#0b1326);border:1px solid var(--border);border-radius:16px;padding:16px}
 .header{position:sticky;top:0;z-index:30;backdrop-filter:blur(8px);background:rgba(10,15,30,.72);border-bottom:1px solid var(--border)}
 .header-inner{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px}
-.left{display:flex;align-items:center;gap:14px;flex:1;min-width:0}.brand{display:flex;align-items:center;gap:10px;font-weight:800;white-space:nowrap}
-.brand .logo{
-  width:28px;height:28px;border-radius:8px;
-  background-image:url('/static/GrowCBnobackground.png');
-  background-size:cover;background-position:center;background-repeat:no-repeat;
-  border:1px solid var(--border)
-}
+.left{display:flex;align-items:center;gap:14px;flex:1;min-width:0}
+.brand{display:flex;align-items:center;gap:10px;font-weight:800;white-space:nowrap}
+.brand .logo{width:28px;height:28px;border-radius:8px;background:linear-gradient(135deg,var(--accent),var(--accent2))}
+.brand img.logo-img{width:28px;height:28px;border-radius:8px;object-fit:contain;display:block}
 .tabs{display:flex;gap:4px;align-items:center;padding:4px;border-radius:14px;background:linear-gradient(180deg,#0f1a33,#0b1326);border:1px solid var(--border)}
 .tab{padding:8px 12px;border-radius:10px;cursor:pointer;font-weight:700;white-space:nowrap;color:#d8e6ff;opacity:.85;transition:all .15s ease;display:flex;align-items:center;gap:8px}
 .tab:hover{opacity:1;transform:translateY(-1px)}.tab.active{background:linear-gradient(135deg,#3b82f6,#22c1dc);color:#051326;box-shadow:0 6px 16px rgba(59,130,246,.25);opacity:1}
@@ -1086,12 +1087,19 @@ input::placeholder{color:var(--input-ph)}input:focus{border-color:#4c78ff;box-sh
 .btn.ghost{background:#162a52;border:1px solid var(--border);color:#eaf2ff}
 .btn.ok{background:linear-gradient(135deg,#22c55e,#16a34a);border-color:transparent}
 .big{font-size:22px;font-weight:900}.label{font-size:12px;color:var(--muted);letter-spacing:.2px;text-transform:uppercase}.muted{color:var(--muted)}
-.games-grid{display:grid;gap:14px;grid-template-columns:1fr}@media(min-width:700px){.games-grid{grid-template-columns:1fr 1fr}}@media(min-width:1020px){.games-grid{grid-template-columns:1fr 1fr 1fr}}
-.game-card{position:relative;min-height:130px;display:flex;flex-direction:column;justify-content:flex-end;gap:4px;border:1px solid var(--border);border-radius:16px;padding:16px;cursor:pointer;transition:transform .08s ease, box-shadow .12s ease, border-color .12s ease, background .18s ease;overflow:hidden;
-  background-size:cover;background-position:center;background-repeat:no-repeat;
-}
-.game-card:hover{transform:translateY(-2px);box-shadow:0 8px 18px rgba(0,0,0,.25)}.game-card .title{font-size:20px;font-weight:800}
+
+.games-grid{display:grid;gap:14px;grid-template-columns:1fr}
+@media(min-width:700px){.games-grid{grid-template-columns:1fr 1fr}}
+@media(min-width:1020px){.games-grid{grid-template-columns:1fr 1fr 1fr}}
+
+.game-card{position:relative;min-height:160px;display:flex;flex-direction:column;justify-content:flex-end;gap:4px;
+  background:linear-gradient(180deg,#0f1a33,#0c152a);border:1px solid var(--border);border-radius:16px;padding:16px;cursor:pointer;
+  transition:transform .08s ease, box-shadow .12s ease, border-color .12s ease, background .18s ease;overflow:hidden}
+.game-card:hover{transform:translateY(-2px);box-shadow:0 8px 18px rgba(0,0,0,.25)}
+.game-card .title{font-size:20px;font-weight:800}
+.game-card img.banner{position:absolute;inset:auto 0 0 0;width:100%;height:58%;object-fit:cover;opacity:.95;pointer-events:none;filter:saturate(1.05) contrast(1.05)}
 .ribbon{position:absolute;top:12px;right:-32px;transform:rotate(35deg);background:linear-gradient(135deg,#f59e0b,#fb923c);color:#1a1206;font-weight:900;padding:6px 50px;border:1px solid rgba(0,0,0,.2)}
+
 .cr-graph-wrap{position:relative;height:240px;background:#0e1833;border:1px solid var(--border);border-radius:16px;overflow:hidden}
 canvas{display:block;width:100%;height:100%}
 .lb-controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
@@ -1102,6 +1110,7 @@ table{width:100%;border-collapse:collapse}th,td{padding:10px;border-bottom:1px s
 tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%)}tr.anon td.name{color:#9db4e4;font-style:italic}
 .countdown{font-size:12px;color:var(--muted)}.hint{font-size:12px;color:var(--muted);margin-top:6px}
 .grid-2{display:grid;grid-template-columns:1fr;gap:16px}@media(min-width:900px){.grid-2{grid-template-columns:1.1fr .9fr}}
+
 .hero{display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap}
 .kpi{display:flex;gap:8px;flex-wrap:wrap}
 .kpi .pill{background:#0c1631;border:1px solid var(--border);border-radius:999px;padding:6px 10px;font-size:12px}
@@ -1111,6 +1120,7 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
 .discord-cta{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
 .bad{color:#ffb4b4}.good{color:#b7ffcc}
 .card.soft{background:linear-gradient(180deg,#0f1836,#0c152b)}
+
 .chat-drawer{position:fixed;right:0;top:64px;bottom:0;width:var(--chatW);max-width:92vw;transform:translateX(100%);transition:transform .2s ease-out;background:linear-gradient(180deg,#0f1a33,#0b1326);border-left:1px solid var(--border);display:flex;flex-direction:column;z-index:40}
 .chat-drawer.open{transform:translateX(0)}.chat-head{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border-bottom:1px solid var(--border)}
 .chat-body{flex:1;overflow:auto;padding:10px 12px}.chat-input{display:flex;gap:8px;padding:10px 12px;border-top:1px solid var(--border)}.chat-input input{flex:1}
@@ -1128,7 +1138,11 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
   <div class="header">
     <div class="header-inner container">
       <div class="left">
-        <a class="brand" href="#" id="homeLink"><span class="logo"></span> GROWCB</a>
+        <a class="brand" href="#" id="homeLink">
+          <span class="logo"></span>
+          <img class="logo-img" src="/static/GrowCBnobackground.png" alt="GROWCB" onerror="this.style.display='none'"/>
+          GROWCB
+        </a>
         <div class="tabs">
           <a class="tab active" id="tab-games">Games</a>
           <a class="tab" id="tab-ref">Referral</a>
@@ -1152,41 +1166,26 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
           </div>
         </div>
         <div class="games-grid" style="margin-top:12px">
-          <div class="game-card" id="openCrash" style="
-            background:
-              url('/static/crash.png') center/cover no-repeat,
-              radial-gradient(600px 280px at 10% -10%, rgba(59,130,246,.25), transparent 60%);
-          ">
+          <div class="game-card" id="openCrash">
+            <img class="banner" src="/static/crash.png" alt="Crash banner" onerror="this.style.display='none'"/>
             <div class="title">🚀 Crash</div><div class="muted">Shared rounds • 10s betting • Live cashout</div>
           </div>
-          <div class="game-card" id="openMines" style="
-            background:
-              url('/static/mines.png') center/cover no-repeat,
-              radial-gradient(600px 280px at 85% -20%, rgba(34,197,94,.25), transparent 60%);
-          ">
+          <div class="game-card" id="openMines">
+            <img class="banner" src="/static/mines.png" alt="Mines banner" onerror="this.style.display='none'"/>
             <div class="title">💣 Mines</div><div class="muted">5×5 board • Choose mines • Cash out anytime</div>
           </div>
 
-          <!-- New stubs -->
-          <div class="game-card" id="openCoinflip" style="
-            background:
-              url('/static/coinflip.png') center/cover no-repeat,
-              radial-gradient(600px 280px at 50% -20%, rgba(250,204,21,.22), transparent 60%);
-          ">
+          <!-- Stubs (optional banners if you add images) -->
+          <div class="game-card" id="openCoinflip">
+            <img class="banner" src="/static/coinflip.png" alt="Coinflip banner" onerror="this.style.display='none'"/>
             <div class="title">🪙 Coinflip</div><div class="muted">Quick 50/50 — coming soon</div>
           </div>
-          <div class="game-card" id="openBlackjack" style="
-            background:
-              url('/static/blackjack.png') center/cover no-repeat,
-              radial-gradient(600px 280px at 30% -10%, rgba(16,185,129,.22), transparent 60%);
-          ">
+          <div class="game-card" id="openBlackjack">
+            <img class="banner" src="/static/blackjack.png" alt="Blackjack banner" onerror="this.style.display='none'"/>
             <div class="title">🃏 Blackjack</div><div class="muted">Beat the dealer — coming soon</div>
           </div>
-          <div class="game-card" id="openPump" style="
-            background:
-              url('/static/pump.png') center/cover no-repeat,
-              radial-gradient(600px 280px at 70% -10%, rgba(147,51,234,.22), transparent 60%);
-          ">
+          <div class="game-card" id="openPump">
+            <img class="banner" src="/static/pump.png" alt="Pump banner" onerror="this.style.display='none'"/>
             <div class="title">📈 Pump</div><div class="muted">Ride the spike — coming soon</div>
           </div>
         </div>
@@ -1330,7 +1329,7 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
       </div>
     </div>
 
-    <!-- Settings -->
+    <!-- Settings (open via avatar; logout at bottom) -->
     <div id="page-settings" style="display:none">
       <div class="card">
         <div class="label">Settings</div>
@@ -1347,7 +1346,7 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
       </div>
     </div>
 
-    <!-- Profile -->
+    <!-- Profile (open by clicking avatar) -->
     <div id="page-profile" style="display:none">
       <div class="card">
         <div class="label">Profile</div><div id="profileBox">Loading…</div>
@@ -1419,7 +1418,7 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
     }
   }
 
-  // Header / Auth
+  // Header / Auth (avatar opens menu with Profile/Settings)
   async function renderHeader(){
     try{
       const me = await j('/api/me');
@@ -1447,7 +1446,7 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
     }
   }
 
-  // Join Discord
+  // Join Discord (buttons in multiple places)
   async function joinDiscord(){
     try{
       await j('/api/discord/join', { method:'POST' });
@@ -1591,224 +1590,248 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
   }
   function endOfUtcMonth(){
     const now = new Date();
-    return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth()+1, 1, 0,0,0));
+    return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth()+1, 1, 0,0,0,0));
   }
-  function renderLbCountdown(){
-    let target = lbPeriod==='daily' ? nextUtcMidnight() : (lbPeriod==='monthly' ? endOfUtcMonth() : null);
-    if(!target){ qs('lbCountdown').textContent = 'All-time'; return; }
-    const now = new Date();
-    const diff = Math.max(0, target.getTime() - now.getTime());
-    const h = Math.floor(diff/3600000), m = Math.floor((diff%3600000)/60000), s = Math.floor((diff%60000)/1000);
-    qs('lbCountdown').textContent = `Resets in ${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
-  }
-  setInterval(renderLbCountdown, 1000);
-
   async function refreshLeaderboard(){
     setLbButtons();
+    const target = qs('lbWrap');
+    target.textContent = 'Loading…';
     try{
-      const r = await j(`/api/leaderboard?period=${encodeURIComponent(lbPeriod)}`);
-      const rows = r.rows||[];
-      if(!rows.length){ qs('lbWrap').textContent='—'; return; }
-      qs('lbWrap').innerHTML = '<table><thead><tr><th>#</th><th>Name</th><th>Total Wagered</th></tr></thead><tbody>' +
-        rows.map((row,i)=>{
-          const name = row.is_anon ? 'Anonymous' : row.display_name;
-          const amt = row.is_anon ? '—' : fmtDL(row.total_wagered);
-          return `<tr class="${row.is_anon?'anon':''}"><td>${i+1}</td><td class="name">${name}</td><td>${amt}</td></tr>`;
-        }).join('') + '</tbody></table>';
-    }catch(e){ qs('lbWrap').textContent = e.message||'Error'; }
+      const r = await j('/api/leaderboard?period=' + lbPeriod + '&limit=100');
+      const rows = r.rows || [];
+      if(!rows.length){ target.textContent = '—'; return; }
+      let html = '<table><thead><tr><th>#</th><th>Name</th><th>Total Wagered</th></tr></thead><tbody>';
+      rows.forEach((u,i)=>{
+        const name = u.is_anon ? 'Anonymous' : (u.display_name || 'user_' + (u.user_id||'').slice(-4));
+        const amt = u.is_anon ? '—' : (GEM + ' ' + (Number(u.total_wagered||0)).toFixed(2) + ' DL');
+        html += `<tr><td>${i+1}</td><td class="name ${u.is_anon?'anon':''}">${name}</td><td>${amt}</td></tr>`;
+      });
+      html += '</tbody></table>';
+      target.innerHTML = html;
+      // countdown
+      const el = qs('lbCountdown');
+      function tick(){
+        const end = lbPeriod==='daily' ? nextUtcMidnight() : lbPeriod==='monthly' ? endOfUtcMonth() : null;
+        if(!end){ el.textContent = 'All-time'; return; }
+        const ms = end - new Date();
+        const s = Math.max(0, Math.floor(ms/1000));
+        const h = String(Math.floor(s/3600)).padStart(2,'0');
+        const m = String(Math.floor((s%3600)/60)).padStart(2,'0');
+        const sec = String(s%60).padStart(2,'0');
+        el.textContent = `Resets in ${h}:${m}:${sec} (UTC)`;
+      }
+      clearInterval(window._lbI); window._lbI = setInterval(tick, 1000); tick();
+    }catch(e){ target.textContent = e.message || 'Failed to load'; }
   }
-  qs('lbSeg').addEventListener('click', (ev)=>{
-    const btn = ev.target.closest('button'); if(!btn) return;
-    lbPeriod = btn.dataset.period; refreshLeaderboard();
+  qs('lbSeg').addEventListener('click', (e)=>{
+    const b = e.target.closest('button'); if(!b) return;
+    lbPeriod = b.dataset.period; refreshLeaderboard();
   });
 
-  // ---------- Crash UI ----------
-  const crCanvas = qs('crCanvas'); const crCtx = crCanvas.getContext('2d');
-  function sizeCanvas(){
-    const dpr = window.devicePixelRatio||1; const w = crCanvas.clientWidth; const h = crCanvas.clientHeight;
-    crCanvas.width = Math.floor(w*dpr); crCanvas.height = Math.floor(h*dpr); crCtx.setTransform(dpr,0,0,dpr,0,0);
+  // ---------- Crash ----------
+  const cr = { timer:null, startedAt:null, expectedEnd:null, phase:'betting', your:null };
+  const crCanvas = ()=> qs('crCanvas');
+  function drawCrash(mult){
+    const c = crCanvas(); if(!c) return;
+    const ctx = c.getContext('2d');
+    const w = c.width = c.clientWidth; const h = c.height = c.clientHeight;
+    ctx.clearRect(0,0,w,h);
+    // axes
+    ctx.globalAlpha = 0.12; ctx.strokeStyle = '#fff'; ctx.beginPath(); ctx.moveTo(40,h-30); ctx.lineTo(w-10,h-30); ctx.lineTo(w-10,10); ctx.stroke(); ctx.globalAlpha = 1;
+    // curve (log-ish growth)
+    const steps = 200;
+    ctx.beginPath(); ctx.moveTo(40,h-30);
+    for(let i=0;i<=steps;i++){
+      const t = i/steps;
+      const x = 40 + (w-60)*t;
+      const mm = Math.max(1, mult);
+      const y = (h-30) - (h-60)*Math.min(1, (mm-1)/10) * Math.pow(t, 1.2);
+      ctx.lineTo(x,y);
+    }
+    ctx.stroke();
   }
-  window.addEventListener('resize', sizeCanvas); sizeCanvas();
-
-  let crTimer = null, crPolling = null;
-  function setCrMsg(t){ qs('crMsg').textContent = t||''; }
-  function setCrHint(t){ qs('crHint').textContent = t||''; }
-
-  function drawMultiplier(mult){
-    const w = crCanvas.clientWidth, h = crCanvas.clientHeight;
-    crCtx.clearRect(0,0,w,h);
-    crCtx.beginPath();
-    crCtx.moveTo(12,h-18);
-    const x = Math.min(w-12, 12 + (mult*28)); const y = Math.max(18, h-18 - (mult*16));
-    crCtx.lineTo(x,y);
-    crCtx.strokeStyle = '#7fb3ff'; crCtx.lineWidth = 2; crCtx.stroke();
-  }
-
   async function pollCrash(){
     try{
       const st = await j('/api/crash/state');
-      qs('lastBusts').textContent = (st.last_busts||[]).map(v=> (Number(v)||0).toFixed(2)+'×').join(' • ') || '—';
-      if(st.phase === 'betting'){
-        const end = new Date(st.betting_ends_at); const now = new Date(); const sec = Math.max(0, Math.floor((end-now)/1000));
-        setCrHint(`Betting: ${sec}s left`); qs('crCashout').style.display='none';
-        drawMultiplier(1.0);
-      }else if(st.phase === 'running'){
-        const mult = Number(st.current_multiplier||1.0); drawMultiplier(mult);
-        qs('crNow').textContent = (mult).toFixed(2)+'×';
-        setCrHint('Round live'); qs('crCashout').style.display='';
-      }else if(st.phase === 'ended'){
-        qs('crNow').textContent = Number(st.bust||0).toFixed(2)+'×';
-        setCrHint('Round ended'); qs('crCashout').style.display='none';
+      cr.phase = st.phase; cr.startedAt = st.started_at ? new Date(st.started_at) : null; cr.expectedEnd = st.expected_end_at ? new Date(st.expected_end_at) : null;
+      const now = new Date();
+      let mult = 1.0; let hint = '';
+      if(cr.phase === 'betting'){
+        const ends = st.betting_ends_at ? new Date(st.betting_ends_at) : null;
+        const s = ends ? Math.max(0, Math.floor((ends-now)/1000)) : 0;
+        hint = `Betting ends in ${s}s`;
+      }else if(cr.phase === 'running'){
+        mult = st.current_multiplier || 1.0;
+        hint = `Live — busts at ${Number(st.bust||0).toFixed(2)}×`;
+      }else if(cr.phase === 'ended'){
+        mult = st.bust || 1.0; hint = `Last bust ${Number(st.bust||0).toFixed(2)}×`;
       }
-      // your recent
-      try{
-        const hist = await j('/api/crash/history');
-        qs('crLast').innerHTML = (hist.rows||[]).map(r=>`<div>${new Date(r.created_at).toLocaleString()} — Bet ${fmtDL(r.bet)} • Cash ${Number(r.cashout).toFixed(2)}× • Bust ${Number(r.bust).toFixed(2)}× • Win ${fmtDL(r.win)}</div>`).join('') || '—';
-      }catch(_){}
-    }catch(e){
-      setCrHint(e.message||'Error'); qs('crCashout').style.display='none';
-    }
-  }
-  setInterval(pollCrash, 1000);
+      qs('crNow').textContent = (Number(mult).toFixed(2)) + '×';
+      qs('crHint').textContent = hint;
+      drawCrash(mult);
 
-  qs('crPlace').onclick = async ()=>{
-    setCrMsg('');
+      // last busts
+      const lb = (st.last_busts||[]).map(x=> Number(x||0).toFixed(2)+'×').join(' • ');
+      qs('lastBusts').textContent = lb || '—';
+
+      // your bet state
+      if(st.your_bet){
+        cr.your = st.your_bet;
+        qs('crCashout').style.display = ''; qs('crPlace').style.display='none';
+      }else{
+        cr.your = null;
+        qs('crCashout').style.display = 'none'; qs('crPlace').style.display='';
+      }
+    }catch(_){}
+  }
+  async function loadCrashHistory(){
     try{
-      const bet = qs('crBet').value; const cash = qs('crCash').value || null;
-      const r = await j('/api/crash/place', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ bet, cashout: cash?Number(cash):null })});
-      setCrMsg('Bet placed.'); renderHeader();
-    }catch(e){ setCrMsg(e.message); }
+      const r = await j('/api/crash/history');
+      const rows = r.rows||[];
+      qs('crLast').textContent = rows.length ? rows.map(x=> `${new Date(x.created_at).toLocaleTimeString()} — bet ${fmtDL(x.bet)} @ ${Number(x.cashout).toFixed(2)}× → win ${fmtDL(x.win)}`).join(' | ') : '—';
+    }catch(_){}
+  }
+  qs('crPlace').onclick = async ()=>{
+    try{
+      const bet = qs('crBet').value; const cash = qs('crCash').value;
+      const payload = { bet, cashout: cash? Number(cash): undefined };
+      const r = await j('/api/crash/place', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+      qs('crMsg').textContent = 'Bet placed.'; renderHeader();
+    }catch(e){ qs('crMsg').textContent = e.message; }
   };
   qs('crCashout').onclick = async ()=>{
-    setCrMsg('');
     try{
-      const r = await j('/api/crash/cashout', { method:'POST' });
-      setCrMsg('Cashed out! +' + fmtDL(r.win));
-      renderHeader();
-    }catch(e){ setCrMsg(e.message); }
+      await j('/api/crash/cashout', { method:'POST' }); qs('crMsg').textContent='Cashed out!'; renderHeader(); loadCrashHistory();
+    }catch(e){ qs('crMsg').textContent = e.message; }
   };
 
-  // ---------- Mines UI ----------
-  const mGrid = qs('mGrid'); const mMsg = qs('mMsg'); const mCash = qs('mCash');
-  function buildGrid(){
-    mGrid.innerHTML=''; for(let i=0;i<25;i++){
+  // ---------- Mines ----------
+  const m = { active:false, picks:0, mines:3, bet:0 };
+  function renderMinesGrid(state){
+    const g = qs('mGrid'); g.innerHTML='';
+    for(let i=0;i<25;i++){
       const b = document.createElement('button');
-      b.textContent = (i+1); b.className='btn'; b.style.minWidth='64px'; b.style.height='64px';
-      b.onclick = ()=> pick(i);
-      mGrid.appendChild(b);
+      b.className='btn'; b.style.minHeight='64px';
+      b.textContent = state.revealed && state.revealed[i] ? (state.mines_at && state.mines_at[i] ? '💣' : '💎') : (i+1);
+      b.disabled = !state.can_pick || (state.revealed && state.revealed[i]);
+      b.onclick = async ()=>{
+        try{
+          const r = await j('/api/mines/pick?index='+i, { method:'POST' });
+          updateMinesUI(r);
+        }catch(e){ qs('mMsg').textContent = e.message; }
+      };
+      g.appendChild(b);
     }
   }
-  buildGrid();
-
-  async function refreshMines(){
+  function updateMinesUI(st){
+    m.active = st && st.status==='active';
+    qs('mStatus').textContent = 'Status: ' + (st.status||'—');
+    qs('mPicks').textContent = 'Picks: ' + (st.picks||0);
+    qs('mBombs').textContent = 'Mines: ' + (st.mines||m.mines);
+    qs('mMult').textContent = 'Multiplier: ' + (st.multiplier? st.multiplier.toFixed(4): '1.0000') + '×';
+    qs('mPotential').textContent = 'Potential: ' + (st.potential_win ? fmtDL(st.potential_win) : '—');
+    qs('mHash').textContent = 'Commit: ' + (st.commit_hash || '—');
+    renderMinesGrid(st);
+    qs('mCash').style.display = m.active ? '' : 'none';
+    qs('mSetup').style.display = m.active ? 'none' : '';
+  }
+  async function pollMinesState(){
     try{
       const st = await j('/api/mines/state');
-      if(!st || !st.game){
-        qs('mSetup').style.display=''; mCash.style.display='none';
-        qs('mStatus').textContent='Status: —'; qs('mHash').textContent='Commit: —'; qs('mPicks').textContent='Picks: 0';
-        qs('mMult').textContent='Multiplier: 1.0000×'; qs('mPotential').textContent='Potential: —';
-        Array.from(mGrid.children).forEach((b)=>{ b.disabled=true; b.textContent='—'; b.className='btn'; });
-      }else{
-        const g = st.game;
-        qs('mSetup').style.display='none'; mCash.style.display='';
-        qs('mStatus').textContent='Status: ' + g.status;
-        qs('mHash').textContent='Commit: ' + (g.commit_hash||'');
-        qs('mPicks').textContent='Picks: ' + (g.picks||0);
-        qs('mBombs').textContent='Mines: ' + (g.mines||0);
-        qs('mMult').textContent='Multiplier: ' + Number(g.multiplier||1).toFixed(4) + '×';
-        qs('mPotential').textContent='Potential: ' + (g.potential_win ? fmtDL(g.potential_win) : '—');
-        Array.from(mGrid.children).forEach((b)=>{ b.disabled = (g.status!=='active'); b.textContent='?'; b.className='btn'; });
-        if(g.reveals && Array.isArray(g.reveals)){
-          g.reveals.forEach((rv)=>{
-            const b = mGrid.children[rv.index]; b.disabled=true;
-            b.textContent = rv.type==='bomb' ? '💣' : '💎';
-            b.className = 'btn ' + (rv.type==='bomb' ? '' : 'ok');
-          });
-        }
-      }
-      // history
-      try{
-        const h = await j('/api/mines/history');
-        qs('mHist').innerHTML = (h.rows||[]).map(r=>`<div>${new Date(r.started_at).toLocaleString()} — Bet ${fmtDL(r.bet)} • Mines ${r.mines} • Picks ${r.picks} • Win ${fmtDL(r.win)}</div>`).join('') || '—';
-      }catch(_){}
-    }catch(e){}
+      if(st && st.status){ updateMinesUI(st); }
+    }catch(_){}
+    try{
+      const h = await j('/api/mines/history');
+      const rows = h.rows||[];
+      qs('mHist').textContent = rows.length ? rows.map(x=> `${new Date(x.started_at).toLocaleTimeString()} — bet ${fmtDL(x.bet)} → ${fmtDL(x.win)} (${x.status})`).join(' | ') : '—';
+    }catch(_){}
   }
-  setInterval(refreshMines, 1000);
-
   qs('mStart').onclick = async ()=>{
-    mMsg.textContent='';
+    qs('mMsg').textContent='';
     try{
       const bet = qs('mBet').value; const mines = parseInt(qs('mMines').value||'3',10);
-      await j('/api/mines/start', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ bet, mines }) });
-      mMsg.textContent='Game started.'; refreshMines(); renderHeader();
-    }catch(e){ mMsg.textContent=e.message; }
+      const st = await j('/api/mines/start', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ bet, mines }) });
+      updateMinesUI(st);
+      renderHeader();
+    }catch(e){ qs('mMsg').textContent = e.message; }
   };
-  async function pick(i){
-    try{ await j(`/api/mines/pick?index=${i}`, { method:'POST' }); refreshMines(); renderHeader(); }
-    catch(e){ mMsg.textContent = e.message; }
-  }
-  mCash.onclick = async ()=>{
-    mMsg.textContent='';
-    try{ const r = await j('/api/mines/cashout', { method:'POST' }); mMsg.textContent = 'Cashed out: +' + fmtDL(r.win); refreshMines(); renderHeader(); }
-    catch(e){ mMsg.textContent = e.message; }
+  qs('mCash').onclick = async ()=>{
+    qs('mMsg').textContent='';
+    try{
+      const st = await j('/api/mines/cashout', { method:'POST' });
+      updateMinesUI(st); renderHeader();
+    }catch(e){ qs('mMsg').textContent = e.message; }
   };
 
   // ---------- Chat ----------
-  const drawer = qs('chatDrawer'); const fab = qs('fabChat'); const chatClose = qs('chatClose');
-  fab.onclick = ()=> drawer.classList.add('open'); chatClose.onclick = ()=> drawer.classList.remove('open');
-  let lastId = 0;
-  async function pullChat(){
+  let chatOpen = false, chatSince = 0, chatInt = null;
+  function renderMsg(m){
+    const el = document.createElement('div'); el.className = 'msg';
+    el.innerHTML = `
+      <div class="msghead">
+        <span class="user-link">${m.username}</span>
+        <span class="level">Lv ${m.level||1}</span>
+        <span class="badge ${m.role||'member'}">${m.role||'member'}</span>
+        <span class="time">${new Date(m.created_at).toLocaleTimeString()}</span>
+      </div>
+      <div>${m.text}</div>
+    `;
+    return el;
+  }
+  async function chatFetch(){
     try{
-      const r = await j(`/api/chat/fetch?since=${lastId}`);
-      const body = qs('chatBody');
-      (r.rows||[]).forEach(m=>{
-        lastId = Math.max(lastId, m.id);
-        const el = document.createElement('div'); el.className='msg';
-        el.innerHTML = `<div class="msghead">
-          <span class="user-link">${m.username}</span>
-          <span class="badge ${m.role}">${m.role.toUpperCase()}</span>
-          <span class="level">Lv ${m.level}</span>
-          <span class="time">${new Date(m.created_at).toLocaleTimeString()}</span>
-        </div>
-        <div>${m.text.replace(/[<>]/g, '')}</div>`;
-        body.appendChild(el); body.scrollTop = body.scrollHeight;
-      });
+      const r = await j('/api/chat/fetch?since=' + (chatSince||0) + '&limit=50');
+      const rows = r.rows||[];
+      if(rows.length){
+        const body = qs('chatBody');
+        rows.forEach(m=> { body.appendChild(renderMsg(m)); chatSince = Math.max(chatSince, m.id||0); });
+        body.scrollTop = body.scrollHeight;
+      }
     }catch(_){}
   }
-  setInterval(pullChat, 1500);
+  function openChat(){ qs('chatDrawer').classList.add('open'); chatOpen=true; chatFetch(); clearInterval(chatInt); chatInt = setInterval(chatFetch, 1500); }
+  function closeChat(){ qs('chatDrawer').classList.remove('open'); chatOpen=false; clearInterval(chatInt); }
+  qs('fabChat').onclick = openChat; qs('chatClose').onclick = closeChat;
   qs('chatSend').onclick = async ()=>{
     const t = qs('chatText'); const text = t.value.trim(); if(!text) return;
-    try{ await j('/api/chat/send', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ text })}); t.value=''; pullChat(); }
+    try{ await j('/api/chat/send', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ text }) }); t.value=''; chatFetch(); }
     catch(e){ alert(e.message); }
   };
 
-  // ---------- Navigation ----------
-  function wireNav(){
-    qs('openCrash').onclick = ()=> { showOnly('page-crash'); };
-    qs('openMines').onclick = ()=> { showOnly('page-mines'); };
-    qs('openCoinflip').onclick = ()=> { showOnly('page-coinflip'); };
-    qs('openBlackjack').onclick = ()=> { showOnly('page-blackjack'); };
-    qs('openPump').onclick = ()=> { showOnly('page-pump'); };
-    qs('backToGames').onclick = ()=> showOnly('page-games');
-    qs('backToGames2').onclick = ()=> showOnly('page-games');
-    qs('backToGames_cf').onclick = ()=> showOnly('page-games');
-    qs('backToGames_bj').onclick = ()=> showOnly('page-games');
-    qs('backToGames_pu').onclick = ()=> showOnly('page-games');
-  }
+  // ---------- Page wiring ----------
+  qs('openCrash').onclick = ()=>{ showOnly('page-crash'); pollCrash(); loadCrashHistory(); clearInterval(window._crI); window._crI = setInterval(pollCrash, 1000); };
+  qs('backToGames').onclick = ()=>{ showOnly('page-games'); clearInterval(window._crI); };
+  qs('openMines').onclick = ()=>{ showOnly('page-mines'); pollMinesState(); clearInterval(window._mI); window._mI = setInterval(pollMinesState, 1500); };
+  qs('backToGames2').onclick = ()=>{ showOnly('page-games'); clearInterval(window._mI); };
+  qs('openCoinflip').onclick = ()=>{ showOnly('page-coinflip'); };
+  qs('openBlackjack').onclick = ()=>{ showOnly('page-blackjack'); };
+  qs('openPump').onclick = ()=>{ showOnly('page-pump'); };
+  qs('backToGames_cf').onclick = ()=> showOnly('page-games');
+  qs('backToGames_bj').onclick = ()=> showOnly('page-games');
+  qs('backToGames_pu').onclick = ()=> showOnly('page-games');
 
-  // ---------- Boot ----------
-  renderHeader(); wireNav(); refreshLeaderboard(); pollCrash(); refreshMines(); pullChat();
+  // Attach referral from cookie (if any) right after login
+  (async ()=>{
+    try{
+      const m = await j('/api/me'); if(m && m.id){
+        const refCookie = (document.cookie.split('; ').find(x=>x.startsWith('refname='))||'').split('=')[1];
+        if(refCookie){ await j('/api/referral/attach?refname=' + encodeURIComponent(refCookie)); document.cookie='refname=; Max-Age=0; path=/'; }
+      }
+    }catch(_){}
+  })();
+
+  // initial
+  renderHeader();
   </script>
 </body>
 </html>
 """
 
-# ---------- Home ----------
-@app.get("/", response_class=HTMLResponse)
+@app.get("/")
 async def home():
     html = HTML_TEMPLATE.replace("__INVITE__", DISCORD_INVITE or "__INVITE__").replace("__OWNER_ID__", str(OWNER_ID))
     return HTMLResponse(html)
 
-# ---------- Entrypoint ----------
+# ---------- Run ----------
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=bool(os.getenv("DEV") == "1"))
+    uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=os.getenv("RELOAD","0") == "1")

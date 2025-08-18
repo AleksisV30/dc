@@ -753,10 +753,12 @@ HTML_TEMPLATE = """
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
   <title>💎 DL Bank</title>
   <style>
-    :root{
-      --bg:#0a0f1e; --bg2:#0c1428; --card:#111a31; --muted:#9eb3da; --text:#ecf2ff;
-      --accent:#6aa6ff; --accent2:#22c1dc; --ok:#34d399; --warn:#f59e0b; --err:#ef4444; --border:#1f2b47;
-    }
+:root{
+  --bg:#0a0f1e; --bg2:#0c1428; --card:#111a31; --muted:#9eb3da; --text:#ecf2ff;
+  --accent:#6aa6ff; --accent2:#22c1dc; --ok:#34d399; --warn:#f59e0b; --err:#ef4444; --border:#1f2b47;
+  --chatW: 300px;   /* <— add this */
+}
+
     *{box-sizing:border-box}
     html,body{height:100%}
     body{
@@ -882,12 +884,15 @@ HTML_TEMPLATE = """
     .modal .box{ width:min(640px, 92vw); background:linear-gradient(180deg,#0f1a33,#0c1429); border:1px solid var(--border); border-radius:18px; padding:16px; box-shadow:0 10px 30px rgba(0,0,0,.4) }
 
     /* Chat Drawer (narrower) */
-    .chat-drawer{
-      position:fixed; right:0; top:64px; bottom:0; width:300px; max-width:90vw;
-      transform:translateX(100%); transition: transform .2s ease-out;
-      background:linear-gradient(180deg,#0f1a33,#0b1326); border-left:1px solid var(--border);
-      display:flex; flex-direction:column; z-index:40;
-    }
+.chat-drawer{
+  position:fixed; right:0; top:64px; bottom:0; width:var(--chatW);  /* <— use variable */
+  max-width:90vw;
+  transform:translateX(100%);
+  transition: transform .2s ease-out;
+  background:linear-gradient(180deg,#0f1a33,#0b1326); border-left:1px solid var(--border);
+  display:flex; flex-direction:column; z-index:40;
+}
+
     .chat-drawer.open{ transform:translateX(0); }
     .chat-head{ display:flex; align-items:center; justify-content:space-between; padding:10px 12px; border-bottom:1px solid var(--border) }
     .chat-body{ flex:1; overflow:auto; padding:10px 12px; }
@@ -919,13 +924,15 @@ HTML_TEMPLATE = """
     .soon-card{ background:linear-gradient(180deg,#0f1a33,#0b1326); border:1px solid var(--border); border-radius:16px; padding:14px }
 
     /* Floating chat button (bottom-right) */
-    .fab{
-      position:fixed; right:18px; bottom:18px; width:56px; height:56px; border-radius:50%;
-      background:linear-gradient(135deg,#3b82f6,#22c1dc); border:none; cursor:pointer;
-      display:flex; align-items:center; justify-content:center;
-      box-shadow:0 14px 30px rgba(59,130,246,.35), 0 4px 10px rgba(0,0,0,.35);
-      z-index:45;
-    }
+.fab{
+  position:fixed; right:18px; bottom:18px; width:56px; height:56px; border-radius:50%;
+  background:linear-gradient(135deg,#3b82f6,#22c1dc); border:none; cursor:pointer;
+  display:flex; align-items:center; justify-content:center;
+  box-shadow:0 14px 30px rgba(59,130,246,.35), 0 4px 10px rgba(0,0,0,.35);
+  z-index:45;
+  transition:right .2s ease;             /* <— add this */
+}
+
     .fab:hover{ transform: translateY(-1px); box-shadow:0 18px 40px rgba(59,130,246,.45), 0 6px 14px rgba(0,0,0,.45); }
     .fab svg{ width:26px; height:26px; fill:#041018 }
   </style>
@@ -1342,7 +1349,12 @@ HTML_TEMPLATE = """
     qs('mClose').onclick = closeModal;
     qs('modal').addEventListener('click', (e)=>{ if(e.target.id==='modal') closeModal(); });
 
-    function safeAvatar(me){ return me.avatar_url || 'https://cdn.discordapp.com/embed/avatars/1.png?size=64'; }
+function safeAvatar(me){
+  if(!me) return 'https://cdn.discordapp.com/embed/avatars/1.png?size=64';
+  if(typeof me === 'string') return me;                 // already a URL
+  return me.avatar_url || 'https://cdn.discordapp.com/embed/avatars/1.png?size=64';
+}
+
 
     // Header/auth
     async function renderHeader(){
@@ -1858,14 +1870,25 @@ HTML_TEMPLATE = """
       else { chatDisabled.style.display='none'; chatDisabled.textContent=''; }
       chatNote.textContent = isLogged ? `You are Lv ${myLevel}` : 'Not logged in';
     }
-    async function openChat(){
-      drawer.classList.add('open'); chatOpen=true;
-      await updateChatGate(); await fetchChat(true);
-      if(chatPoll) clearInterval(chatPoll);
-      chatPoll = setInterval(()=>{ if(chatOpen) fetchChat(false); }, 2000);
-    }
-    function closeChat(){ drawer.classList.remove('open'); chatOpen=false; if(chatPoll){clearInterval(chatPoll); chatPoll=null;} }
-    qs('chatClose').onclick = closeChat;
+async function openChat(){
+  drawer.classList.add('open'); chatOpen = true;
+  // slide the floating button so it doesn't overlap the drawer
+  const pad = drawer.offsetWidth + 18;            // 18px gap
+  qs('fabChat').style.right = pad + 'px';
+
+  await updateChatGate();
+  await fetchChat(true);
+  if(chatPoll) clearInterval(chatPoll);
+  chatPoll = setInterval(()=>{ if(chatOpen) fetchChat(false); }, 2000);
+}
+
+function closeChat(){
+  drawer.classList.remove('open'); chatOpen = false;
+  if(chatPoll){ clearInterval(chatPoll); chatPoll = null; }
+  // return the floating button to the corner
+  qs('fabChat').style.right = '18px';
+}
+
 
     async
     function sendOnEnter(e){ if(e.key==='Enter'){ e.preventDefault(); sendChat(); } }
@@ -2253,3 +2276,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+

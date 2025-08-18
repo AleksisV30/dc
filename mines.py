@@ -1,7 +1,7 @@
 # mines.py
 import os, random, secrets, hashlib
 from decimal import Decimal
-from typing import Optional, Dict, List
+from typing import Dict
 
 from db_utils import with_conn, D, q2
 
@@ -22,7 +22,6 @@ def picks_count_from_bitmask(mask: int) -> int:
     try:
         return mask.bit_count()
     except AttributeError:
-        # Python < 3.8 fallback
         return bin(mask).count("1")
 
 def mines_multiplier(mines: int, picks_count: int) -> float:
@@ -38,18 +37,15 @@ def mines_start(cur, user_id: str, bet: Decimal, mines: int):
     if bet < MIN_BET or bet > MAX_BET: raise ValueError(f"Bet must be between {MIN_BET:.2f} and {MAX_BET:.2f}")
     if mines < 1 or mines > 24: raise ValueError("Mines must be between 1 and 24")
 
-    # only one active game
     cur.execute("SELECT 1 FROM mines_games WHERE user_id=%s AND status='active'", (user_id,))
     if cur.fetchone(): raise ValueError("You already have an active Mines game")
 
-    # funds
     cur.execute("INSERT INTO balances(user_id,balance) VALUES (%s,0) ON CONFLICT(user_id) DO NOTHING", (user_id,))
     cur.execute("SELECT balance FROM balances WHERE user_id=%s FOR UPDATE", (user_id,))
     bal = D(cur.fetchone()[0])
     if bal < bet: raise ValueError("Insufficient balance")
     cur.execute("UPDATE balances SET balance=balance-%s WHERE user_id=%s", (q2(bet), user_id))
 
-    # commit-reveal
     board = mines_random_board(mines)
     seed = secrets.token_hex(16)
     commit_hash = sha256(f"{seed}:{board}")
@@ -67,7 +63,6 @@ def mines_pick(cur, user_id: str, index: int):
                    ORDER BY id DESC LIMIT 1 FOR UPDATE""", (user_id,))
     r = cur.fetchone()
     if not r: raise ValueError("No active Mines game")
-
     gid, bet, mines, board, picks, status = int(r[0]), D(r[1]), int(r[2]), str(r[3]), int(r[4]), str(r[5])
     bit = 1 << index
     if picks & bit: raise ValueError("Tile already revealed")

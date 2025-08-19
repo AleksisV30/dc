@@ -15,6 +15,7 @@ from itsdangerous import URLSafeSerializer, BadSignature
 from pydantic import BaseModel
 
 # ---------- Import games from separate files ----------
+# (ensure crash.py and mines.py are in the same folder)
 from crash import (
     ensure_betting_round, place_bet, load_round, begin_running,
     finish_round, create_next_betting, last_busts, your_bet,
@@ -38,7 +39,7 @@ OWNER_ID = int(os.getenv("OWNER_ID", "1128658280546320426"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
-DISCORD_INVITE = os.getenv("DISCORD_INVITE", "")
+DISCORD_INVITE = os.getenv("DISCORD_INVITE", "")  # optional vanity invite
 
 GEM = "💎"
 MIN_BET = Decimal("1.00")
@@ -60,6 +61,7 @@ def iso(dt: Optional[datetime.datetime]) -> Optional[str]:
 
 # ---------- App / Lifespan / Static ----------
 def _get_static_dir():
+    # We'll still mount /static as a fallback, but images can live right next to main.py.
     base = os.path.dirname(os.path.abspath(__file__))
     static_dir = os.path.join(base, "static")
     try:
@@ -68,16 +70,189 @@ def _get_static_dir():
         pass
     return static_dir
 
+# Discord bot globals
+_discord_task: Optional[asyncio.Task] = None
+_discord_bot = None  # set when started
+
+async def _start_discord_bot():
+    """
+    Starts a discord.py bot in the same event loop as FastAPI.
+    Provides:
+      - Slash: /balance, /profile, /redeem [code], /adjust [user_id_or_mention] [amount] [reason]
+      - Prefix: .balance, .profile, .redeem CODE
+    """
+    global _discord_bot
+    if not DISCORD_BOT_TOKEN:
+        print("DISCORD_BOT_TOKEN not set; skipping bot startup")
+        return
+    try:
+        import discord
+        from discord.ext import commands
+        from discord import app_commands
+    except ImportError:
+        print("discord.py not installed; skipping bot startup")
+        return
+
+    intents = discord.Intents.default()
+    intents.message_content = True
+    intents.members = True
+
+    bot = commands.Bot(command_prefix=PREFIX, intents=intents)
+    _discord_bot = bot
+
+    # ----- Helpers for commands -----
+    def _fmt_dl(val: Decimal) -> str:
+        return f"{GEM} {q2(D(val)):.2f} DL"
+
+    def _is_site_admin(uid: str) -> bool:
+        try:
+            r = get_role(uid)
+            return r in ("admin", "owner")
+        except Exception:
+            return False
+
+    def _is_site_owner(uid: str) -> bool:
+        try:
+            r = get_role(uid)
+            return r == "owner" or str(uid) == str(OWNER_ID)
+        except Exception:
+            return False
+
+    @bot.event
+    async def on_ready():
+        try:
+            if GUILD_ID:
+                guild = discord.Object(id=GUILD_ID)
+                await bot.tree.sync(guild=guild)
+            else:
+                await bot.tree.sync()
+            print(f"[Discord] Logged in as {bot.user} — slash commands synced.")
+        except Exception as e:
+            print(f"[Discord] Slash sync failed: {e}")
+
+    # ----- Slash commands -----
+    @bot.tree.command(name="balance", description="Show your balance on the site")
+    async def slash_balance(interaction):
+        bal = get_balance(str(interaction.user.id))
+        await interaction.response.send_message(f"Your balance: {_fmt_dl(bal)}", ephemeral=True)
+
+    @bot.tree.command(name="profile", description="Show your site profile (level, xp, role)")
+    async def slash_profile(interaction):
+        p = profile_info(str(interaction.user.id))
+        msg = (
+            f"**Profile for {interaction.user.mention}**\n"
+            f"Role: `{p['role']}` • Level: `{p['level']}` • XP: `{p['xp']}`\n"
+            f"Balance: {_fmt_dl(Decimal(str(p['balance'])))}\n"
+            f"Anonymous: `{p['is_anon']}`"
+        )
+        await interaction.response.send_message(msg, ephemeral=True)
+
+    @bot.tree.command(name="redeem", description="Redeem a promo code")
+    @app_commands.describe(code="Promo code (e.g., WELCOME10)")
+    async def slash_redeem(interaction, code: str):
+        try:
+            nb = redeem_promo(str(interaction.user.id), code)
+            await interaction.response.send_message(f"Redeemed `{code}`! New balance: {_fmt_dl(nb)}", ephemeral=True)
+        except PromoInvalid:
+            await interaction.response.send_message("❌ Invalid code.", ephemeral=True)
+        except PromoExpired:
+            await interaction.response.send_message("⏰ That code is expired.", ephemeral=True)
+        except PromoExhausted:
+            await interaction.response.send_message("🔁 That code has no uses left.", ephemeral=True)
+        except PromoAlreadyRedeemed:
+            await interaction.response.send_message("✅ You already redeemed that.", ephemeral=True)
+
+    @bot.tree.command(name="adjust", description="Admin: adjust a user's balance (+/-)")
+    @app_commands.describe(user="Discord ID or mention", amount="e.g. 10 or -5.25", reason="Optional reason")
+    async def slash_adjust(interaction, user: str, amount: str, reason: str = ""):
+        uid = str(interaction.user.id)
+        if not _is_site_admin(uid):
+            await interaction.response.send_message("No permission.", ephemeral=True)
+            return
+        try:
+            target = _id_from_identifier(user)
+            newbal = adjust_balance(uid, target, D(amount), reason or "adjust")
+            await interaction.response.send_message(
+                f"Adjusted <@{target}> by `{amount}`. New balance: {_fmt_dl(newbal)}",
+                ephemeral=True
+            )
+        except Exception as e:
+            await interaction.response.send_message(f"Error: {e}", ephemeral=True)
+
+    # ----- Prefix commands (fallback) -----
+    @bot.command(name="balance")
+    async def balance_cmd(ctx):
+        bal = get_balance(str(ctx.author.id))
+        await ctx.reply(f"Your balance: {_fmt_dl(bal)}", mention_author=False)
+
+    @bot.command(name="profile")
+    async def profile_cmd(ctx):
+        p = profile_info(str(ctx.author.id))
+        await ctx.reply(
+            f"Role: `{p['role']}` • Level: `{p['level']}` • XP: `{p['xp']}` • Balance: {_fmt_dl(Decimal(str(p['balance'])))}",
+            mention_author=False
+        )
+
+    @bot.command(name="redeem")
+    async def redeem_cmd(ctx, code: str):
+        try:
+            nb = redeem_promo(str(ctx.author.id), code)
+            await ctx.reply(f"Redeemed `{code}`! New balance: {_fmt_dl(nb)}", mention_author=False)
+        except PromoInvalid:
+            await ctx.reply("❌ Invalid code.", mention_author=False)
+        except PromoExpired:
+            await ctx.reply("⏰ That code is expired.", mention_author=False)
+        except PromoExhausted:
+            await ctx.reply("🔁 That code has no uses left.", mention_author=False)
+        except PromoAlreadyRedeemed:
+            await ctx.reply("✅ You already redeemed that.", mention_author=False)
+
+    @bot.command(name="adjust")
+    async def adjust_cmd(ctx, user: str, amount: str, *, reason: str = ""):
+        uid = str(ctx.author.id)
+        if not _is_site_admin(uid):
+            await ctx.reply("No permission.", mention_author=False)
+            return
+        try:
+            target = _id_from_identifier(user)
+            newbal = adjust_balance(uid, target, D(amount), reason or "adjust")
+            await ctx.reply(
+                f"Adjusted <@{target}> by `{amount}`. New balance: {_fmt_dl(newbal)}",
+                mention_author=False
+            )
+        except Exception as e:
+            await ctx.reply(f"Error: {e}", mention_author=False)
+
+    # finally: run the bot (blocks until closed)
+    await bot.start(DISCORD_BOT_TOKEN)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
     apply_migrations()
-    yield
+    # Start Discord bot in the background
+    global _discord_task
+    _discord_task = asyncio.create_task(_start_discord_bot())
+    try:
+        yield
+    finally:
+        # Shutdown bot cleanly
+        global _discord_bot
+        try:
+            if _discord_bot:
+                await _discord_bot.close()
+        except Exception:
+            pass
+        if _discord_task:
+            with contextlib.suppress(Exception):
+                await _discord_task
 
 app = FastAPI(lifespan=lifespan)
+# Optional fallback for anyone who still wants /static
 app.mount("/static", StaticFiles(directory=_get_static_dir()), name="static")
 
-# Serve images placed next to main.py (or fallback to /static). Return 1×1 PNG if missing.
+# Serve images from the SAME directory as main.py (or fallback to /static).
+# If not found, we return a tiny transparent PNG so the UI never breaks.
 _TRANSPARENT_PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
 )
@@ -85,7 +260,9 @@ _TRANSPARENT_PNG = base64.b64decode(
 @app.get("/img/{filename}")
 async def serve_img(filename: str):
     base = os.path.dirname(os.path.abspath(__file__))
+    # Try same folder as main.py first
     p1 = os.path.join(base, filename)
+    # Then /static as backup
     p2 = os.path.join(base, "static", filename)
     for p in (p1, p2):
         if os.path.isfile(p):
@@ -125,12 +302,14 @@ def with_conn(fn):
 
 @with_conn
 def init_db(cur):
+    # balances
     cur.execute("""
         CREATE TABLE IF NOT EXISTS balances (
             user_id TEXT PRIMARY KEY,
             balance NUMERIC(18,2) NOT NULL DEFAULT 0
         )
     """)
+    # balance_log
     cur.execute("""
         CREATE TABLE IF NOT EXISTS balance_log (
             id BIGSERIAL PRIMARY KEY,
@@ -141,6 +320,8 @@ def init_db(cur):
             created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
+    # profiles (+ referral)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS profiles (
             user_id TEXT PRIMARY KEY,
@@ -153,6 +334,8 @@ def init_db(cur):
             created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
+    # oauth tokens for guild join
     cur.execute("""
         CREATE TABLE IF NOT EXISTS oauth_tokens (
             user_id TEXT PRIMARY KEY,
@@ -161,6 +344,8 @@ def init_db(cur):
             expires_at TIMESTAMPTZ
         )
     """)
+
+    # referral registry
     cur.execute("""
         CREATE TABLE IF NOT EXISTS ref_names (
             user_id TEXT PRIMARY KEY,
@@ -176,6 +361,8 @@ def init_db(cur):
             created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
+    # promos
     cur.execute("""
         CREATE TABLE IF NOT EXISTS promo_codes (
             code TEXT PRIMARY KEY,
@@ -195,6 +382,8 @@ def init_db(cur):
             PRIMARY KEY(user_id, code)
         )
     """)
+
+    # crash tables
     cur.execute("""
         CREATE TABLE IF NOT EXISTS crash_rounds (
             id BIGSERIAL PRIMARY KEY,
@@ -232,6 +421,8 @@ def init_db(cur):
             created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
+    # chat
     cur.execute("""
         CREATE TABLE IF NOT EXISTS chat_messages (
             id BIGSERIAL PRIMARY KEY,
@@ -251,6 +442,8 @@ def init_db(cur):
             created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
+    # mines
     cur.execute("""
         CREATE TABLE IF NOT EXISTS mines_games (
             id BIGSERIAL PRIMARY KEY,
@@ -487,9 +680,11 @@ def get_leaderboard_rows_db(cur, period: str, limit: int = 50):
 # ---------- Migrations ----------
 @with_conn
 def apply_migrations(cur):
+    # profiles extras
     cur.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS is_anon BOOLEAN NOT NULL DEFAULT FALSE")
     cur.execute("CREATE INDEX IF NOT EXISTS ix_crash_games_created_at ON crash_games (created_at)")
     cur.execute("CREATE INDEX IF NOT EXISTS ix_mines_games_started_at ON mines_games (started_at)")
+    # private messages column (already present in init but keep safe)
     cur.execute("ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS private_to TEXT")
 
 # ---------- OAuth token store & Discord join ----------
@@ -528,14 +723,13 @@ async def discord_refresh_token(user_id: str):
 
 async def discord_get_valid_access_token(user_id: str):
     rec = get_tokens(user_id)
-    if not rec: return None
-    exp = rec.get("expires_at")
+    exp = rec.get("expires_at") if rec else None
     if exp and isinstance(exp, datetime.datetime) and exp.tzinfo is None:
         exp = exp.replace(tzinfo=UTC)
-    if (not exp) or (exp - now_utc() < datetime.timedelta(seconds=30)):
+    if rec and ((not exp) or (exp - now_utc() < datetime.timedelta(seconds=30))):
         tok = await discord_refresh_token(user_id)
         if tok: return tok
-    return rec.get("access_token")
+    return rec.get("access_token") if rec else None
 
 async def guild_add_member(user_id: str, nickname: Optional[str] = None):
     if not (DISCORD_BOT_TOKEN and GUILD_ID):
@@ -549,7 +743,7 @@ async def guild_add_member(user_id: str, nickname: Optional[str] = None):
         url = f"{DISCORD_API}/guilds/{GUILD_ID}/members/{user_id}"
         r = await cx.put(url, json=payload, headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"})
         if r.status_code in (201, 204): return {"ok": True}
-        if r.status_code == 409: return {"ok": True}
+        if r.status_code == 409: return {"ok": True}  # already a member
         raise HTTPException(r.status_code, f"Discord join failed: {r.text}")
 
 # ---------- OAuth / Auth ----------
@@ -632,7 +826,7 @@ async def api_profile(request: Request):
     s = _require_session(request)
     return profile_info(s["id"])
 
-# ---------- Settings ----------
+# ---------- Settings (Anonymous mode) ----------
 class AnonIn(BaseModel):
     is_anon: bool
 
@@ -647,7 +841,7 @@ async def api_settings_set_anon(request: Request, body: AnonIn):
     s = _require_session(request)
     return set_profile_is_anon(s["id"], bool(body.is_anon))
 
-# ---------- Leaderboard API ----------
+# ---------- Leaderboard ----------
 @app.get("/api/leaderboard")
 async def api_leaderboard(period: str = Query("daily"), limit: int = Query(50, ge=1, le=200)):
     rows = get_leaderboard_rows_db(period, limit)
@@ -756,6 +950,12 @@ class PromoCreateIn(BaseModel):
     max_uses: int = 1
     expires_at: Optional[str] = None
 
+@with_conn
+def get_role(cur, user_id: str) -> str:
+    cur.execute("SELECT role FROM profiles WHERE user_id=%s", (user_id,))
+    r = cur.fetchone()
+    return r[0] if r else "member"
+
 @app.post("/api/admin/promo/create")
 async def api_admin_promo_create(request: Request, body: PromoCreateIn):
     s = _require_session(request)
@@ -771,18 +971,25 @@ class CrashBetIn(BaseModel):
 
 @app.get("/api/crash/state")
 async def api_crash_state(request: Request):
+    # not requiring login for readonly viewing
     try:
-        s = _require_session(request); uid = s["id"]
+        s = _require_session(request)
+        uid = s["id"]
     except:
+        s = None
         uid = None
 
     rid, info = ensure_betting_round()
     now = now_utc()
 
+    # Progress state machine
     if info["status"] == "betting" and now >= info["betting_ends_at"]:
-        begin_running(rid); info = load_round()
+        begin_running(rid)
+        info = load_round()
     if info and info["status"] == "running" and info["expected_end_at"] and now >= info["expected_end_at"]:
-        finish_round(rid); create_next_betting(); info = load_round()
+        finish_round(rid)
+        create_next_betting()
+        info = load_round()
 
     out = {
         "phase": info["status"],
@@ -856,12 +1063,6 @@ class ChatIn(BaseModel):
     text: str
 
 @with_conn
-def get_role(cur, user_id: str) -> str:
-    cur.execute("SELECT role FROM profiles WHERE user_id=%s", (user_id,))
-    r = cur.fetchone()
-    return r[0] if r else "member"
-
-@with_conn
 def chat_timeout_set(cur, actor_id: str, user_id: str, seconds: int, reason: Optional[str]):
     until = now_utc() + datetime.timedelta(seconds=max(1, seconds))
     cur.execute("""INSERT INTO chat_timeouts(user_id, until, reason, created_by)
@@ -884,7 +1085,7 @@ def chat_timeout_get(cur, user_id: str):
 
 @with_conn
 def chat_insert(cur, user_id: str, username: str, text: str, private_to: Optional[str] = None):
-    text = (text or "").strip()
+    text = (text or "").strip()  # FIX: use strip() (not .trim())
     if not text: raise ValueError("Message is empty")
     if len(text) > 300: raise ValueError("Message is too long (max 300)")
     ensure_profile_row(user_id)
@@ -1017,6 +1218,7 @@ async def api_admin_timeout_site(request: Request, body: TimeoutIn):
 
 @app.post("/api/admin/timeout_both")
 async def api_admin_timeout_both(request: Request, body: TimeoutIn):
+    # mirror site timeout; discord moderation (if any) should be handled in your bot
     return await api_admin_timeout_site(request, body)
 
 # ---------- Discord Join ----------
@@ -1026,7 +1228,8 @@ async def api_discord_join(request: Request):
     nick = get_profile_name(s["id"]) or s["username"]
     return await guild_add_member(s["id"], nickname=nick)
 
-# (Part 2 continues with the HTML/JS/CSS template, index(), and __main__)
+# ---------- HTML (UI/UX) ----------
+# (Part 2/2 continues with HTML_TEMPLATE, root route, and uvicorn runner)
 # ---------- HTML (UI/UX) ----------
 HTML_TEMPLATE = """
 <!doctype html><html lang="en"><head>
@@ -1062,11 +1265,9 @@ input,select,textarea{width:100%;appearance:none;background:var(--input-bg);colo
 @media(min-width:700px){.games-grid{grid-template-columns:1fr 1fr}}
 @media(min-width:1020px){.games-grid{grid-template-columns:1fr 1fr 1fr}}
 
-/* Game cards: show the banner image only; size to the image */
+/* Game cards show just the banner image; size to the image */
 .game-card{border:1px solid var(--border);border-radius:16px;overflow:hidden;cursor:pointer;background:#0b1326;padding:0}
 .game-card .banner{display:block;width:100%;height:auto;opacity:1;object-fit:contain}
-
-/* Removed overlay title/description entirely */
 
 /* Crash area */
 .cr-graph-wrap{position:relative;height:240px;background:#0e1833;border:1px solid var(--border);border-radius:16px;overflow:hidden}
@@ -1089,7 +1290,7 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
 .bad{color:#ffb4b4}.good{color:#b7ffcc}
 .card.soft{background:linear-gradient(180deg,#0f1836,#0c152b)}
 
-/* Chat: drawer above FAB; FAB hides while open */
+/* Chat drawer above FAB; FAB hides while open */
 .chat-drawer{position:fixed;right:0;top:64px;bottom:0;width:var(--chatW);max-width:92vw;transform:translateX(100%);transition:transform .2s ease-out;background:linear-gradient(180deg,#0f1a33,#0b1326);border-left:1px solid var(--border);display:flex;flex-direction:column;z-index:80}
 .chat-drawer.open{transform:translateX(0)}
 .chat-head{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border-bottom:1px solid var(--border)}
@@ -1101,8 +1302,6 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
 .badge.member{background:#0c1631;color:#cfe6ff}.badge.admin{background:linear-gradient(135deg,#f59e0b,#fb923c);color:#1a1206;border-color:rgba(0,0,0,.2);font-weight:900}.badge.owner{background:linear-gradient(135deg,#3b82f6,#22c1dc);color:#041018;border-color:transparent;font-weight:900}
 .level{font-size:10px;padding:3px 7px;border-radius:999px;background:#0b1f3a;color:#cfe6ff;border:1px solid var(--border)}
 .user-link{cursor:pointer;font-weight:800;padding:2px 6px;border-radius:8px;background:#0b1f3a;border:1px solid var(--border)}
-
-/* FAB */
 .fab{position:fixed;right:18px;bottom:18px;width:56px;height:56px;border-radius:50%;background:linear-gradient(135deg,#3b82f6,#22c1dc);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 14px 30px rgba(59,130,246,.35), 0 4px 10px rgba(0,0,0,.35);z-index:50}
 .fab.hide{display:none}
 .fab svg{width:26px;height:26px;fill:#041018}
@@ -1362,8 +1561,6 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
 
 <script>
 const qs = id => document.getElementById(id);
-
-// Fetch helper with robust content-type handling
 const j = async (url, init) => {
   const r = await fetch(url, init);
   if(!r.ok){
@@ -1375,10 +1572,9 @@ const j = async (url, init) => {
   if (ct.includes('application/json')) return r.json();
   return r.text();
 };
-
 const GEM = "💎"; const fmtDL = (n)=> `${GEM} ${(Number(n)||0).toFixed(2)} DL`;
 
-// -------- Simple router --------
+// Router
 const pages = ['page-games','page-crash','page-mines','page-coinflip','page-blackjack','page-pump','page-ref','page-promo','page-lb','page-settings','page-profile'];
 function showOnly(id){
   for(const p of pages){ const el = qs(p); if(el) el.style.display = (p===id) ? '' : 'none'; }
@@ -1388,16 +1584,16 @@ function showOnly(id){
   }
 }
 
-// -------- Header / Auth --------
+// Header / Auth  (FIX: removed backslashes so ${...} evaluates)
 async function renderHeader(){
   try{
     const me = await j('/api/me');
     const bal = await j('/api/balance');
     qs('authArea').innerHTML = `
-      <button class="btn primary" id="btnJoinSmall">\${me.in_guild ? 'In Discord' : 'Join Discord'}</button>
-      <span class="chip">Balance: <strong>\${fmtDL(bal.balance)}</strong></span>
+      <button class="btn primary" id="btnJoinSmall">${me.in_guild ? 'In Discord' : 'Join Discord'}</button>
+      <span class="chip">Balance: <strong>${fmtDL(bal.balance)}</strong></span>
       <div class="avatar-wrap">
-        <img class="avatar" id="avatarBtn" src="\${me.avatar_url||''}" title="\${me.username||'user'}"/>
+        <img class="avatar" id="avatarBtn" src="${me.avatar_url||''}" title="${me.username||'user'}"/>
         <div id="userMenu" class="menu">
           <div class="item" id="menuProfile">Profile</div>
           <div class="item" id="menuSettings">Settings</div>
@@ -1416,7 +1612,7 @@ async function renderHeader(){
   }
 }
 
-// -------- Discord join --------
+// Discord join
 async function joinDiscord(){
   try{
     await j('/api/discord/join', { method:'POST' });
@@ -1431,14 +1627,14 @@ for(const id of ['btnInvite','btnInvite2','btnInvite3']){
   const a = qs(id); if(a && a.getAttribute('href') === '__INVITE__'){ a.style.display='none'; }
 }
 
-// -------- Tabs / navigation --------
+// Tabs
 qs('homeLink').onclick = (e)=>{ e.preventDefault(); showOnly('page-games'); };
 qs('tab-games').onclick = ()=> showOnly('page-games');
 qs('tab-ref').onclick = ()=> { showOnly('page-ref'); loadReferral(); };
 qs('tab-promo').onclick = ()=> { showOnly('page-promo'); renderPromo(); };
 qs('tab-lb').onclick = ()=> { showOnly('page-lb'); refreshLeaderboard(); };
 
-// -------- Referral --------
+// Referral
 async function loadReferral(){
   try{
     const st = await j('/api/referral/state');
@@ -1458,13 +1654,13 @@ qs('copyRef').onclick = ()=>{
   const inp = qs('refLink'); inp.select(); inp.setSelectionRange(0, 99999); document.execCommand('copy');
 };
 
-// -------- Promo --------
+// Promo
 async function renderPromo(){
   try{
     const my = await j('/api/promo/my');
     qs('myCodes').innerHTML = (my.rows && my.rows.length)
       ? '<table><thead><tr><th>Code</th><th>Redeemed</th></tr></thead><tbody>' +
-        my.rows.map(r=>`<tr><td>\${r.code}</td><td>\${new Date(r.redeemed_at).toLocaleString()}</td></tr>`).join('') +
+        my.rows.map(r=>`<tr><td>${r.code}</td><td>${new Date(r.redeemed_at).toLocaleString()}</td></tr>`).join('') +
         '</tbody></table>' : '—';
   }catch(_){ qs('myCodes').textContent = '—'; }
 }
@@ -1478,7 +1674,7 @@ qs('redeemBtn').onclick = async ()=>{
   }catch(e){ qs('promoMsg').textContent = e.message; }
 };
 
-// -------- Profile / Admin --------
+// Profile/Admin  (FIX: removed backslashes here too)
 async function renderProfile(){
   try{
     const p = await j('/api/profile');
@@ -1486,9 +1682,9 @@ async function renderProfile(){
     const isOwner = (role==='owner') || (String(p.id||'') === String('__OWNER_ID__'));
     qs('profileBox').innerHTML = `
       <div class="games-grid" style="grid-template-columns:1fr 1fr 1fr">
-        <div class="card soft"><div class="label">Level</div><div class="big">Lv \${p.level}</div><div class="muted">\${p.xp} XP • \${p.progress_pct}% to next</div></div>
-        <div class="card soft"><div class="label">Balance</div><div class="big">\${fmtDL(p.balance)}</div></div>
-        <div class="card soft"><div class="label">Role</div><div class="big" style="text-transform:uppercase">\${role}</div></div>
+        <div class="card soft"><div class="label">Level</div><div class="big">Lv ${p.level}</div><div class="muted">${p.xp} XP • ${p.progress_pct}% to next</div></div>
+        <div class="card soft"><div class="label">Balance</div><div class="big">${fmtDL(p.balance)}</div></div>
+        <div class="card soft"><div class="label">Role</div><div class="big" style="text-transform:uppercase">${role}</div></div>
       </div>
     `;
     qs('ownerPanel').style.display = isOwner ? '' : 'none';
@@ -1535,7 +1731,7 @@ async function renderProfile(){
   }catch(_){ qs('profileBox').textContent = '—'; }
 }
 
-// -------- Settings --------
+// Settings
 async function loadSettings(){
   qs('setMsg').textContent='';
   try{ const r = await j('/api/settings/get'); qs('anonToggle').checked = !!(r && r.is_anon); }catch(_){}
@@ -1548,16 +1744,10 @@ qs('anonToggle')?.addEventListener('change', async (e)=>{
   }catch(err){ qs('setMsg').textContent = err.message; }
 });
 
-// -------- Leaderboard --------
+// Leaderboard
 let lbPeriod = 'daily';
-function nextUtcMidnight(){
-  const now = new Date();
-  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()+1, 0,0,0,0));
-}
-function endOfUtcMonth(){
-  const now = new Date();
-  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth()+1, 1, 0,0,0,0));
-}
+function nextUtcMidnight(){ const now = new Date(); return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()+1, 0,0,0,0)); }
+function endOfUtcMonth(){ const now = new Date(); return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth()+1, 1, 0,0,0,0)); }
 async function refreshLeaderboard(){
   const wrap = qs('lbWrap'); wrap.textContent = 'Loading…';
   const res = await j('/api/leaderboard?period='+lbPeriod+'&limit=50');
@@ -1600,7 +1790,7 @@ async function refreshLeaderboard(){
   });
 }
 
-// -------- Crash UI --------
+// Crash UI
 const crCanvas = ()=> qs('crCanvas');
 let crPollTimer=null, crBust=null, crPhase='betting';
 function drawCrash(mult){
@@ -1673,7 +1863,7 @@ function openCrash(){
   pollCrash();
 }
 
-// -------- Mines UI --------
+// Mines UI
 function buildMinesGrid(){
   const grid = qs('mGrid'); grid.innerHTML='';
   for(let i=0;i<25;i++){
@@ -1737,19 +1927,19 @@ async function refreshMines(){
     const h = await j('/api/mines/history');
     qs('mHist').innerHTML = (h.rows && h.rows.length)
       ? '<table><thead><tr><th>Time</th><th>Bet</th><th>Mines</th><th>Win</th><th>Status</th></tr></thead><tbody>' +
-        h.rows.map(r=>`<tr><td>\${new Date(r.started_at).toLocaleString()}</td><td>\${fmtDL(r.bet)}</td><td>\${r.mines}</td><td>\${fmtDL(r.win)}</td><td>\${r.status}</td></tr>`).join('') +
+        h.rows.map(r=>`<tr><td>${new Date(r.started_at).toLocaleString()}</td><td>${fmtDL(r.bet)}</td><td>${r.mines}</td><td>${fmtDL(r.win)}</td><td>${r.status}</td></tr>`).join('') +
         '</tbody></table>' : '—';
   }catch(_){}
 }
 qs('mStart').onclick = startMines;
 qs('mCash').onclick = cashoutMines;
 
-// -------- Chat UI --------
+// Chat UI
 let chatOpen = false, chatTimer=null, lastChatId=0;
 function toggleChat(open){
   chatOpen = open;
   qs('chatDrawer').classList.toggle('open', open);
-  qs('fabChat').classList.toggle('hide', open); // hide FAB when drawer is open
+  qs('fabChat').classList.toggle('hide', open);
   if(open){ pollChat(); } else { if(chatTimer) clearTimeout(chatTimer); }
 }
 qs('fabChat').onclick = ()=> toggleChat(true);
@@ -1766,12 +1956,12 @@ async function pollChat(){
         const row = document.createElement('div'); row.className='msg';
         row.innerHTML = `
           <div class="msghead">
-            <span class="user-link">\${m.username}</span>
-            <span class="badge \${m.role}">\${m.role}</span>
-            <span class="level">Lv \${m.level}</span>
-            <span class="time">\${new Date(m.created_at).toLocaleTimeString()}</span>
+            <span class="user-link">${m.username}</span>
+            <span class="badge ${m.role}">${m.role}</span>
+            <span class="level">Lv ${m.level}</span>
+            <span class="time">${new Date(m.created_at).toLocaleTimeString()}</span>
           </div>
-          <div>\${escapeHtml(m.text)}</div>
+          <div>${escapeHtml(m.text)}</div>
         `;
         body.appendChild(row);
       }
@@ -1794,7 +1984,7 @@ qs('chatSend').onclick = async ()=>{
   }catch(e){ alert(e.message); }
 };
 
-// -------- Games navigation --------
+// Game navigation
 qs('openCrash').onclick = openCrash;
 qs('backToGames').onclick = ()=>{ showOnly('page-games'); if(crPollTimer) clearTimeout(crPollTimer); };
 qs('openMines').onclick = ()=>{ showOnly('page-mines'); refreshMines(); };
@@ -1806,7 +1996,7 @@ qs('backToGames_bj').onclick = ()=> showOnly('page-games');
 qs('openPump').onclick = ()=> showOnly('page-pump');
 qs('backToGames_pu').onclick = ()=> showOnly('page-games');
 
-// -------- Boot --------
+// Boot
 (async function boot(){
   buildMinesGrid();
   showOnly('page-games');

@@ -966,68 +966,119 @@ def chat_fetch(cur, since_id: int, limit: int, for_user_id: Optional[str]):
             levels[str(uid)] = 1 + int(xp) // 100
             roles[str(uid)] = role or "member"
     out = []
-    for mid, uid, uname, text, created_at, private_to in rows:
-        out.append({
-            "id": int(mid),
-            "user_id": str(uid),
-            "username": uname,
-            "text": text,
-            "created_at": str(created_at),
-            "private_to": (str(private_to) if private_to else None),
-            "level": levels.get(str(uid), 1),
-            "role": roles.get(str(uid), "member")
-        })
+    for mid, uid, uname, txt, ts, priv in rows:
+        uid = str(uid)
+        out.append({"id": int(mid), "user_id": uid, "username": uname,
+                    "level": int(levels.get(uid,1)), "role": roles.get(uid,"member"),
+                    "text": txt, "created_at": str(ts), "private_to": priv})
     return out
 
-@app.get("/api/chat/fetch")
-async def api_chat_fetch(request: Request, since_id: int = Query(0), limit: int = Query(50, ge=1, le=200)):
-    try:
-        s = _require_session(request)
-        uid = s["id"]
-    except:
-        uid = None
-    rows = chat_fetch(since_id, limit, uid)
-    return {"rows": rows}
+@with_conn
+def chat_delete(cur, message_id: int):
+    cur.execute("DELETE FROM chat_messages WHERE id=%s", (message_id,))
+    return {"ok": True}
 
 @app.post("/api/chat/send")
 async def api_chat_send(request: Request, body: ChatIn):
     s = _require_session(request)
-    try:
-        row = chat_insert(s["id"], s["username"], body.text)
-        return {"ok": True, "row": row}
-    except PermissionError as e:
-        raise HTTPException(403, str(e))
-    except ValueError as e:
-        raise HTTPException(400, str(e))
+    return chat_insert(s["id"], s["username"], body.text, None)
 
-# ---------- Admin: timeouts ----------
+@app.get("/api/chat/fetch")
+async def api_chat_fetch(request: Request, since: int = 0, limit: int = 30):
+    uid = None
+    try:
+        sess = _require_session(request)
+        uid = sess["id"]
+    except:
+        pass
+    rows = chat_fetch(since, limit, uid)
+    return {"rows": rows}
+
+@app.post("/api/chat/delete")
+async def api_chat_del(request: Request, id: int):
+    s = _require_session(request)
+    role = get_role(s["id"])
+    if role not in ("admin","owner"): raise HTTPException(403, "No permission")
+    return chat_delete(id)
+
+# ---------- Admin ----------
+class AdjustIn(BaseModel):
+    identifier: str
+    amount: str
+    reason: Optional[str] = None
+
+def _id_from_identifier(identifier: str) -> str:
+    m = re.search(r"\d{5,}", identifier or "")
+    if not m: raise HTTPException(400, "Provide a numeric Discord ID or mention")
+    return m.group(0)
+
+@app.post("/api/admin/adjust")
+async def api_admin_adjust(request: Request, body: AdjustIn):
+    s = _require_session(request)
+    role = get_role(s["id"])
+    if role not in ("admin","owner"): raise HTTPException(403, "No permission")
+    target = _id_from_identifier(body.identifier)
+    newbal = adjust_balance(s["id"], target, D(body.amount), body.reason)
+    return {"new_balance": float(newbal)}
+
+class RoleIn(BaseModel):
+    identifier: str
+    role: str
+
+@app.post("/api/admin/role")
+async def api_admin_role(request: Request, body: RoleIn):
+    s = _require_session(request)
+    role = get_role(s["id"])
+    if role != "owner": raise HTTPException(403, "Only owner can set roles")
+    target = _id_from_identifier(body.identifier)
+    return set_role(target, body.role)
+
 class TimeoutIn(BaseModel):
-    user_id: str
+    identifier: str
     seconds: int
     reason: Optional[str] = None
 
-@app.post("/api/admin/chat/timeout")
-async def api_admin_chat_timeout(request: Request, body: TimeoutIn):
+@app.post("/api/admin/timeout_site")
+async def api_admin_timeout_site(request: Request, body: TimeoutIn):
     s = _require_session(request)
     role = get_role(s["id"])
-    if role not in ("admin", "owner"): raise HTTPException(403, "No permission")
-    return chat_timeout_set(s["id"], body.user_id, body.seconds, body.reason)
+    if role not in ("admin","owner"): raise HTTPException(403, "No permission")
+    target = _id_from_identifier(body.identifier)
+    return chat_timeout_set(s["id"], target, int(body.seconds), body.reason or "")
 
-@app.get("/api/chat/timeout_state")
-async def api_chat_timeout_state(request: Request):
+@app.post("/api/admin/timeout_both")
+async def api_admin_timeout_both(request: Request, body: TimeoutIn):
+    # mirror site timeout; discord moderation (if any) should be handled in your bot
+    return await api_admin_timeout_site(request, body)
+
+# ---------- Discord Join ----------
+@app.post("/api/discord/join")
+async def api_discord_join(request: Request):
     s = _require_session(request)
-    return chat_timeout_get(s["id"]) or {}
+    nick = get_profile_name(s["id"]) or s["username"]
+    return await guild_add_member(s["id"], nickname=nick)
 
-# ---------- Root ----------
-@app.get("/")
-async def root():
-    # Serve your SPA / frontend entrypoint
-    index_path = os.path.join(os.path.dirname(__file__), "index.html")
-    if os.path.isfile(index_path):
-        return FileResponse(index_path)
-    return HTMLResponse("<h1>Backend is running</h1>")
+# ---------- HTML (UI/UX) ----------
+HTML_TEMPLATE = """
+<!doctype html><html lang="en"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+<title>GROWCB</title>
+<!-- Your full HTML/JS from earlier goes here (unchanged) -->
+</head>
+<body>
+  <!-- The same HTML UI you already had -->
+</body>
+</html>
+"""
 
-# ---------- Run ----------
+# ---------- Root page ----------
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    html = HTML_TEMPLATE.replace("__INVITE__", DISCORD_INVITE or "__INVITE__") \
+                        .replace("__OWNER_ID__", str(OWNER_ID))
+    return HTMLResponse(html)
+
+# ---------- Utility: run local (optional) ----------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=True)

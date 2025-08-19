@@ -384,6 +384,51 @@ async def guild_add_member(user_id: str, nickname: Optional[str] = None):
         if r.status_code in (201, 204, 409): return {"ok": True}
         raise HTTPException(r.status_code, f"Discord join failed: {r.text}")
 
+# ---------- Promo helpers (placed before endpoints for clarity) ----------
+class PromoInvalid(Exception): pass
+class PromoExpired(Exception): pass
+class PromoExhausted(Exception): pass
+class PromoAlreadyRedeemed(Exception): pass
+
+@with_conn
+def redeem_promo(cur, user_id: str, code: str) -> Decimal:
+    code = (code or "").strip().lower()
+    cur.execute("SELECT code, amount, max_uses, uses, expires_at FROM promo_codes WHERE code=%s", (code,))
+    r = cur.fetchone()
+    if not r: raise PromoInvalid("Invalid code")
+    _, amount, max_uses, uses, expires_at = r
+    if expires_at and now_utc() > expires_at: raise PromoExpired("Code expired")
+    if uses >= max_uses: raise PromoExhausted("Code fully used")
+    cur.execute("SELECT 1 FROM promo_redemptions WHERE user_id=%s AND code=%s", (user_id, code))
+    if cur.fetchone(): raise PromoAlreadyRedeemed("You already redeemed this code")
+    cur.execute("UPDATE promo_codes SET uses=uses+1 WHERE code=%s", (code,))
+    cur.execute("INSERT INTO promo_redemptions(user_id,code) VALUES(%s,%s)", (user_id, code))
+    newbal = adjust_balance(user_id, user_id, amount, f"promo:{code}")
+    return newbal
+
+@with_conn
+def create_promo(cur, creator_id: str, code: Optional[str], amount: str, max_uses: int, expires_at: Optional[str]):
+    if not code:
+        code = ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(8))
+    code = code.lower()
+    amt = q2(D(amount))
+    exp_dt = None
+    if expires_at:
+        try:
+            exp_dt = datetime.datetime.fromisoformat(expires_at).astimezone(UTC)
+        except Exception:
+            raise ValueError("Invalid expires_at format")
+    cur.execute("""INSERT INTO promo_codes(code,amount,max_uses,expires_at,created_by)
+                   VALUES(%s,%s,%s,%s,%s)""",
+                (code, amt, max_uses, exp_dt, creator_id))
+    return {
+        "ok": True,
+        "code": code,
+        "amount": float(amt),
+        "max_uses": max_uses,
+        "expires_at": exp_dt.isoformat() if exp_dt else None
+    }
+
 # ---------- OAuth / Auth ----------
 @app.get("/login")
 async def login():
@@ -460,6 +505,13 @@ async def api_balance(request: Request):
 async def api_profile(request: Request):
     s = _require_session(request)
     return profile_info(s["id"])
+
+@app.get("/api/public/{user_id}")
+async def api_public(user_id: str):
+    info = public_profile(user_id)
+    if not info: raise HTTPException(404, "Not found")
+    info.pop("balance", None)
+    return info
 
 # ---------- Settings (Anonymous mode) ----------
 class AnonIn(BaseModel):
@@ -692,12 +744,6 @@ class ChatIn(BaseModel):
     text: str
 
 @with_conn
-def get_role(cur, user_id: str) -> str:
-    cur.execute("SELECT role FROM profiles WHERE user_id=%s", (user_id,))
-    r = cur.fetchone()
-    return r[0] if r else "member"
-
-@with_conn
 def chat_timeout_set(cur, actor_id: str, user_id: str, seconds: int, reason: Optional[str]):
     until = now_utc() + datetime.timedelta(seconds=max(1, seconds))
     cur.execute("""INSERT INTO chat_timeouts(user_id, until, reason, created_by)
@@ -720,7 +766,7 @@ def chat_timeout_get(cur, user_id: str):
 
 @with_conn
 def chat_insert(cur, user_id: str, username: str, text: str, private_to: Optional[str] = None):
-    text = (text or "").strip()  # FIX: use strip() (not .trim())
+    text = (text or "").strip()
     if not text: raise ValueError("Message is empty")
     if len(text) > 300: raise ValueError("Message is too long (max 300)")
     ensure_profile_row(user_id)
@@ -806,56 +852,6 @@ async def api_chat_del(request: Request, id: int):
     if role not in ("admin","owner"): raise HTTPException(403, "No permission")
     return chat_delete(id)
 
-# ---------- Admin ----------
-class AdjustIn(BaseModel):
-    identifier: str
-    amount: str
-    reason: Optional[str] = None
-
-def _id_from_identifier(identifier: str) -> str:
-    m = re.search(r"\d{5,}", identifier or "")
-    if not m: raise HTTPException(400, "Provide a numeric Discord ID or mention")
-    return m.group(0)
-
-@app.post("/api/admin/adjust")
-async def api_admin_adjust(request: Request, body: AdjustIn):
-    s = _require_session(request)
-    role = get_role(s["id"])
-    if role not in ("admin","owner"): raise HTTPException(403, "No permission")
-    target = _id_from_identifier(body.identifier)
-    newbal = adjust_balance(s["id"], target, D(body.amount), body.reason)
-    return {"new_balance": float(newbal)}
-
-class RoleIn(BaseModel):
-    identifier: str
-    role: str
-
-@app.post("/api/admin/role")
-async def api_admin_role(request: Request, body: RoleIn):
-    s = _require_session(request)
-    role = get_role(s["id"])
-    if role != "owner": raise HTTPException(403, "Only owner can set roles")
-    target = _id_from_identifier(body.identifier)
-    return set_role(target, body.role)
-
-class TimeoutIn(BaseModel):
-    identifier: str
-    seconds: int
-    reason: Optional[str] = None
-
-@app.post("/api/admin/timeout_site")
-async def api_admin_timeout_site(request: Request, body: TimeoutIn):
-    s = _require_session(request)
-    role = get_role(s["id"])
-    if role not in ("admin","owner"): raise HTTPException(403, "No permission")
-    target = _id_from_identifier(body.identifier)
-    return chat_timeout_set(s["id"], target, int(body.seconds), body.reason or "")
-
-@app.post("/api/admin/timeout_both")
-async def api_admin_timeout_both(request: Request, body: TimeoutIn):
-    # mirror site timeout; discord moderation (if any) should be handled in your bot
-    return await api_admin_timeout_site(request, body)
-
 # ---------- Discord Join ----------
 @app.post("/api/discord/join")
 async def api_discord_join(request: Request):
@@ -868,9 +864,390 @@ HTML_TEMPLATE = """
 <!doctype html><html lang="en"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
 <title>GROWCB</title>
-<!-- (inline CSS + JS omitted here in this snippet for brevity; use your full template) -->
+<style>
+:root{--bg:#0b0f14;--bg2:#111825;--card:#121a2a;--text:#e7eefc;--muted:#9db0ce;--pri:#52a7ff;--good:#27d17f;--bad:#ff5c7a}
+*{box-sizing:border-box}html,body{height:100%}
+body{margin:0;background:linear-gradient(180deg,#0b0f14,#0b0f14 60%,#0b1826);color:var(--text);font:14px/1.3 system-ui,Segoe UI,Roboto,Ubuntu,sans-serif}
+a{color:var(--pri);text-decoration:none}
+header{position:sticky;top:0;z-index:50;background:rgba(11,15,20,.7);backdrop-filter:blur(8px);border-bottom:1px solid #1d2740}
+.container{max-width:1000px;margin:0 auto;padding:12px}
+.row{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.brand{font-weight:700;letter-spacing:.5px}
+.tabs{display:flex;gap:8px;flex-wrap:wrap}
+.tab{padding:8px 10px;border-radius:8px;background:#121a2a;color:#cfe1ff;cursor:pointer;border:1px solid #1c2840}
+.tab.active{background:#1a2640;color:#fff;border-color:#29406e}
+.right{margin-left:auto;display:flex;gap:8px;align-items:center}
+.btn{padding:8px 10px;border-radius:8px;border:1px solid #2a3a5e;background:#162034;color:#cfe1ff;cursor:pointer}
+.btn.primary{background:#1b2d4f;border-color:#2e4a80}
+.btn.good{background:#123524;border-color:#1f6d45;color:#bdf6d6}
+.btn.bad{background:#3a0f1a;border-color:#6e2340;color:#ffd0db}
+.card{background:var(--card);border:1px solid #1d2740;border-radius:12px;padding:12px}
+.grid{display:grid;gap:12px}
+.grid.cols-2{grid-template-columns:1fr 1fr}
+.grid.cols-3{grid-template-columns:1fr 1fr 1fr}
+section{display:none;padding:16px 0}
+section.active{display:block}
+.small{color:var(--muted);font-size:12px}
+input,select{background:#0f1523;border:1px solid #2a3a5e;color:#e7eefc;border-radius:8px;padding:8px}
+input[type=number]{width:120px}
+table{width:100%;border-collapse:collapse}
+th,td{padding:6px;border-bottom:1px solid #20304e;font-size:13px}
+ul{margin:0;padding-left:18px}
+#chatList{max-height:340px;overflow:auto}
+.chat-row{padding:6px 0;border-bottom:1px solid #1b2a45}
+.chat-name{color:#abd0ff;cursor:pointer}
+.badge{display:inline-block;padding:2px 6px;border-radius:6px;background:#20314f;color:#cfe1ff;font-size:11px;margin-left:6px}
+.mono{font-family:ui-monospace, Menlo, Consolas, monospace}
+footer{color:#6c84a7;text-align:center;padding:20px 0}
+</style>
 </head>
-<body>...</body></html>
+<body>
+<header>
+  <div class="container row">
+    <div class="brand">💎 GROWCB</div>
+    <nav class="tabs" id="tabs">
+      <div class="tab active" data-tab="home">Home</div>
+      <div class="tab" data-tab="games">Games</div>
+      <div class="tab" data-tab="promo">Promo</div>
+      <div class="tab" data-tab="referral">Referral</div>
+      <div class="tab" data-tab="settings">Settings</div>
+      <div class="tab" data-tab="chat">Chat</div>
+      <div class="tab" data-tab="leaderboard">Leaderboard</div>
+    </nav>
+    <div class="right">
+      <a id="joinGuild" class="btn" style="display:none" target="_blank" rel="noopener">Join Discord</a>
+      <div id="userBox" class="small"></div>
+    </div>
+  </div>
+</header>
+
+<main class="container">
+  <section id="home" class="active">
+    <div class="grid cols-2">
+      <div class="card">
+        <h3>Welcome</h3>
+        <p class="small">Use the tabs above to play Crash/Mines, redeem promos, manage your referral, or chat.</p>
+      </div>
+      <div class="card">
+        <h3>Your Account</h3>
+        <div id="acctBox" class="small">Checking session…</div>
+        <div id="balBox" class="small"></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="games">
+    <div class="grid cols-2">
+      <div class="card">
+        <h3>Crash</h3>
+        <div class="small" id="crashState">Loading…</div>
+        <div class="row" style="margin-top:8px">
+          <input id="crBet" type="number" step="0.01" min="1" placeholder="Bet"/>
+          <input id="crCash" type="number" step="0.01" min="1.01" value="2.0" />
+          <button class="btn primary" id="crPlace">Place</button>
+          <button class="btn good" id="crCashout">Cashout</button>
+        </div>
+        <div class="small" style="margin-top:8px">Last busts: <span id="crBusts">—</span></div>
+      </div>
+      <div class="card">
+        <h3>Mines</h3>
+        <div class="row">
+          <input id="mnBet" type="number" step="0.01" min="1" placeholder="Bet"/>
+          <select id="mnMines">
+            <option value="3">3 mines</option><option value="5">5</option><option value="8">8</option>
+          </select>
+          <button class="btn primary" id="mnStart">Start</button>
+          <button class="btn good" id="mnCashout">Cashout</button>
+        </div>
+        <div class="grid cols-3" style="margin-top:8px" id="mnGrid"></div>
+        <div class="small" id="mnInfo"></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="promo">
+    <div class="card">
+      <h3>Redeem Promo</h3>
+      <div class="row">
+        <input id="promoCode" placeholder="enter code"/>
+        <button id="promoBtn" class="btn primary">Redeem</button>
+      </div>
+      <div id="promoMsg" class="small"></div>
+      <h4 style="margin-top:14px">Your redemptions</h4>
+      <table id="promoTable"><thead><tr><th>Code</th><th>Redeemed at</th></tr></thead><tbody></tbody></table>
+    </div>
+  </section>
+
+  <section id="referral">
+    <div class="card">
+      <h3>Your referral</h3>
+      <div class="row">
+        <input id="refName" placeholder="set your name"/>
+        <button id="refSet" class="btn primary">Save</button>
+      </div>
+      <div id="refInfo" class="small"></div>
+    </div>
+  </section>
+
+  <section id="settings">
+    <div class="card">
+      <h3>Settings</h3>
+      <div class="row">
+        <label class="small"><input type="checkbox" id="anonChk"/> Anonymous public profile</label>
+        <button id="saveAnon" class="btn primary">Save</button>
+        <a id="logoutBtn" class="btn bad" href="/logout">Logout</a>
+      </div>
+      <div class="small" id="setMsg"></div>
+    </div>
+  </section>
+
+  <section id="chat">
+    <div class="card">
+      <h3>Chat</h3>
+      <div id="chatList"></div>
+      <div class="row" style="margin-top:8px">
+        <input id="chatInput" placeholder="Say something…"/>
+        <button id="chatSend" class="btn primary">Send</button>
+      </div>
+      <div class="small">Tip: click a name to view their public profile.</div>
+    </div>
+  </section>
+
+  <section id="leaderboard">
+    <div class="card">
+      <h3>Leaderboard</h3>
+      <div class="row">
+        <select id="lbPeriod">
+          <option value="daily">Daily</option>
+          <option value="monthly">Monthly</option>
+          <option value="all">All-time</option>
+        </select>
+        <button id="lbLoad" class="btn primary">Load</button>
+      </div>
+      <table id="lbTable"><thead><tr><th>User</th><th>Total Wagered</th></tr></thead><tbody></tbody></table>
+    </div>
+  </section>
+
+  <footer class="small">© GROWCB</footer>
+</main>
+
+<script>
+const el = (id)=>document.getElementById(id);
+const $ = (sel,root=document)=>root.querySelector(sel);
+const $$ = (sel,root=document)=>Array.from(root.querySelectorAll(sel));
+
+function setActive(tab){
+  $$("#tabs .tab").forEach(t=>t.classList.toggle("active", t.dataset.tab===tab));
+  $$("main section").forEach(s=>s.classList.toggle("active", s.id===tab));
+}
+
+$("#tabs").addEventListener("click",e=>{
+  const t=e.target.closest(".tab"); if(!t) return;
+  setActive(t.dataset.tab);
+});
+
+async function jget(u){ const r=await fetch(u); if(!r.ok) throw r; return r.json(); }
+async function jpost(u,body){ const r=await fetch(u,{method:"POST",headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})}); if(!r.ok) throw r; return r.json(); }
+
+let authed=false;
+
+async function loadMe(){
+  try{
+    const me = await jget("/api/me");
+    authed = true;
+    el("userBox").innerHTML = \`<span class="small">👤 \${me.username}</span>\`;
+    el("joinGuild").style.display = "inline-block";
+    el("joinGuild").href = "${DISCORD_INVITE or ''}" || "#";
+    el("joinGuild").textContent = "Join Discord";
+    await loadBalance();
+  }catch(e){
+    authed = false;
+    el("userBox").innerHTML = '<a class="btn primary" href="/login">Login with Discord</a>';
+    el("joinGuild").style.display = "none";
+  }
+}
+async function loadBalance(){
+  try{
+    const b = await jget("/api/balance");
+    el("acctBox").textContent = "Logged in.";
+    el("balBox").textContent = "Balance: " + b.balance.toFixed(2);
+  }catch(e){
+    el("acctBox").innerHTML = 'Not logged in. <a href="/login">Login</a> to play.';
+  }
+}
+
+async function loadPromo(){
+  if(!authed) return;
+  try{
+    const d = await jget("/api/promo/my");
+    const tb = $("#promoTable tbody"); tb.innerHTML="";
+    d.rows.forEach(r=>{
+      const tr = document.createElement("tr");
+      tr.innerHTML = \`<td class="mono">\${r.code}</td><td>\${r.redeemed_at}</td>\`;
+      tb.appendChild(tr);
+    });
+  }catch(e){}
+}
+$("#promoBtn").addEventListener("click", async ()=>{
+  if(!authed) return alert("Login first");
+  const code = el("promoCode").value.trim();
+  if(!code) return;
+  el("promoMsg").textContent = "Redeeming…";
+  try{
+    const res = await jpost("/api/promo/redeem",{code});
+    el("promoMsg").textContent = "Redeemed! New balance: "+res.new_balance.toFixed(2);
+    await loadBalance(); await loadPromo();
+  }catch(e){
+    const txt = await e.text(); el("promoMsg").textContent = "Error: "+txt;
+  }
+});
+
+async function loadRef(){
+  if(!authed) return;
+  try{
+    const d = await jget("/api/referral/state");
+    el("refName").value = d.name || "";
+    const url = location.origin + "/r/" + (d.name || "yourname");
+    el("refInfo").innerHTML = \`Referral link: <span class="mono">\${url}</span><br/>Clicks: \${d.clicks} • Joined: \${d.joined}\`;
+  }catch(e){}
+}
+$("#refSet").addEventListener("click", async ()=>{
+  if(!authed) return alert("Login first");
+  const name = el("refName").value.trim();
+  if(!name) return;
+  try{
+    await jpost("/api/referral/set",{name});
+    await loadRef();
+  }catch(e){ alert("Failed: "+await e.text()); }
+});
+
+async function loadSettings(){
+  if(!authed) return;
+  try{
+    const d = await jget("/api/settings/get");
+    el("anonChk").checked = !!d.is_anon;
+  }catch(e){}
+}
+$("#saveAnon").addEventListener("click", async ()=>{
+  if(!authed) return alert("Login first");
+  try{
+    await jpost("/api/settings/set_anon",{is_anon: el("anonChk").checked});
+    el("setMsg").textContent = "Saved.";
+  }catch(e){ el("setMsg").textContent = "Failed: "+await e.text(); }
+});
+
+async function loadLb(){
+  try{
+    const d = await jget("/api/leaderboard?period="+el("lbPeriod").value);
+    const tb = $("#lbTable tbody"); tb.innerHTML="";
+    d.rows.forEach(r=>{
+      const name = r.is_anon ? "Anonymous" : r.display_name;
+      const tr = document.createElement("tr");
+      tr.innerHTML = \`<td>\${name}</td><td class="mono">\${r.total_wagered.toFixed(2)}</td>\`;
+      tb.appendChild(tr);
+    });
+  }catch(e){}
+}
+$("#lbLoad").addEventListener("click", loadLb);
+
+let crashTimer = null;
+async function loadCrash(){
+  try{
+    const d = await jget("/api/crash/state");
+    el("crashState").textContent = \`Phase: \${d.phase} \${d.current_multiplier?("• x"+d.current_multiplier.toFixed(2)):""}\`;
+    el("crBusts").textContent = (d.last_busts||[]).map(x=>"x"+Number(x).toFixed(2)).join(" · ");
+  }catch(e){ el("crashState").textContent = "Failed to load."; }
+}
+$("#crPlace").addEventListener("click", async ()=>{
+  if(!authed) return alert("Login first");
+  const bet = el("crBet").value||"0"; const cashout = parseFloat(el("crCash").value||"2");
+  try{ await jpost("/api/crash/place",{bet, cashout}); await loadCrash(); await loadBalance(); }
+  catch(e){ alert("Bet failed: "+await e.text()); }
+});
+$("#crCashout").addEventListener("click", async ()=>{
+  if(!authed) return alert("Login first");
+  try{ await jpost("/api/crash/cashout",{}); await loadCrash(); await loadBalance(); }
+  catch(e){ alert("Cashout failed: "+await e.text()); }
+});
+
+function renderMines(st){
+  const g = el("mnGrid"); g.innerHTML="";
+  const info = el("mnInfo");
+  if(!st || !st.board){ info.textContent = "No active game."; return; }
+  info.textContent = \`Bet: \${Number(st.bet).toFixed(2)} • Cashout: \${Number(st.cashout).toFixed(2)} • Mines: \${st.mines}\`;
+  for(let i=0;i<25;i++){
+    const b=document.createElement("button");
+    b.className="btn"; b.textContent = st.revealed && st.revealed.includes(i) ? (st.mines_positions && st.mines_positions.includes(i)?"💥":"💎") : i+1;
+    b.disabled = !!(st.ended || (st.revealed && st.revealed.includes(i)));
+    b.style.minHeight="44px";
+    b.addEventListener("click", async ()=>{
+      try{ const r=await jpost("/api/mines/pick?index="+i,{}); renderMines(r); await loadBalance(); }
+      catch(e){ alert("Pick failed: "+await e.text()); }
+    });
+    g.appendChild(b);
+  }
+}
+async function loadMines(){
+  if(!authed) return;
+  try{ const st=await jget("/api/mines/state"); renderMines(st); }
+  catch(e){ el("mnInfo").textContent="No game."; }
+}
+$("#mnStart").addEventListener("click", async ()=>{
+  if(!authed) return alert("Login first");
+  try{
+    const r = await jpost("/api/mines/start",{bet: el("mnBet").value||"0", mines: Number(el("mnMines").value)});
+    renderMines(r); await loadBalance();
+  }catch(e){ alert("Start failed: "+await e.text()); }
+});
+$("#mnCashout").addEventListener("click", async ()=>{
+  if(!authed) return alert("Login first");
+  try{ const r=await jpost("/api/mines/cashout",{}); renderMines(r); await loadBalance(); }
+  catch(e){ alert("Cashout failed: "+await e.text()); }
+});
+
+async function loadChat(since=0){
+  try{
+    const d = await jget("/api/chat/fetch?since="+since+"&limit=50");
+    const list = el("chatList");
+    d.rows.forEach(m=>{
+      const div = document.createElement("div"); div.className="chat-row";
+      const nm = document.createElement("span"); nm.className="chat-name"; nm.textContent=m.username;
+      nm.title="click to view public profile"; nm.addEventListener("click",()=>viewPublic(m.user_id));
+      div.appendChild(nm);
+      const lvl = document.createElement("span"); lvl.className="badge"; lvl.textContent="Lv"+m.level; div.appendChild(lvl);
+      const rl = document.createElement("span"); rl.className="badge"; rl.textContent=m.role; div.appendChild(rl);
+      const t = document.createElement("div"); t.textContent=m.text; div.appendChild(t);
+      list.appendChild(div);
+      list.scrollTop = list.scrollHeight;
+    });
+    return d.rows.length? d.rows[d.rows.length-1].id : since;
+  }catch(e){ return since; }
+}
+
+async function viewPublic(uid){
+  try{
+    const d = await jget("/api/public/"+uid);
+    alert("Public profile\\nName: "+d.name+"\\nLevel: "+d.level+"\\nXP: "+d.xp+"\\nRole: "+d.role);
+  }catch(e){ alert("User not found"); }
+}
+
+$("#chatSend").addEventListener("click", async ()=>{
+  if(!authed) return alert("Login first");
+  const text = el("chatInput").value.trim(); if(!text) return;
+  try{ await jpost("/api/chat/send",{text}); el("chatInput").value=""; await loadChat(); }
+  catch(e){ alert("Send failed: "+await e.text()); }
+});
+
+async function boot(){
+  setActive("home");
+  await loadMe();
+  await Promise.all([loadPromo(), loadRef(), loadSettings(), loadLb(), loadCrash(), loadMines(), loadChat()]);
+  // pollers
+  setInterval(loadCrash, 1200);
+}
+boot();
+</script>
+</body></html>
 """
 
 # ---------- Root page ----------
@@ -884,52 +1261,3 @@ async def index():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=True)
-# ---------- Promo helpers ----------
-class PromoInvalid(Exception): pass
-class PromoExpired(Exception): pass
-class PromoExhausted(Exception): pass
-class PromoAlreadyRedeemed(Exception): pass
-
-@with_conn
-def redeem_promo(cur, user_id: str, code: str) -> Decimal:
-    code = (code or "").strip().lower()
-    cur.execute("SELECT code, amount, max_uses, uses, expires_at FROM promo_codes WHERE code=%s", (code,))
-    r = cur.fetchone()
-    if not r:
-        raise PromoInvalid("Invalid code")
-    _, amount, max_uses, uses, expires_at = r
-    if expires_at and now_utc() > expires_at:
-        raise PromoExpired("Code expired")
-    if uses >= max_uses:
-        raise PromoExhausted("Code fully used")
-    cur.execute("SELECT 1 FROM promo_redemptions WHERE user_id=%s AND code=%s", (user_id, code))
-    if cur.fetchone():
-        raise PromoAlreadyRedeemed("You already redeemed this code")
-    cur.execute("UPDATE promo_codes SET uses=uses+1 WHERE code=%s", (code,))
-    cur.execute("INSERT INTO promo_redemptions(user_id,code) VALUES(%s,%s)", (user_id, code))
-    newbal = adjust_balance(user_id, user_id, amount, f"promo:{code}")
-    return newbal
-
-@with_conn
-def create_promo(cur, creator_id: str, code: Optional[str], amount: str, max_uses: int, expires_at: Optional[str]):
-    if not code:
-        code = ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(8))
-    code = code.lower()
-    amt = q2(D(amount))
-    exp_dt = None
-    if expires_at:
-        try:
-            exp_dt = datetime.datetime.fromisoformat(expires_at).astimezone(UTC)
-        except Exception:
-            raise ValueError("Invalid expires_at format")
-    cur.execute("""INSERT INTO promo_codes(code,amount,max_uses,expires_at,created_by)
-                   VALUES(%s,%s,%s,%s,%s)""",
-                (code, amt, max_uses, exp_dt, creator_id))
-    return {
-        "ok": True,
-        "code": code,
-        "amount": float(amt),
-        "max_uses": max_uses,
-        "expires_at": exp_dt.isoformat() if exp_dt else None
-    }
-

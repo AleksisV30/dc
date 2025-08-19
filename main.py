@@ -783,64 +783,75 @@ class PromoCreateIn(BaseModel):
 @app.post("/api/admin/promo/create")
 async def api_admin_promo_create(request: Request, body: PromoCreateIn):
     s = _require_session(request)
-    # only owner can create
-    if str(s["id"]) != str(OWNER_ID):
-        raise HTTPException(403, "Forbidden")
-    out = create_promo(s["id"], body.code, body.amount, body.max_uses, body.expires_at)
+    role = get_role(s["id"])
+    if role not in ("admin", "owner"): raise HTTPException(403, "No permission")
+    res = create_promo(s["id"], body.code, body.amount, int(body.max_uses or 1), body.expires_at)
+    return res
+
+# ---------- Crash endpoints ----------
+class CrashBetIn(BaseModel):
+    bet: str
+    cashout: Optional[float] = None
+
+@app.get("/api/crash/state")
+async def api_crash_state(request: Request):
+    # not requiring login for readonly viewing
+    try:
+        s = _require_session(request)
+        uid = s["id"]
+    except:
+        s = None
+        uid = None
+
+    rid, info = ensure_betting_round()
+    now = now_utc()
+
+    # Progress state machine
+    if info["status"] == "betting" and now >= info["betting_ends_at"]:
+        begin_running(rid)
+        info = load_round()
+    if info and info["status"] == "running" and info["expected_end_at"] and now >= info["expected_end_at"]:
+        finish_round(rid)
+        create_next_betting()
+        info = load_round()
+
+    out = {
+        "phase": info["status"],
+        "bust": info["bust"],
+        "betting_opens_at": iso(info["betting_opens_at"]),
+        "betting_ends_at": iso(info["betting_ends_at"]),
+        "started_at": iso(info["started_at"]),
+        "expected_end_at": iso(info["expected_end_at"]),
+        "last_busts": last_busts()
+    }
+    if info["status"] == "running":
+        out["current_multiplier"] = current_multiplier(info["started_at"], info["expected_end_at"], info["bust"], now)
+    if uid:
+        y = your_bet(rid, uid)
+        if y: out["your_bet"] = y
     return out
 
-# ---------- Chat ----------
-class ChatIn(BaseModel):
-    text: str
-
-@app.post("/api/chat/send")
-async def api_chat_send(request: Request, body: ChatIn):
+@app.post("/api/crash/place")
+async def api_crash_place(request: Request, body: CrashBetIn):
     s = _require_session(request)
-    txt = (body.text or "").strip()
-    if not txt:
-        raise HTTPException(400, "Empty message")
-    with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
-        cur.execute("INSERT INTO chat_messages(user_id, username, text) VALUES (%s,%s,%s)",
-                    (s["id"], s["username"], txt))
-        con.commit()
-    return {"ok": True}
-
-@app.get("/api/chat/fetch")
-async def api_chat_fetch(limit: int = Query(50, ge=1, le=200)):
-    with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
-        cur.execute("SELECT user_id, username, text, created_at FROM chat_messages ORDER BY id DESC LIMIT %s", (limit,))
-        rows = [{"user_id": r[0], "username": r[1], "text": r[2], "created_at": str(r[3])} for r in cur.fetchall()]
-    return {"rows": rows[::-1]}
-
-# ---------- Crash ----------
-@app.get("/api/crash/state")
-async def api_crash_state():
-    return load_round()
-
-class CrashBetIn(BaseModel):
-    amount: str
-    cashout: str
-
-@app.post("/api/crash/bet")
-async def api_crash_bet(request: Request, body: CrashBetIn):
-    s = _require_session(request)
-    return place_bet(s["id"], body.amount, body.cashout)
+    bet = q2(D(body.bet or "0"))
+    cashout = float(body.cashout or 2.0)
+    return place_bet(s["id"], bet, max(1.01, cashout))
 
 @app.post("/api/crash/cashout")
 async def api_crash_cashout(request: Request):
     s = _require_session(request)
+    cur = load_round()
+    if not cur or cur["status"] != "running":
+        raise HTTPException(400, "No running round")
     return cashout_now(s["id"])
 
 @app.get("/api/crash/history")
-async def api_crash_history():
-    return {"rows": last_busts()}
-
-@app.get("/api/crash/your")
-async def api_crash_your(request: Request):
+async def api_crash_history(request: Request):
     s = _require_session(request)
-    return your_history(s["id"])
+    return {"rows": your_history(s["id"], 10)}
 
-# ---------- Mines ----------
+# ---------- Mines endpoints ----------
 class MinesStartIn(BaseModel):
     bet: str
     mines: int
@@ -848,15 +859,12 @@ class MinesStartIn(BaseModel):
 @app.post("/api/mines/start")
 async def api_mines_start(request: Request, body: MinesStartIn):
     s = _require_session(request)
-    return mines_start(s["id"], body.bet, body.mines)
-
-class MinesPickIn(BaseModel):
-    cell: int
+    return mines_start(s["id"], q2(D(body.bet or "0")), int(body.mines))
 
 @app.post("/api/mines/pick")
-async def api_mines_pick(request: Request, body: MinesPickIn):
+async def api_mines_pick(request: Request, index: int = Query(..., ge=0, le=24)):
     s = _require_session(request)
-    return mines_pick(s["id"], body.cell)
+    return mines_pick(s["id"], index)
 
 @app.post("/api/mines/cashout")
 async def api_mines_cashout(request: Request):
@@ -866,69 +874,158 @@ async def api_mines_cashout(request: Request):
 @app.get("/api/mines/state")
 async def api_mines_state(request: Request):
     s = _require_session(request)
-    return mines_state(s["id"])
+    st = mines_state(s["id"])
+    return st or {}
 
 @app.get("/api/mines/history")
 async def api_mines_history(request: Request):
     s = _require_session(request)
-    return mines_history(s["id"])
+    return {"rows": mines_history(s["id"], 15)}
 
-# ---------- Root HTML ----------
-HTML_TEMPLATE = """<!DOCTYPE html>
-<html>
-  <head>
-    <meta charset="utf-8"/>
-    <title>GROWCB</title>
-    <style>
-      body { background:#0b1326; color:#fff; font-family:sans-serif; margin:0; padding:0; }
-      .header { display:flex; align-items:center; justify-content:space-between; padding:10px 20px; background:#111a33; }
-      .games-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:12px; padding:20px; }
-      .game-card{ position:relative; aspect-ratio:16/9; border:1px solid #333; border-radius:16px; overflow:hidden; padding:0; cursor:pointer; background:#0b1326; }
-      .game-card .banner{ position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }
-      .avatar{ width:32px; height:32px; border-radius:50%; vertical-align:middle; }
-    </style>
-  </head>
-  <body>
-    <div class="header">
-      <div id="authArea"></div>
-      <div id="balanceArea"></div>
-    </div>
-    <div class="games-grid">
-      <div class="game-card" id="openCrash"><img class="banner" src="/img/crash.png"/></div>
-      <div class="game-card" id="openMines"><img class="banner" src="/img/mines.png"/></div>
-      <div class="game-card" id="openCoinflip"><img class="banner" src="/img/coinflip.png"/></div>
-      <div class="game-card" id="openBlackjack"><img class="banner" src="/img/blackjack.png"/></div>
-      <div class="game-card" id="openPump"><img class="banner" src="/img/pump.png"/></div>
-    </div>
-    <script>
-      async function api(path, opts={}){
-        let r = await fetch(path, Object.assign({headers:{"Content-Type":"application/json"}}, opts));
-        let ct = r.headers.get("content-type")||"";
-        return ct.includes("application/json") ? r.json() : r.text();
-      }
-      async function refresh(){
-        try {
-          let me = await api("/api/me");
-          let bal = await api("/api/balance");
-          document.getElementById("authArea").innerHTML =
-            `<img class="avatar" src="${me.avatar_url||'/img/GrowCBnobackground.png'}"/> ${me.username}`;
-          document.getElementById("balanceArea").innerText = bal.balance.toFixed(2)+" ${GEM}";
-        } catch(e){}
-      }
-      refresh();
-      document.getElementById("openCrash").onclick = ()=>location="/crash";
-      document.getElementById("openMines").onclick = ()=>location="/mines";
-      document.getElementById("openCoinflip").onclick = ()=>alert("Coming soon!");
-      document.getElementById("openBlackjack").onclick = ()=>alert("Coming soon!");
-      document.getElementById("openPump").onclick = ()=>alert("Coming soon!");
-    </script>
-  </body>
-</html>
-"""
+# ---------- Chat endpoints ----------
+class ChatIn(BaseModel):
+    text: str
 
+@with_conn
+def get_role(cur, user_id: str) -> str:
+    cur.execute("SELECT role FROM profiles WHERE user_id=%s", (user_id,))
+    r = cur.fetchone()
+    return r[0] if r else "member"
+
+@with_conn
+def chat_timeout_set(cur, actor_id: str, user_id: str, seconds: int, reason: Optional[str]):
+    until = now_utc() + datetime.timedelta(seconds=max(1, seconds))
+    cur.execute("""INSERT INTO chat_timeouts(user_id, until, reason, created_by)
+                   VALUES (%s,%s,%s,%s)
+                   ON CONFLICT (user_id) DO UPDATE SET until=EXCLUDED.until, reason=EXCLUDED.reason, created_by=EXCLUDED.created_by""",
+                (user_id, until, reason, actor_id))
+    return {"ok": True, "until": str(until)}
+
+@with_conn
+def chat_timeout_get(cur, user_id: str):
+    cur.execute("SELECT until, reason FROM chat_timeouts WHERE user_id=%s", (user_id,))
+    r = cur.fetchone()
+    if not r: return None
+    until, reason = r
+    if until <= now_utc():
+        cur.execute("DELETE FROM chat_timeouts WHERE user_id=%s", (user_id,))
+        return None
+    delta = int((until - now_utc()).total_seconds())
+    return {"until": str(until), "seconds_left": max(0, delta), "reason": reason or ""}
+
+@with_conn
+def chat_insert(cur, user_id: str, username: str, text: str, private_to: Optional[str] = None):
+    text = (text or "").strip()  # FIX: use strip() (not .trim())
+    if not text: raise ValueError("Message is empty")
+    if len(text) > 300: raise ValueError("Message is too long (max 300)")
+    ensure_profile_row(user_id)
+    if private_to is None:
+        cur.execute("SELECT until FROM chat_timeouts WHERE user_id=%s", (user_id,))
+        r = cur.fetchone()
+        if r and r[0] > now_utc(): raise PermissionError("You are timed out")
+    cur.execute("INSERT INTO chat_messages(user_id, username, text, private_to) VALUES (%s,%s,%s,%s) RETURNING id, created_at",
+                (user_id, username, text, private_to))
+    row = cur.fetchone()
+    return {"id": int(row[0]), "created_at": str(row[1])}
+
+@with_conn
+def chat_fetch(cur, since_id: int, limit: int, for_user_id: Optional[str]):
+    if since_id <= 0:
+        cur.execute("""SELECT id, user_id, username, text, created_at, private_to
+                       FROM chat_messages
+                       WHERE private_to IS NULL
+                       ORDER BY id DESC LIMIT %s""", (limit,))
+        rows_pub = list(reversed(cur.fetchall()))
+        rows_priv = []
+        if for_user_id:
+            cur.execute("""SELECT id, user_id, username, text, created_at, private_to
+                           FROM chat_messages
+                           WHERE private_to=%s
+                           ORDER BY id DESC LIMIT %s""", (for_user_id, limit))
+            rows_priv = list(reversed(cur.fetchall()))
+        rows = sorted(rows_pub + rows_priv, key=lambda r: r[0])
+    else:
+        if for_user_id:
+            cur.execute("""SELECT id, user_id, username, text, created_at, private_to
+                           FROM chat_messages
+                           WHERE id>%s AND (private_to IS NULL OR private_to=%s)
+                           ORDER BY id ASC LIMIT %s""", (since_id, for_user_id, limit))
+        else:
+            cur.execute("""SELECT id, user_id, username, text, created_at, private_to
+                           FROM chat_messages
+                           WHERE id>%s AND private_to IS NULL
+                           ORDER BY id ASC LIMIT %s""", (since_id, limit))
+        rows = cur.fetchall()
+
+    uids = list({str(r[1]) for r in rows})
+    levels: Dict[str, int] = {}
+    roles: Dict[str, str] = {}
+    if uids:
+        cur.execute("SELECT user_id, xp, role FROM profiles WHERE user_id = ANY(%s)", (uids,))
+        for uid, xp, role in cur.fetchall():
+            levels[str(uid)] = 1 + int(xp) // 100
+            roles[str(uid)] = role or "member"
+    out = []
+    for mid, uid, uname, text, created_at, private_to in rows:
+        out.append({
+            "id": int(mid),
+            "user_id": str(uid),
+            "username": uname,
+            "text": text,
+            "created_at": str(created_at),
+            "private_to": (str(private_to) if private_to else None),
+            "level": levels.get(str(uid), 1),
+            "role": roles.get(str(uid), "member")
+        })
+    return out
+
+@app.get("/api/chat/fetch")
+async def api_chat_fetch(request: Request, since_id: int = Query(0), limit: int = Query(50, ge=1, le=200)):
+    try:
+        s = _require_session(request)
+        uid = s["id"]
+    except:
+        uid = None
+    rows = chat_fetch(since_id, limit, uid)
+    return {"rows": rows}
+
+@app.post("/api/chat/send")
+async def api_chat_send(request: Request, body: ChatIn):
+    s = _require_session(request)
+    try:
+        row = chat_insert(s["id"], s["username"], body.text)
+        return {"ok": True, "row": row}
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+# ---------- Admin: timeouts ----------
+class TimeoutIn(BaseModel):
+    user_id: str
+    seconds: int
+    reason: Optional[str] = None
+
+@app.post("/api/admin/chat/timeout")
+async def api_admin_chat_timeout(request: Request, body: TimeoutIn):
+    s = _require_session(request)
+    role = get_role(s["id"])
+    if role not in ("admin", "owner"): raise HTTPException(403, "No permission")
+    return chat_timeout_set(s["id"], body.user_id, body.seconds, body.reason)
+
+@app.get("/api/chat/timeout_state")
+async def api_chat_timeout_state(request: Request):
+    s = _require_session(request)
+    return chat_timeout_get(s["id"]) or {}
+
+# ---------- Root ----------
 @app.get("/")
-async def index():
-    return HTMLResponse(HTML_TEMPLATE)
+async def root():
+    # Serve your SPA / frontend entrypoint
+    index_path = os.path.join(os.path.dirname(__file__), "index.html")
+    if os.path.isfile(index_path):
+        return FileResponse(index_path)
+    return HTMLResponse("<h1>Backend is running</h1>")
 
 # ---------- Run ----------
 if __name__ == "__main__":

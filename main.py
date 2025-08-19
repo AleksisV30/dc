@@ -1075,7 +1075,15 @@ input,select,textarea{width:100%;appearance:none;background:var(--input-bg);colo
 .header-inner{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px}
 .left{display:flex;align-items:center;gap:12px;flex:1;min-width:0}.brand{display:flex;align-items:center;gap:10px;font-weight:800;white-space:nowrap}
 .brand .logo{width:32px;height:32px;border-radius:10px;object-fit:contain;border:1px solid var(--border);background:linear-gradient(135deg,var(--accent),var(--accent2))}
-.tabs{display:flex;gap:4px;align-items:center;padding:4px;border-radius:14px;background
+.tabs {
+  display:flex;
+  gap:4px;
+  align-items:center;
+  padding:4px;
+  border-radius:14px;
+  background:linear-gradient(180deg,#0f1a33,#0b1326);
+  border:1px solid var(--border);
+}
 :linear-gradient(180deg,#0f1a33,#0b1326);border:1px solid var(--border)}
 .tab{padding:8px 12px;border-radius:10px;cursor:pointer;font-weight:700;white-space:nowrap;color:#d8e6ff;opacity:.85;transition:all .15s ease;display:flex;align-items:center;gap:8px}
 .tab:hover{opacity:1;transform:translateY(-1px)}.tab.active{background:linear-gradient(135deg,#3b82f6,#22c1dc);color:#051326;box-shadow:0 6px 16px rgba(59,130,246,.25);opacity:1}
@@ -1850,3 +1858,4 @@ async def index():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=True)
+

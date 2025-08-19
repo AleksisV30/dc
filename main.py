@@ -584,7 +584,7 @@ async def login():
     params = {
         "client_id": CLIENT_ID,
         "redirect_uri": OAUTH_REDIRECT,
-        "response_type": "code",
+            "response_type": "code",
         "scope": "identify guilds.join",
         "prompt": "consent"
     }
@@ -973,11 +973,6 @@ def chat_fetch(cur, since_id: int, limit: int, for_user_id: Optional[str]):
                     "text": txt, "created_at": str(ts), "private_to": priv})
     return out
 
-@with_conn
-def chat_delete(cur, message_id: int):
-    cur.execute("DELETE FROM chat_messages WHERE id=%s", (message_id,))
-    return {"ok": True}
-
 @app.post("/api/chat/send")
 async def api_chat_send(request: Request, body: ChatIn):
     s = _require_session(request)
@@ -999,7 +994,10 @@ async def api_chat_del(request: Request, id: int):
     s = _require_session(request)
     role = get_role(s["id"])
     if role not in ("admin","owner"): raise HTTPException(403, "No permission")
-    return chat_delete(id)
+    with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
+        cur.execute("DELETE FROM chat_messages WHERE id=%s", (id,))
+        con.commit()
+    return {"ok": True}
 
 # ---------- Admin ----------
 class AdjustIn(BaseModel):
@@ -1063,22 +1061,73 @@ HTML_TEMPLATE = """
 <!doctype html><html lang="en"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
 <title>GROWCB</title>
-<!-- Your full HTML/JS from earlier goes here (unchanged) -->
+<style>
+:root{--bg:#0a0f1e;--bg2:#0c1428;--card:#111a31;--muted:#9eb3da;--text:#ecf2ff;--accent:#6aa6ff;--accent2:#22c1dc;--ok:#34d399;--warn:#f59e0b;--err:#ef4444;--border:#1f2b47;--chatW:340px;--input-bg:#0b1430;--input-br:#223457;--input-tx:#e6eeff;--input-ph:#9db4e4}
+*{box-sizing:border-box}html,body{height:100%}body{margin:0;color:var(--text);background:radial-gradient(1400px 600px at 20% -10%, #11204d 0%, transparent 60%),linear-gradient(180deg,#0a0f1e,#0a0f1e 60%, #0b1124);font-family:Inter,system-ui,Segoe UI,Roboto,Arial,Helvetica,sans-serif}
+a{color:inherit;text-decoration:none}.container{max-width:1120px;margin:0 auto;padding:16px}
+input,select,textarea{width:100%;appearance:none;background:var(--input-bg);color:var(--input-tx);border:1px solid var(--input-br);border-radius:12px;padding:10px 12px;outline:none}
+.field{display:flex;flex-direction:column;gap:6px}.row{display:grid;gap:10px}
+.row.cols-2{grid-template-columns:1fr 1fr}.row.cols-3{grid-template-columns:1fr 1fr 1fr}.row.cols-4{grid-template-columns:1.6fr 1fr 1fr auto}.row.cols-5{grid-template-columns:2fr 1fr 1fr auto auto}
+.card{background:linear-gradient(180deg,#0f1a33,#0b1326);border:1px solid var(--border);border-radius:16px;padding:16px}
+.header{position:sticky;top:0;z-index:30;backdrop-filter:blur(8px);background:rgba(10,15,30,.72);border-bottom:1px solid var(--border)}
+.header-inner{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px}
+.left{display:flex;align-items:center;gap:12px;flex:1;min-width:0}.brand{display:flex;align-items:center;gap:10px;font-weight:800;white-space:nowrap}
+.brand .logo{width:32px;height:32px;border-radius:10px;object-fit:contain;border:1px solid var(--border);background:linear-gradient(135deg,var(--accent),var(--accent2))}
+.tabs{display:flex;gap:4px;align-items:center;padding:4px;border-radius:14px;background:linear-gradient(180deg,#0f1a33,#0b1326);border:1px solid var(--border)}
+.tab{padding:8px 12px;border-radius:10px;cursor:pointer;font-weight:700;white-space:nowrap;color:#d8e6ff;opacity:.85;transition:all .15s ease;display:flex;align-items:center;gap:8px}
+.tab:hover{opacity:1;transform:translateY(-1px)}.tab.active{background:linear-gradient(135deg,#3b82f6,#22c1dc);color:#051326;box-shadow:0 6px 16px rgba(59,130,246,.25);opacity:1}
+.right{display:flex;gap:8px;align-items:center}
+.right .bal{font-weight:700;font-size:15px;white-space:nowrap}
+.right img{width:32px;height:32px;border-radius:50%;border:1px solid var(--border)}
+.game-grid{display:grid;gap:18px;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));margin-top:24px}
+.game-tile{overflow:hidden;border-radius:16px;cursor:pointer;transition:all .15s ease;border:1px solid var(--border);background:#0d152b}
+.game-tile:hover{transform:translateY(-3px);box-shadow:0 8px 18px rgba(0,0,0,.35)}
+.game-tile img{width:100%;height:140px;object-fit:cover;display:block}
+</style>
 </head>
 <body>
-  <!-- The same HTML UI you already had -->
-</body>
-</html>
+<div class="header"><div class="header-inner">
+  <div class="left"><div class="brand"><span>🎲 GROWCB</span></div></div>
+  <div class="right">
+    <div class="bal" id="balance">--</div>
+    <img id="avatar" src="https://cdn.discordapp.com/embed/avatars/0.png"/>
+  </div>
+</div></div>
+
+<div class="container">
+  <div class="game-grid">
+    <div class="game-tile" onclick="go('crash')"><img src="/img/crash.png"></div>
+    <div class="game-tile" onclick="go('mines')"><img src="/img/mines.png"></div>
+    <div class="game-tile" onclick="go('coinflip')"><img src="/img/coinflip.png"></div>
+    <div class="game-tile" onclick="go('blackjack')"><img src="/img/blackjack.png"></div>
+    <div class="game-tile" onclick="go('pump')"><img src="/img/pump.png"></div>
+  </div>
+</div>
+
+<script>
+async function refreshMe(){
+  try{
+    let r=await fetch('/api/me'); if(r.ok){let me=await r.json();
+      if(me.avatar_url) document.getElementById('avatar').src=me.avatar_url;
+    }}
+  catch(e){}
+  try{
+    let r2=await fetch('/api/balance'); if(r2.ok){let b=await r2.json();
+      document.getElementById('balance').textContent=b.balance.toFixed(2)+' 💎';
+    }}
+  catch(e){}
+}
+function go(g){ location.href='/'+g; }
+refreshMe();
+</script>
+</body></html>
 """
 
-# ---------- Root page ----------
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    html = HTML_TEMPLATE.replace("__INVITE__", DISCORD_INVITE or "__INVITE__") \
-                        .replace("__OWNER_ID__", str(OWNER_ID))
-    return HTMLResponse(html)
+    return HTML_TEMPLATE
 
-# ---------- Utility: run local (optional) ----------
+# ---------- Run ----------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=True)

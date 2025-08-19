@@ -1,10 +1,9 @@
-# app/main.py — unified site + discord bot + games + chat
+# app/main.py — full GrowCB site + Discord bot
 
 import os, json, asyncio, re, random, string, datetime, base64
 from urllib.parse import urlencode
-from typing import Optional, Tuple, Dict, List
+from typing import Optional, Dict, List
 from decimal import Decimal, ROUND_DOWN, getcontext
-from contextlib import asynccontextmanager
 
 import httpx
 import psycopg
@@ -41,52 +40,28 @@ DISCORD_API = "https://discord.com/api"
 OWNER_ID = int(os.getenv("OWNER_ID", "1128658280546320426"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
-GUILD_ID = int(os.getenv("GUILD_ID", "0"))
-DISCORD_INVITE = os.getenv("DISCORD_INVITE", "")
 
 GEM = "💎"
 TWO = Decimal("0.01")
-def D(x) -> Decimal:
-    return Decimal(str(x)) if not isinstance(x, Decimal) else x
-def q2(x: Decimal) -> Decimal:
-    return D(x).quantize(TWO, rounding=ROUND_DOWN)
+def D(x): return Decimal(str(x)) if not isinstance(x, Decimal) else x
+def q2(x): return D(x).quantize(TWO, rounding=ROUND_DOWN)
 
 UTC = datetime.timezone.utc
-def now_utc() -> datetime.datetime: return datetime.datetime.now(UTC)
-def iso(dt: Optional[datetime.datetime]) -> Optional[str]:
-    return dt.astimezone(UTC).isoformat() if dt else None
+def now_utc(): return datetime.datetime.now(UTC)
 
 # ---------- FastAPI + static ----------
-def _get_static_dir():
-    base = os.path.dirname(os.path.abspath(__file__))
-    static_dir = os.path.join(base, "static")
-    os.makedirs(static_dir, exist_ok=True)
-    return static_dir
-
 app = FastAPI()
-app.mount("/static", StaticFiles(directory=_get_static_dir()), name="static")
-
-# fallback transparent image
-_TRANSPARENT_PNG = base64.b64decode(
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
-)
-@app.get("/img/{filename}")
-async def serve_img(filename: str):
-    base = os.path.dirname(os.path.abspath(__file__))
-    for path in (os.path.join(base, filename), os.path.join(base, "static", filename)):
-        if os.path.isfile(path):
-            return FileResponse(path)
-    return Response(content=_TRANSPARENT_PNG, media_type="image/png")
+base = os.path.dirname(os.path.abspath(__file__))
+app.mount("/static", StaticFiles(directory=os.path.join(base, "static")), name="static")
 
 # ---------- Sessions ----------
 SER = URLSafeSerializer(SECRET_KEY, salt="session-v1")
-def _set_session(resp, data: dict):
-    resp.set_cookie("session", SER.dumps(data), max_age=30*86400, httponly=True, samesite="lax")
+def _set_session(resp, data): resp.set_cookie("session", SER.dumps(data), max_age=30*86400, httponly=True, samesite="lax")
 def _clear_session(resp): resp.delete_cookie("session")
-def _require_session(request: Request) -> dict:
+def _require_session(request: Request):
     raw = request.cookies.get("session")
     if not raw: raise HTTPException(401, "Not logged in")
-    try: sess = SER.loads(raw); return sess
+    try: return SER.loads(raw)
     except BadSignature: raise HTTPException(401, "Invalid session")
 
 # ---------- DB ----------
@@ -95,8 +70,7 @@ def with_conn(fn):
         if not DATABASE_URL: raise RuntimeError("DATABASE_URL not set")
         with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
             res = fn(cur, *a, **kw)
-            con.commit()
-            return res
+            con.commit(); return res
     return wrapper
 
 @with_conn
@@ -121,6 +95,13 @@ def init_db(cur):
         role TEXT NOT NULL DEFAULT 'member',
         is_anon BOOLEAN NOT NULL DEFAULT FALSE,
         referred_by TEXT,
+        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+    )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS chat_messages (
+        id BIGSERIAL PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        username TEXT NOT NULL,
+        text TEXT NOT NULL,
         created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
     )""")
 
@@ -164,7 +145,7 @@ bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
 @bot.event
 async def on_ready():
-    print(f"Bot ready as {bot.user} (id={bot.user.id})")
+    print(f"🤖 Bot ready as {bot.user} (id={bot.user.id})")
 
 @bot.command()
 async def bal(ctx, user: discord.User=None):

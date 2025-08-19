@@ -584,7 +584,7 @@ async def login():
     params = {
         "client_id": CLIENT_ID,
         "redirect_uri": OAUTH_REDIRECT,
-            "response_type": "code",
+        "response_type": "code",
         "scope": "identify guilds.join",
         "prompt": "consent"
     }
@@ -973,6 +973,11 @@ def chat_fetch(cur, since_id: int, limit: int, for_user_id: Optional[str]):
                     "text": txt, "created_at": str(ts), "private_to": priv})
     return out
 
+@with_conn
+def chat_delete(cur, message_id: int):
+    cur.execute("DELETE FROM chat_messages WHERE id=%s", (message_id,))
+    return {"ok": True}
+
 @app.post("/api/chat/send")
 async def api_chat_send(request: Request, body: ChatIn):
     s = _require_session(request)
@@ -994,10 +999,7 @@ async def api_chat_del(request: Request, id: int):
     s = _require_session(request)
     role = get_role(s["id"])
     if role not in ("admin","owner"): raise HTTPException(403, "No permission")
-    with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
-        cur.execute("DELETE FROM chat_messages WHERE id=%s", (id,))
-        con.commit()
-    return {"ok": True}
+    return chat_delete(id)
 
 # ---------- Admin ----------
 class AdjustIn(BaseModel):
@@ -1073,62 +1075,778 @@ input,select,textarea{width:100%;appearance:none;background:var(--input-bg);colo
 .header-inner{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px}
 .left{display:flex;align-items:center;gap:12px;flex:1;min-width:0}.brand{display:flex;align-items:center;gap:10px;font-weight:800;white-space:nowrap}
 .brand .logo{width:32px;height:32px;border-radius:10px;object-fit:contain;border:1px solid var(--border);background:linear-gradient(135deg,var(--accent),var(--accent2))}
-.tabs{display:flex;gap:4px;align-items:center;padding:4px;border-radius:14px;background:linear-gradient(180deg,#0f1a33,#0b1326);border:1px solid var(--border)}
+.tabs{display:flex;gap:4px;align-items:center;padding:4px;border-radius:14px;background
+:linear-gradient(180deg,#0f1a33,#0b1326);border:1px solid var(--border)}
 .tab{padding:8px 12px;border-radius:10px;cursor:pointer;font-weight:700;white-space:nowrap;color:#d8e6ff;opacity:.85;transition:all .15s ease;display:flex;align-items:center;gap:8px}
 .tab:hover{opacity:1;transform:translateY(-1px)}.tab.active{background:linear-gradient(135deg,#3b82f6,#22c1dc);color:#051326;box-shadow:0 6px 16px rgba(59,130,246,.25);opacity:1}
-.right{display:flex;gap:8px;align-items:center}
-.right .bal{font-weight:700;font-size:15px;white-space:nowrap}
-.right img{width:32px;height:32px;border-radius:50%;border:1px solid var(--border)}
-.game-grid{display:grid;gap:18px;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));margin-top:24px}
-.game-tile{overflow:hidden;border-radius:16px;cursor:pointer;transition:all .15s ease;border:1px solid var(--border);background:#0d152b}
-.game-tile:hover{transform:translateY(-3px);box-shadow:0 8px 18px rgba(0,0,0,.35)}
-.game-tile img{width:100%;height:140px;object-fit:cover;display:block}
+.right{display:flex;gap:8px;align-items:center;margin-left:12px}
+.chip{background:#0c1631;border:1px solid var(--border);color:#dce7ff;padding:6px 10px;border-radius:999px;font-size:12px;white-space:nowrap;cursor:pointer}
+.avatar{width:34px;height:34px;border-radius:50%;object-fit:cover;border:1px solid var(--border);cursor:pointer}
+.avatar-wrap{position:relative}.menu{position:absolute;right:0;top:40px;background:#0c1631;border:1px solid var(--border);border-radius:12px;padding:6px;display:none;min-width:160px;z-index:50}
+.menu.open{display:block}.menu .item{padding:8px 10px;border-radius:8px;cursor:pointer;font-size:14px}.menu .item:hover{background:#11234a}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:10px 14px;border-radius:12px;border:1px solid var(--border);background:linear-gradient(180deg,#0e1833,#0b1326);cursor:pointer;font-weight:600}
+.btn.primary{background:linear-gradient(135deg,#3b82f6,#22c1dc);border-color:transparent}
+.btn.ghost{background:#162a52;border:1px solid var(--border);color:#eaf2ff}
+.btn.ok{background:linear-gradient(135deg,#22c55e,#16a34a);border-color:transparent}
+.big{font-size:22px;font-weight:900}.label{font-size:12px;color:var(--muted);letter-spacing:.2px;text-transform:uppercase}.muted{color:var(--muted)}
+.games-grid{display:grid;gap:14px;grid-template-columns:1fr}@media(min-width:700px){.games-grid{grid-template-columns:1fr 1fr}}@media(min-width:1020px){.games-grid{grid-template-columns:1fr 1fr 1fr}}
+.game-card{position:relative;min-height:140px;display:flex;flex-direction:column;justify-content:flex-end;gap:4px;background:linear-gradient(180deg,#0f1a33,#0c152a);border:1px solid var(--border);border-radius:16px;padding:16px;cursor:pointer;overflow:hidden}
+.game-card .banner{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:.35}
+.game-card .title{font-size:20px;font-weight:800;position:relative}.game-card .muted{position:relative}
+.ribbon{position:absolute;top:12px;right:-32px;transform:rotate(35deg);background:linear-gradient(135deg,#f59e0b,#fb923c);color:#1a1206;font-weight:900;padding:6px 50px;border:1px solid rgba(0,0,0,.2)}
+.cr-graph-wrap{position:relative;height:240px;background:#0e1833;border:1px solid var(--border);border-radius:16px;overflow:hidden}
+canvas{display:block;width:100%;height:100%}
+.lb-controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
+.seg{display:flex;border:1px solid var(--border);border-radius:12px;overflow:hidden}
+.seg button{padding:8px 12px;background:#0c1631;color:#dce7ff;border:none;cursor:pointer}
+.seg button.active{background:linear-gradient(135deg,#3b82f6,#22c1dc);color:#051326;font-weight:800}
+table{width:100%;border-collapse:collapse}th,td{padding:10px;border-bottom:1px solid rgba(255,255,255,.06);text-align:left}
+tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%)}tr.anon td.name{color:#9db4e4;font-style:italic}
+.countdown{font-size:12px;color:var(--muted)}.hint{font-size:12px;color:var(--muted);margin-top:6px}
+.grid-2{display:grid;grid-template-columns:1fr;gap:16px}@media(min-width:900px){.grid-2{grid-template-columns:1.1fr .9fr}}
+.hero{display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap}
+.kpi{display:flex;gap:8px;flex-wrap:wrap}
+.kpi .pill{background:#0c1631;border:1px solid var(--border);border-radius:999px;padding:6px 10px;font-size:12px}
+.copy{display:flex;gap:8px}
+.copy input{flex:1}
+.sep{height:1px;background:rgba(255,255,255,.06);margin:10px 0}
+.discord-cta{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.bad{color:#ffb4b4}.good{color:#b7ffcc}
+.card.soft{background:linear-gradient(180deg,#0f1836,#0c152b)}
+.chat-drawer{position:fixed;right:0;top:64px;bottom:0;width:var(--chatW);max-width:92vw;transform:translateX(100%);transition:transform .2s ease-out;background:linear-gradient(180deg,#0f1a33,#0b1326);border-left:1px solid var(--border);display:flex;flex-direction:column;z-index:40}
+.chat-drawer.open{transform:translateX(0)}.chat-head{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border-bottom:1px solid var(--border)}
+.chat-body{flex:1;overflow:auto;padding:10px 12px}.chat-input{display:flex;gap:8px;padding:10px 12px;border-top:1px solid var(--border)}.chat-input input{flex:1}
+.msg{margin-bottom:12px;padding-bottom:8px;border-bottom:1px dashed rgba(255,255,255,.04);position:relative}
+.msghead{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.msghead .time{margin-left:auto;color:#9eb3da;font-size:12px}
+.badge{font-size:10px;padding:3px 7px;border-radius:999px;border:1px solid var(--border);letter-spacing:.2px}
+.badge.member{background:#0c1631;color:#cfe6ff}.badge.admin{background:linear-gradient(135deg,#f59e0b,#fb923c);color:#1a1206;border-color:rgba(0,0,0,.2);font-weight:900}.badge.owner{background:linear-gradient(135deg,#3b82f6,#22c1dc);color:#041018;border-color:transparent;font-weight:900}
+.level{font-size:10px;padding:3px 7px;border-radius:999px;background:#0b1f3a;color:#cfe6ff;border:1px solid var(--border)}
+.user-link{cursor:pointer;font-weight:800;padding:2px 6px;border-radius:8px;background:#0b1f3a;border:1px solid var(--border)}
+.fab{position:fixed;right:18px;bottom:18px;width:56px;height:56px;border-radius:50%;background:linear-gradient(135deg,#3b82f6,#22c1dc);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 14px 30px rgba(59,130,246,.35), 0 4px 10px rgba(0,0,0,.35);z-index:45}
+.fab svg{width:26px;height:26px;fill:#041018}
 </style>
 </head>
 <body>
-<div class="header"><div class="header-inner">
-  <div class="left"><div class="brand"><span>🎲 GROWCB</span></div></div>
-  <div class="right">
-    <div class="bal" id="balance">--</div>
-    <img id="avatar" src="https://cdn.discordapp.com/embed/avatars/0.png"/>
+  <div class="header">
+    <div class="header-inner container">
+      <div class="left">
+        <a class="brand" href="#" id="homeLink">
+          <img class="logo" src="/img/GrowCBnobackground.png" alt="GROWCB" onerror="this.style.display='none'"/>
+          GROWCB
+        </a>
+        <div class="tabs">
+          <a class="tab active" id="tab-games">Games</a>
+          <a class="tab" id="tab-ref">Referral</a>
+          <a class="tab" id="tab-promo">Promo Codes</a>
+          <a class="tab" id="tab-lb">Leaderboard</a>
+        </div>
+      </div>
+      <div class="right" id="authArea"></div>
+    </div>
   </div>
-</div></div>
 
-<div class="container">
-  <div class="game-grid">
-    <div class="game-tile" onclick="go('crash')"><img src="/img/crash.png"></div>
-    <div class="game-tile" onclick="go('mines')"><img src="/img/mines.png"></div>
-    <div class="game-tile" onclick="go('coinflip')"><img src="/img/coinflip.png"></div>
-    <div class="game-tile" onclick="go('blackjack')"><img src="/img/blackjack.png"></div>
-    <div class="game-tile" onclick="go('pump')"><img src="/img/pump.png"></div>
+  <div class="container" style="padding-top:16px">
+    <!-- Games -->
+    <div id="page-games">
+      <div class="card">
+        <div class="hero">
+          <div class="big">Welcome to GROWCB</div>
+          <div class="discord-cta">
+            <button class="btn ghost" id="btnJoinDiscord">Join Discord</button>
+            <a class="chip" id="btnInvite" href="__INVITE__" target="_blank" rel="noopener">Invite Link</a>
+          </div>
+        </div>
+        <div class="games-grid" style="margin-top:12px">
+          <div class="game-card" id="openCrash">
+            <img class="banner" src="/img/crash.png" alt="Crash" onerror="this.style.display='none'"/>
+            <div class="title">🚀 Crash</div><div class="muted">Shared rounds • 10s betting • Live cashout</div>
+          </div>
+          <div class="game-card" id="openMines">
+            <img class="banner" src="/img/mines.png" alt="Mines" onerror="this.style.display='none'"/>
+            <div class="title">💣 Mines</div><div class="muted">5×5 board • Choose mines • Cash out anytime</div>
+          </div>
+
+          <div class="game-card" id="openCoinflip">
+            <img class="banner" src="/img/coinflip.png" alt="Coinflip" onerror="this.style.display='none'"/>
+            <div class="title">🪙 Coinflip</div><div class="muted">Quick 50/50 — coming soon</div>
+          </div>
+          <div class="game-card" id="openBlackjack">
+            <img class="banner" src="/img/blackjack.png" alt="Blackjack" onerror="this.style.display='none'"/>
+            <div class="title">🃏 Blackjack</div><div class="muted">Beat the dealer — coming soon</div>
+          </div>
+          <div class="game-card" id="openPump">
+            <img class="banner" src="/img/pump.png" alt="Pump" onerror="this.style.display='none'"/>
+            <div class="title">📈 Pump</div><div class="muted">Ride the spike — coming soon</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Crash -->
+    <div id="page-crash" style="display:none">
+      <div class="card">
+        <div class="hero">
+          <div style="display:flex;align-items:baseline;gap:10px"><div class="big" id="crNow">0.00×</div><div class="muted" id="crHint">Loading…</div></div>
+          <button class="chip" id="backToGames">← Games</button>
+        </div>
+        <div class="cr-graph-wrap" style="margin-top:10px"><canvas id="crCanvas"></canvas></div>
+        <div style="margin-top:12px"><div class="label" style="margin-bottom:4px">Previous Busts</div><div id="lastBusts" class="muted">Loading last rounds…</div></div>
+        <div class="games-grid" style="grid-template-columns:1fr 1fr;gap:12px;margin-top:8px">
+          <div class="field"><div class="label">Bet (DL)</div><input id="crBet" type="number" min="1" step="0.01" placeholder="min 1.00"/></div>
+          <div class="field"><div class="label">Auto Cashout (×) — optional</div><input id="crCash" type="number" min="1.01" step="0.01" placeholder="e.g. 2.00"/></div>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px">
+          <button class="btn primary" id="crPlace">Place Bet</button>
+          <button class="btn ok" id="crCashout" style="display:none">💸 Cash Out</button>
+          <span id="crMsg" class="muted"></span>
+        </div>
+        <div class="card soft" style="margin-top:14px"><div class="label">Your recent rounds</div><div id="crLast" class="muted">—</div></div>
+      </div>
+    </div>
+
+    <!-- Mines -->
+    <div id="page-mines" style="display:none">
+      <div class="card">
+        <div class="hero"><div class="big">💣 Mines</div><button class="chip" id="backToGames2">← Games</button></div>
+        <div class="grid-2" style="margin-top:12px">
+          <div>
+            <div id="mSetup">
+              <div class="field"><div class="label">Bet (DL)</div><input id="mBet" type="number" min="1" step="0.01" placeholder="min 1.00"/></div>
+              <div class="field" style="margin-top:10px"><div class="label">Mines (1–24)</div><input id="mMines" type="number" min="1" max="24" step="1" value="3"/></div>
+              <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:12px">
+                <button class="btn primary" id="mStart">Start Game</button>
+                <span id="mMsg" class="muted"></span>
+              </div>
+            </div>
+
+            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px">
+              <button class="btn ok" id="mCash" style="display:none">💸 Cash Out</button>
+              <span class="pill" id="mMult">Multiplier: 1.0000×</span><span class="pill" id="mPotential">Potential: —</span>
+            </div>
+
+            <div class="kpi" style="margin-top:8px"><span class="pill" id="mHash">Commit: —</span><span class="pill" id="mStatus">Status: —</span><span class="pill" id="mPicks">Picks: 0</span><span class="pill" id="mBombs">Mines: 3</span></div>
+            <div class="card soft" style="margin-top:14px"><div class="label">Recent Mines Games</div><div id="mHist" class="muted">—</div></div>
+          </div>
+          <div>
+            <div class="card soft" style="min-height:420px;display:grid;place-items:center">
+              <div id="mGrid" style="display:grid;gap:10px;grid-template-columns:repeat(5,64px)"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Coming soon placeholders -->
+    <div id="page-coinflip" style="display:none"><div class="card"><div class="hero"><div class="big">🪙 Coinflip</div><button class="chip" id="backToGames_cf">← Games</button></div><div class="muted" style="margin-top:8px">Coming soon.</div></div></div>
+    <div id="page-blackjack" style="display:none"><div class="card"><div class="hero"><div class="big">🃏 Blackjack</div><button class="chip" id="backToGames_bj">← Games</button></div><div class="muted" style="margin-top:8px">Coming soon.</div></div></div>
+    <div id="page-pump" style="display:none"><div class="card"><div class="hero"><div class="big">📈 Pump</div><button class="chip" id="backToGames_pu">← Games</button></div><div class="muted" style="margin-top:8px">Coming soon.</div></div></div>
+
+    <!-- Referral -->
+    <div id="page-ref" style="display:none">
+      <div class="card">
+        <div class="hero">
+          <div class="big">🙌 Referral Program</div>
+          <div class="discord-cta">
+            <button class="btn ghost" id="btnJoinDiscord2">Join Discord</button>
+            <a class="chip" id="btnInvite2" href="__INVITE__" target="_blank" rel="noopener">Invite Link</a>
+          </div>
+        </div>
+        <div class="sep"></div>
+        <div class="grid-2">
+          <div class="card soft">
+            <div class="label">Your Referral Handle</div>
+            <div class="row cols-2" style="margin-top:6px">
+              <div class="field"><input id="refName" placeholder="choose-handle (3-20 chars)"/></div>
+              <button class="btn primary" id="refSave">Save</button>
+            </div>
+            <div class="hint" id="refMsg" style="margin-top:6px"></div>
+            <div class="sep"></div>
+            <div class="label">Share Link</div>
+            <div class="copy" style="margin-top:6px">
+              <input id="refLink" readonly value=""/>
+              <button class="btn ghost" id="copyRef">Copy</button>
+            </div>
+          </div>
+          <div class="card soft">
+            <div class="label">Stats</div>
+            <div class="kpi" style="margin-top:8px">
+              <span class="pill">Clicks: <strong id="refClicks">0</strong></span>
+              <span class="pill">Joins: <strong id="refJoins">0</strong></span>
+            </div>
+            <div class="hint" style="margin-top:6px">Clicks count when someone opens your link. Joins count when they sign in.</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Promo -->
+    <div id="page-promo" style="display:none">
+      <div class="card">
+        <div class="hero">
+          <div class="big">🎁 Promo Codes</div>
+          <div class="discord-cta">
+            <button class="btn ghost" id="btnJoinDiscord3">Join Discord</button>
+            <a class="chip" id="btnInvite3" href="__INVITE__" target="_blank" rel="noopener">Invite Link</a>
+          </div>
+        </div>
+        <div class="sep"></div>
+        <div class="grid-2">
+          <div class="card soft">
+            <div class="label">Redeem</div>
+            <div class="row cols-2" style="margin-top:6px">
+              <div class="field"><input id="promoInput" placeholder="e.g. WELCOME10"/></div>
+              <button class="btn primary" id="redeemBtn">Redeem</button>
+            </div>
+            <div id="promoMsg" class="hint" style="margin-top:6px"></div>
+          </div>
+          <div class="card soft">
+            <div class="label">Your Redemptions</div>
+            <div id="myCodes" class="muted" style="margin-top:8px">—</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Leaderboard -->
+    <div id="page-lb" style="display:none">
+      <div class="card">
+        <div class="hero"><div class="big">🏆 Leaderboard — Top Wagered</div><div class="countdown" id="lbCountdown">—</div></div>
+        <div class="lb-controls" style="margin-top:10px">
+          <div class="seg" id="lbSeg"><button data-period="daily" class="active">Daily</button><button data-period="monthly">Monthly</button><button data-period="alltime">All-time</button></div>
+          <span class="hint">Anonymous players show as “Anonymous”. Amounts hidden for anonymous users.</span>
+        </div>
+        <div id="lbWrap" class="muted">Loading…</div>
+      </div>
+    </div>
+
+    <!-- Settings -->
+    <div id="page-settings" style="display:none">
+      <div class="card">
+        <div class="label">Settings</div>
+        <div style="margin-top:8px">
+          <label style="display:flex;align-items:center;gap:10px">
+            <input type="checkbox" id="anonToggle" style="width:auto"/>
+            <span><strong>Anonymous Mode</strong> — hide your name & wager amounts from others. You still show as “Anonymous”.</span>
+          </label>
+          <div class="hint">Takes effect immediately.</div>
+          <div id="setMsg" class="muted" style="margin-top:8px"></div>
+          <div class="sep"></div>
+          <a class="btn ghost" href="/logout" style="margin-top:6px">Logout</a>
+        </div>
+      </div>
+    </div>
+
+    <!-- Profile -->
+    <div id="page-profile" style="display:none">
+      <div class="card">
+        <div class="label">Profile</div><div id="profileBox">Loading…</div>
+        <div id="ownerPanel" class="card soft" style="display:none;margin-top:12px">
+          <div class="label">Owner / Admin Panel</div>
+          <div class="row cols-4" style="margin-top:6px">
+            <div class="field"><div class="label">Discord ID or &lt;@mention&gt;</div><input id="tIdent" placeholder="ID or <@id>"/></div>
+            <div class="field"><div class="label">Amount (+/- DL)</div><input id="tAmt" type="text" placeholder="10 or -5.25"/></div>
+            <div class="field"><div class="label">Reason (optional)</div><input id="tReason" placeholder="promo/correction/prize"/></div>
+            <div style="align-self:end"><button class="btn primary" id="tApply">Apply</button></div>
+          </div>
+          <div id="tMsg" class="hint" style="margin-top:6px"></div>
+          <div class="sep"></div>
+          <div class="row cols-3">
+            <div class="field"><div class="label">Target</div><input id="rIdent" placeholder="ID or <@id>"/></div>
+            <button class="btn" id="rAdmin">Make ADMIN</button>
+            <button class="btn" id="rMember">Make MEMBER</button>
+          </div>
+          <div id="rMsg" class="hint" style="margin-top:6px"></div>
+          <div class="sep"></div>
+          <div class="row cols-5">
+            <div class="field"><div class="label">Target</div><input id="xIdent" placeholder="ID or <@id>"/></div>
+            <div class="field"><div class="label">Seconds</div><input id="xSecs" type="number" value="600"/></div>
+            <div class="field"><div class="label">Reason</div><input id="xReason" placeholder="spam / rude / etc"/></div>
+            <button class="btn" id="xSite">Site Only</button><button class="btn" id="xBoth">Site + Discord</button>
+          </div>
+          <div id="xMsg" class="hint" style="margin-top:6px"></div>
+          <div class="sep"></div>
+          <div class="row cols-3">
+            <div class="field"><div class="label">Code (optional)</div><input id="cCode" placeholder="auto-generate if empty"/></div>
+            <div class="field"><div class="label">Amount (DL)</div><input id="cAmount" type="text" placeholder="e.g. 10 or 1.24"/></div>
+            <div class="field"><div class="label">Max Uses</div><input id="cMax" type="number" placeholder="e.g. 100"/></div>
+          </div>
+          <div style="margin-top:8px"><button class="btn primary" id="cMake">Create</button> <span id="cMsg" class="hint"></span></div>
+        </div>
+      </div>
+    </div>
   </div>
-</div>
+
+  <!-- Floating chat -->
+  <button class="fab" id="fabChat" title="Open chat"><svg viewBox="0 0 24 24"><path d="M4 4h16v12H7l-3 3V4z"/></svg></button>
+  <div class="chat-drawer" id="chatDrawer">
+    <div class="chat-head"><div>Global Chat <span id="chatNote" class="muted"></span></div><button class="chip" id="chatClose">Close</button></div>
+    <div class="chat-body" id="chatBody"></div>
+    <div class="chat-input"><input id="chatText" placeholder="Say something…"/><button class="btn primary" id="chatSend">Send</button></div>
+  </div>
 
 <script>
-async function refreshMe(){
-  try{
-    let r=await fetch('/api/me'); if(r.ok){let me=await r.json();
-      if(me.avatar_url) document.getElementById('avatar').src=me.avatar_url;
-    }}
-  catch(e){}
-  try{
-    let r2=await fetch('/api/balance'); if(r2.ok){let b=await r2.json();
-      document.getElementById('balance').textContent=b.balance.toFixed(2)+' 💎';
-    }}
-  catch(e){}
+const qs = id => document.getElementById(id);
+const j = async (url, init) => {
+  const r = await fetch(url, init);
+  if(!r.ok){
+    let t = await r.text().catch(()=> '');
+    try{ const js = JSON.parse(t); throw new Error(js.detail || js.message || t || r.statusText); }
+    catch{ throw new Error(t || r.statusText); }
+  }
+  const ct = r.headers.get('content-type')||'';
+  return ct.includes('application/json') ? r.json() : r.text();
+};
+const GEM = "💎"; const fmtDL = (n)=> `${GEM} ${(Number(n)||0).toFixed(2)} DL`;
+
+// -------- Simple router --------
+const pages = ['page-games','page-crash','page-mines','page-coinflip','page-blackjack','page-pump','page-ref','page-promo','page-lb','page-settings','page-profile'];
+function showOnly(id){
+  for(const p of pages){ const el = qs(p); if(el) el.style.display = (p===id) ? '' : 'none'; }
+  const map = {'page-games':'tab-games','page-ref':'tab-ref','page-promo':'tab-promo','page-lb':'tab-lb'};
+  for(const t of ['tab-games','tab-ref','tab-promo','tab-lb']){
+    const el = qs(t); if(el) el.classList.toggle('active', map[id]===t);
+  }
 }
-function go(g){ location.href='/'+g; }
-refreshMe();
+
+// -------- Header / Auth --------
+async function renderHeader(){
+  try{
+    const me = await j('/api/me');
+    const bal = await j('/api/balance');
+    qs('authArea').innerHTML = `
+      <button class="btn primary" id="btnJoinSmall">${me.in_guild ? 'In Discord' : 'Join Discord'}</button>
+      <span class="chip">Balance: <strong>${fmtDL(bal.balance)}</strong></span>
+      <div class="avatar-wrap">
+        <img class="avatar" id="avatarBtn" src="${me.avatar_url||''}" title="${me.username||'user'}"/>
+        <div id="userMenu" class="menu">
+          <div class="item" id="menuProfile">Profile</div>
+          <div class="item" id="menuSettings">Settings</div>
+          <a class="item" href="/logout">Logout</a>
+        </div>
+      </div>
+    `;
+    qs('btnJoinSmall').onclick = joinDiscord;
+    const menu = qs('userMenu'); const av = qs('avatarBtn');
+    av.onclick = (e)=>{ e.stopPropagation(); menu.classList.toggle('open'); };
+    document.body.addEventListener('click', ()=> menu.classList.remove('open'));
+    qs('menuProfile').onclick = ()=>{ menu.classList.remove('open'); showOnly('page-profile'); renderProfile(); };
+    qs('menuSettings').onclick = ()=>{ menu.classList.remove('open'); showOnly('page-settings'); loadSettings(); };
+  }catch(_){
+    qs('authArea').innerHTML = `<a class="btn primary" href="/login">Login with Discord</a>`;
+  }
+}
+
+// -------- Discord join --------
+async function joinDiscord(){
+  try{
+    await j('/api/discord/join', { method:'POST' });
+    alert('Joined the Discord server!');
+    renderHeader();
+  }catch(e){ alert(e.message || 'Could not join. Try relogin.'); }
+}
+for(const id of ['btnJoinDiscord','btnJoinDiscord2','btnJoinDiscord3']){
+  const el = qs(id); if(el) el.onclick = joinDiscord;
+}
+for(const id of ['btnInvite','btnInvite2','btnInvite3']){
+  const a = qs(id); if(a && a.getAttribute('href') === '__INVITE__'){ a.style.display='none'; }
+}
+
+// -------- Tabs / navigation --------
+qs('homeLink').onclick = (e)=>{ e.preventDefault(); showOnly('page-games'); };
+qs('tab-games').onclick = ()=> showOnly('page-games');
+qs('tab-ref').onclick = ()=> { showOnly('page-ref'); loadReferral(); };
+qs('tab-promo').onclick = ()=> { showOnly('page-promo'); renderPromo(); };
+qs('tab-lb').onclick = ()=> { showOnly('page-lb'); refreshLeaderboard(); };
+
+// -------- Referral --------
+async function loadReferral(){
+  try{
+    const st = await j('/api/referral/state');
+    if(st && st.name){ qs('refName').value = st.name; qs('refLink').value = location.origin + '/r/' + st.name; }
+    qs('refClicks').textContent = st.clicks||0; qs('refJoins').textContent = st.joined||0;
+  }catch(_){}
+}
+qs('refSave').onclick = async()=>{
+  const name = qs('refName').value.trim();
+  qs('refMsg').textContent = '';
+  try{
+    await j('/api/referral/set', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ name })});
+    qs('refMsg').textContent = 'Saved.'; qs('refLink').value = location.origin + '/r/' + name.toLowerCase();
+  }catch(e){ qs('refMsg').textContent = e.message; }
+};
+qs('copyRef').onclick = ()=>{
+  const inp = qs('refLink'); inp.select(); inp.setSelectionRange(0, 99999); document.execCommand('copy');
+};
+
+// -------- Promo --------
+async function renderPromo(){
+  try{
+    const my = await j('/api/promo/my');
+    qs('myCodes').innerHTML = (my.rows && my.rows.length)
+      ? '<table><thead><tr><th>Code</th><th>Redeemed</th></tr></thead><tbody>' +
+        my.rows.map(r=>`<tr><td>${r.code}</td><td>${new Date(r.redeemed_at).toLocaleString()}</td></tr>`).join('') +
+        '</tbody></table>' : '—';
+  }catch(_){ qs('myCodes').textContent = '—'; }
+}
+qs('redeemBtn').onclick = async ()=>{
+  const code = qs('promoInput').value.trim();
+  qs('promoMsg').textContent = '';
+  try{
+    const r = await j('/api/promo/redeem', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ code }) });
+    qs('promoMsg').textContent = 'Redeemed! New balance: ' + fmtDL(r.new_balance);
+    renderHeader(); renderPromo();
+  }catch(e){ qs('promoMsg').textContent = e.message; }
+};
+
+// -------- Profile / Admin --------
+async function renderProfile(){
+  try{
+    const p = await j('/api/profile');
+    const role = p.role || 'member';
+    const isOwner = (role==='owner') || (String(p.id||'') === String('__OWNER_ID__'));
+    qs('profileBox').innerHTML = `
+      <div class="games-grid" style="grid-template-columns:1fr 1fr 1fr">
+        <div class="card soft"><div class="label">Level</div><div class="big">Lv ${p.level}</div><div class="muted">${p.xp} XP • ${p.progress_pct}% to next</div></div>
+        <div class="card soft"><div class="label">Balance</div><div class="big">${fmtDL(p.balance)}</div></div>
+        <div class="card soft"><div class="label">Role</div><div class="big" style="text-transform:uppercase">${role}</div></div>
+      </div>
+    `;
+    qs('ownerPanel').style.display = isOwner ? '' : 'none';
+
+    if(isOwner){
+      qs('tApply').onclick = async ()=>{
+        qs('tMsg').textContent='';
+        try{
+          const r = await j('/api/admin/adjust',{ method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({ identifier: qs('tIdent').value.trim(), amount: qs('tAmt').value.trim(), reason: qs('tReason').value.trim() })});
+          qs('tMsg').textContent = 'OK. New balance: ' + fmtDL(r.new_balance); renderHeader();
+        }catch(e){ qs('tMsg').textContent = e.message; }
+      };
+      qs('rAdmin').onclick = ()=> setRole('admin');
+      qs('rMember').onclick = ()=> setRole('member');
+      async function setRole(role){
+        qs('rMsg').textContent='';
+        try{
+          await j('/api/admin/role',{ method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({ identifier: qs('rIdent').value.trim(), role })});
+          qs('rMsg').textContent = 'Role updated.';
+        }catch(e){ qs('rMsg').textContent = e.message; }
+      }
+      qs('xSite').onclick = ()=> timeout('site');
+      qs('xBoth').onclick = ()=> timeout('both');
+      async function timeout(which){
+        qs('xMsg').textContent='';
+        try{
+          const payload = { identifier: qs('xIdent').value.trim(), seconds: parseInt(qs('xSecs').value||'600',10), reason: qs('xReason').value.trim() };
+          const url = which==='both' ? '/api/admin/timeout_both' : '/api/admin/timeout_site';
+          await j(url, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+          qs('xMsg').textContent='Timeout set.';
+        }catch(e){ qs('xMsg').textContent = e.message; }
+      }
+      qs('cMake').onclick = async ()=>{
+        qs('cMsg').textContent='';
+        try{
+          const r = await j('/api/admin/promo/create',{ method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({ code: (qs('cCode').value||'').trim() || null, amount: qs('cAmount').value.trim(), max_uses: parseInt(qs('cMax').value||'1',10)||1 })});
+          qs('cMsg').textContent = 'Created: ' + r.code;
+        }catch(e){ qs('cMsg').textContent = e.message; }
+      };
+    }
+  }catch(_){ qs('profileBox').textContent = '—'; }
+}
+
+// -------- Settings --------
+async function loadSettings(){
+  qs('setMsg').textContent='';
+  try{ const r = await j('/api/settings/get'); qs('anonToggle').checked = !!(r && r.is_anon); }catch(_){}
+}
+qs('anonToggle')?.addEventListener('change', async (e)=>{
+  qs('setMsg').textContent='';
+  try{
+    const r = await j('/api/settings/set_anon', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ is_anon: !!e.target.checked }) });
+    qs('setMsg').textContent = r && r.ok ? 'Saved.' : 'Updated.';
+  }catch(err){ qs('setMsg').textContent = err.message; }
+});
+
+// -------- Leaderboard --------
+let lbPeriod = 'daily';
+function nextUtcMidnight(){
+  const now = new Date();
+  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()+1, 0,0,0,0));
+}
+function endOfUtcMonth(){
+  const now = new Date();
+  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth()+1, 1, 0,0,0,0));
+}
+async function refreshLeaderboard(){
+  const wrap = qs('lbWrap'); wrap.textContent = 'Loading…';
+  const res = await j('/api/leaderboard?period='+lbPeriod+'&limit=50');
+  const rows = res.rows||[];
+  const me = await j('/api/me').catch(()=>null);
+  const uid = me?.id || '';
+  const html = rows.length ? `
+    <table>
+      <thead><tr><th>#</th><th>Name</th><th>Wagered</th></tr></thead>
+      <tbody>
+        ${rows.map((r, i)=>{
+          const isMe = String(r.user_id)===String(uid);
+          const name = r.is_anon ? 'Anonymous' : r.display_name;
+          const amt = r.is_anon ? '—' : fmtDL(r.total_wagered);
+          return `<tr class="${isMe?'me-row':''} ${r.is_anon?'anon':''}"><td>${i+1}</td><td class="name">${name}</td><td>${amt}</td></tr>`;
+        }).join('')}
+      </tbody>
+    </table>` : '—';
+  wrap.innerHTML = html;
+
+  const tgt = lbPeriod==='daily' ? nextUtcMidnight() : lbPeriod==='monthly' ? endOfUtcMonth() : null;
+  if(tgt){
+    const tick = ()=>{
+      const now = new Date();
+      const ms = tgt-now; 
+      if(ms<=0){ qs('lbCountdown').textContent = 'Resets soon…'; return; }
+      const s = Math.floor(ms/1000); const h = Math.floor(s/3600); const m = Math.floor((s%3600)/60); const sc = s%60;
+      qs('lbCountdown').textContent = `Resets in ${h}h ${m}m ${sc}s`;
+      requestAnimationFrame(()=>setTimeout(tick, 500));
+    };
+    tick();
+  }else{
+    qs('lbCountdown').textContent = 'All-time';
+  }
+
+  const seg = qs('lbSeg');
+  Array.from(seg.querySelectorAll('button')).forEach(b=>{
+    b.classList.toggle('active', b.dataset.period===lbPeriod);
+    b.onclick = ()=>{ lbPeriod = b.dataset.period; refreshLeaderboard(); };
+  });
+}
+
+// -------- Crash UI --------
+const crCanvas = ()=> qs('crCanvas');
+let crPollTimer=null, crBust=null, crPhase='betting';
+function drawCrash(mult){
+  const c = crCanvas(); if(!c) return; const ctx = c.getContext('2d');
+  const w = c.width = c.clientWidth || 600; const h = c.height = c.clientHeight || 240;
+  ctx.fillStyle='#0e1833'; ctx.fillRect(0,0,w,h);
+  ctx.strokeStyle='#9eb3da'; ctx.lineWidth=2; ctx.beginPath();
+  const maxX = w-40, base=20, maxY=h-20;
+  const maxMult = Math.max(2, mult);
+  for(let x=0; x<=maxX; x++){
+    const t = x/maxX; const m = 1 + (maxMult-1)*t*t;
+    const y = maxY - (m-1)/(maxMult-1+1e-9) * (maxY-base);
+    if(x===0) ctx.moveTo(base, y); else ctx.lineTo(base+x, y);
+  }
+  ctx.stroke();
+}
+async function pollCrash(){
+  try{
+    const st = await j('/api/crash/state');
+    crPhase = st.phase;
+    crBust = st.bust;
+    qs('lastBusts').textContent = (st.last_busts||[]).map(v=> (Number(v)||0).toFixed(2)+'×').join(' • ') || '—';
+    const cashBtn = qs('crCashout');
+    const you = st.your_bet;
+    cashBtn.style.display = (you && crPhase==='running' && !you.cashed_out) ? '' : 'none';
+
+    if(crPhase==='running' && st.current_multiplier){
+      const m = Number(st.current_multiplier)||1.0;
+      qs('crNow').textContent = m.toFixed(2)+'×';
+      qs('crHint').textContent = 'In flight…';
+      drawCrash(m);
+    }else if(crPhase==='betting'){
+      qs('crNow').textContent = '0.00×';
+      const ends = st.betting_ends_at? new Date(st.betting_ends_at): null;
+      if(ends){
+        const left = Math.max(0, Math.floor((ends - new Date())/1000));
+        qs('crHint').textContent = `Betting… ${left}s`;
+      }else qs('crHint').textContent = 'Betting…';
+      drawCrash(1);
+    }else if(crPhase==='ended'){
+      qs('crNow').textContent = (Number(crBust)||0).toFixed(2)+'×';
+      qs('crHint').textContent = 'Round ended';
+      drawCrash(Number(crBust)||1);
+    }
+  }catch(e){
+    qs('crHint').textContent = e.message || 'Error';
+  }finally{
+    crPollTimer = setTimeout(pollCrash, 900);
+  }
+}
+qs('crPlace').onclick = async ()=>{
+  const bet = qs('crBet').value || '0';
+  const cash = qs('crCash').value || null;
+  qs('crMsg').textContent = '';
+  try{
+    await j('/api/crash/place', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ bet, cashout: cash? Number(cash): null })});
+    qs('crMsg').textContent = 'Bet placed.';
+  }catch(e){ qs('crMsg').textContent = e.message; }
+};
+qs('crCashout').onclick = async ()=>{
+  qs('crMsg').textContent = '';
+  try{
+    await j('/api/crash/cashout', { method:'POST' });
+    qs('crMsg').textContent = 'Cashed out!';
+  }catch(e){ qs('crMsg').textContent = e.message; }
+};
+function openCrash(){
+  showOnly('page-crash');
+  if(crPollTimer) clearTimeout(crPollTimer);
+  pollCrash();
+}
+
+// -------- Mines UI --------
+function buildMinesGrid(){
+  const grid = qs('mGrid'); grid.innerHTML='';
+  for(let i=0;i<25;i++){
+    const b = document.createElement('button');
+    b.textContent = '?';
+    b.style.width='64px'; b.style.height='64px'; b.style.borderRadius='12px';
+    b.style.border='1px solid var(--border)'; b.style.background='#0f1a33'; b.style.color='#cfe6ff';
+    b.dataset.index = i;
+    b.onclick = ()=> pickCell(i);
+    grid.appendChild(b);
+  }
+}
+async function pickCell(i){
+  try{
+    await j('/api/mines/pick?index='+i, { method:'POST' });
+    await refreshMines();
+  }catch(e){ alert(e.message); }
+}
+async function startMines(){
+  const bet = qs('mBet').value || '0';
+  const mines = parseInt(qs('mMines').value||'3',10);
+  qs('mMsg').textContent='';
+  try{
+    await j('/api/mines/start', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ bet, mines })});
+    await refreshMines();
+  }catch(e){ qs('mMsg').textContent = e.message; }
+}
+async function cashoutMines(){
+  try{
+    await j('/api/mines/cashout', { method:'POST' });
+    await refreshMines();
+  }catch(e){ alert(e.message); }
+}
+async function refreshMines(){
+  try{
+    const st = await j('/api/mines/state');
+    const grid = qs('mGrid');
+    const status = st?.status || 'idle';
+    qs('mStatus').textContent = 'Status: ' + status;
+    qs('mPicks').textContent = 'Picks: ' + (st?.picks||0);
+    qs('mBombs').textContent = 'Mines: ' + (st?.mines|| (qs('mMines').value||3));
+    qs('mHash').textContent = 'Commit: ' + (st?.commit_hash || '—');
+    qs('mMult').textContent = 'Multiplier: ' + (st?.multiplier ? (Number(st.multiplier)||1).toFixed(4)+'×' : '1.0000×');
+    qs('mPotential').textContent = 'Potential: ' + (st?.potential_win ? fmtDL(st.potential_win) : '—');
+
+    // toggle controls
+    const playing = status==='active';
+    qs('mCash').style.display = playing ? '' : 'none';
+    qs('mSetup').style.display = playing ? 'none' : '';
+
+    if(grid.children.length!==25) buildMinesGrid();
+
+    if(st?.reveals && Array.isArray(st.reveals)){
+      st.reveals.forEach((cell, idx)=>{
+        const b = grid.children[idx];
+        if(!b) return;
+        if(cell === 'u'){ b.textContent = '?'; b.disabled = false; b.style.background='#0f1a33'; }
+        else if(cell === 'g'){ b.textContent = '✅'; b.disabled = true; b.style.background='#163a2a'; }
+        else if(cell === 'b'){ b.textContent = '💣'; b.disabled = true; b.style.background='#3a1620'; }
+      });
+    }
+    // history
+    const h = await j('/api/mines/history');
+    qs('mHist').innerHTML = (h.rows && h.rows.length)
+      ? '<table><thead><tr><th>Time</th><th>Bet</th><th>Mines</th><th>Win</th><th>Status</th></tr></thead><tbody>' +
+        h.rows.map(r=>`<tr><td>${new Date(r.started_at).toLocaleString()}</td><td>${fmtDL(r.bet)}</td><td>${r.mines}</td><td>${fmtDL(r.win)}</td><td>${r.status}</td></tr>`).join('') +
+        '</tbody></table>' : '—';
+  }catch(_){}
+}
+qs('mStart').onclick = startMines;
+qs('mCash').onclick = cashoutMines;
+
+// -------- Chat UI --------
+let chatOpen = false, chatTimer=null, lastChatId=0;
+function toggleChat(open){
+  chatOpen = open;
+  qs('chatDrawer').classList.toggle('open', open);
+  if(open){ pollChat(); } else { if(chatTimer) clearTimeout(chatTimer); }
+}
+qs('fabChat').onclick = ()=> toggleChat(true);
+qs('chatClose').onclick = ()=> toggleChat(false);
+
+async function pollChat(){
+  try{
+    const r = await j('/api/chat/fetch?since='+lastChatId+'&limit=50');
+    const arr = r.rows||[];
+    if(arr.length){
+      const body = qs('chatBody');
+      for(const m of arr){
+        lastChatId = Math.max(lastChatId, m.id||0);
+        const row = document.createElement('div'); row.className='msg';
+        row.innerHTML = `
+          <div class="msghead">
+            <span class="user-link">${m.username}</span>
+            <span class="badge ${m.role}">${m.role}</span>
+            <span class="level">Lv ${m.level}</span>
+            <span class="time">${new Date(m.created_at).toLocaleTimeString()}</span>
+          </div>
+          <div>${escapeHtml(m.text)}</div>
+        `;
+        body.appendChild(row);
+      }
+      qs('chatBody').scrollTop = qs('chatBody').scrollHeight;
+    }
+  }catch(_){}
+  finally{
+    chatTimer = setTimeout(pollChat, 1200);
+  }
+}
+function escapeHtml(s){
+  return String(s||'').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+qs('chatSend').onclick = async ()=>{
+  const t = qs('chatText').value.trim();
+  if(!t) return;
+  try{
+    await j('/api/chat/send', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ text: t })});
+    qs('chatText').value = '';
+  }catch(e){ alert(e.message); }
+};
+
+// -------- Games navigation --------
+qs('openCrash').onclick = openCrash;
+qs('backToGames').onclick = ()=>{ showOnly('page-games'); if(crPollTimer) clearTimeout(crPollTimer); };
+qs('openMines').onclick = ()=>{ showOnly('page-mines'); refreshMines(); };
+qs('backToGames2').onclick = ()=> showOnly('page-games');
+qs('openCoinflip').onclick = ()=> showOnly('page-coinflip');
+qs('backToGames_cf').onclick = ()=> showOnly('page-games');
+qs('openBlackjack').onclick = ()=> showOnly('page-blackjack');
+qs('backToGames_bj').onclick = ()=> showOnly('page-games');
+qs('openPump').onclick = ()=> showOnly('page-pump');
+qs('backToGames_pu').onclick = ()=> showOnly('page-games');
+
+// -------- Boot --------
+(async function boot(){
+  buildMinesGrid();
+  showOnly('page-games');
+  renderHeader();
+  refreshLeaderboard();
+})();
 </script>
-</body></html>
+</body>
+</html>
 """
 
+# ---------- Root page ----------
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    return HTML_TEMPLATE
+    html = HTML_TEMPLATE.replace("__INVITE__", DISCORD_INVITE or "__INVITE__") \
+                        .replace("__OWNER_ID__", str(OWNER_ID))
+    return HTMLResponse(html)
 
-# ---------- Run ----------
+# ---------- Utility: run local (optional) ----------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=True)
-

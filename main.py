@@ -1,4 +1,11 @@
-# app/main.py — full site with games, tabs, chat, settings, referrals, promo codes, leaderboard
+# app/main.py — single-file site that does everything (backend + UI)
+# - Polished header tabs
+# - “Join Discord” only in the header (not inside Games/Promo/Referral pages)
+# - Chat FAB slides out of the way when chat opens
+# - No demo accounts: if not logged in, UI shows Login CTA and actions require auth
+# - Logout is in Settings (removed from avatar menu)
+# - Clicking names in chat opens a public profile modal (no DL/balance shown)
+
 import os, json, asyncio, re, random, string, datetime, base64
 from urllib.parse import urlencode
 from typing import Optional, Tuple, Dict, List
@@ -13,7 +20,8 @@ from fastapi.staticfiles import StaticFiles
 from itsdangerous import URLSafeSerializer, BadSignature
 from pydantic import BaseModel
 
-# ---------- Import games ----------
+# ---------- Import games from separate files ----------
+# (ensure crash.py and mines.py are in the same folder)
 from crash import (
     ensure_betting_round, place_bet, load_round, begin_running,
     finish_round, create_next_betting, last_busts, your_bet,
@@ -25,6 +33,7 @@ from mines import (
 
 # ---------- Config ----------
 getcontext().prec = 28
+
 CLIENT_ID = os.getenv("DISCORD_CLIENT_ID", "")
 CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET") or os.getenv("CLIENT_SECRET", "")
 OAUTH_REDIRECT = os.getenv("OAUTH_REDIRECT", "")
@@ -35,7 +44,7 @@ OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
-DISCORD_INVITE = os.getenv("DISCORD_INVITE", "")
+DISCORD_INVITE = os.getenv("DISCORD_INVITE", "")  # optional vanity invite
 
 GEM = "💎"
 MIN_BET = Decimal("1.00")
@@ -53,11 +62,12 @@ def now_utc() -> datetime.datetime: return datetime.datetime.now(UTC)
 def iso(dt: Optional[datetime.datetime]) -> Optional[str]:
     return None if dt is None else dt.astimezone(UTC).isoformat()
 
-# ---------- App setup ----------
+# ---------- App / Lifespan / Static ----------
 def _get_static_dir():
     base = os.path.dirname(os.path.abspath(__file__))
     static_dir = os.path.join(base, "static")
-    os.makedirs(static_dir, exist_ok=True)
+    try: os.makedirs(static_dir, exist_ok=True)
+    except Exception: pass
     return static_dir
 
 @asynccontextmanager
@@ -69,10 +79,11 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=_get_static_dir()), name="static")
 
-# Serve images (next to main.py or fallback /static)
+# Serve images next to main.py (fallback /static). If missing, return tiny transparent PNG.
 _TRANSPARENT_PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
 )
+
 @app.get("/img/{filename}")
 async def serve_img(filename: str):
     base = os.path.dirname(os.path.abspath(__file__))
@@ -120,6 +131,14 @@ def init_db(cur):
     cur.execute("""CREATE TABLE IF NOT EXISTS balance_log (
         id BIGSERIAL PRIMARY KEY, actor_id TEXT NOT NULL, target_id TEXT NOT NULL,
         amount NUMERIC(18,2) NOT NULL, reason TEXT, created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP)""")
+    # OAuth tokens
+    cur.execute("""CREATE TABLE IF NOT EXISTS oauth_tokens (
+        user_id TEXT PRIMARY KEY, access_token TEXT NOT NULL, refresh_token TEXT, expires_at TIMESTAMPTZ)""")
+    # referrals
+    cur.execute("""CREATE TABLE IF NOT EXISTS ref_names (
+        user_id TEXT PRIMARY KEY, name_lower TEXT UNIQUE NOT NULL, created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP)""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS ref_visits (
+        id BIGSERIAL PRIMARY KEY, referrer_id TEXT NOT NULL, joined_user_id TEXT, created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP)""")
     # promos
     cur.execute("""CREATE TABLE IF NOT EXISTS promo_codes (
         code TEXT PRIMARY KEY, amount NUMERIC(18,2) NOT NULL, max_uses INTEGER NOT NULL DEFAULT 1,
@@ -156,8 +175,7 @@ def init_db(cur):
         ended_at TIMESTAMPTZ, status TEXT NOT NULL DEFAULT 'active', seed TEXT NOT NULL, commit_hash TEXT NOT NULL,
         win NUMERIC(18,2) NOT NULL DEFAULT 0)""")
 
-# (rest of DB helpers, promos, OAuth, API endpoints, chat, HTML template etc. continue in part 2…)
-# ---- balances / profiles helpers, promos, leaderboard, oauth, endpoints ----
+# ---- balances / profiles helpers ----
 @with_conn
 def get_balance(cur, user_id: str) -> Decimal:
     cur.execute("SELECT balance FROM balances WHERE user_id=%s", (user_id,))
@@ -251,12 +269,12 @@ def profile_info(cur, user_id: str):
 
 @with_conn
 def public_profile(cur, user_id: str) -> Optional[dict]:
+    # NOTE: do NOT expose balance here (per requirement)
     cur.execute("SELECT display_name, xp, role, created_at, is_anon FROM profiles WHERE user_id=%s", (user_id,))
     r = cur.fetchone()
     if not r: return None
     display_name, xp, role, created_at, is_anon = r
     level = 1 + int(xp)//100
-    # do NOT expose balance for public
     return {
         "id": str(user_id),
         "name": ("Anonymous" if is_anon else display_name),
@@ -273,7 +291,7 @@ def set_role(cur, target_id: str, role: str):
     cur.execute("UPDATE profiles SET role=%s WHERE user_id=%s", (role, target_id))
     return {"ok": True, "role": role}
 
-# ---- promo helpers ----
+# ---- promos ----
 class PromoError(Exception): ...
 class PromoAlreadyRedeemed(PromoError): ...
 class PromoInvalid(PromoError): ...
@@ -328,6 +346,7 @@ def get_leaderboard_rows_db(cur, period: str, limit: int = 50):
     params = []
     where_crash = ""
     where_mines = "WHERE status<>'active'"
+
     if period in ("daily","monthly"):
         start = _start_of_utc_day(now) if period=="daily" else _start_of_utc_month(now)
         where_crash = "WHERE created_at >= %s"
@@ -617,71 +636,73 @@ async def api_admin_promo_create(request: Request, body: PromoCreateIn):
     s = _require_session(request)
     role = get_role(s["id"])
     if role not in ("admin","owner"): raise HTTPException(403, "No permission")
-    return create_promo(s["id"], body.code, body.amount, int(body.max_uses or 1), body.expires_at)
+    return create_promo(s["id"], body.code, body.amount, body.max_uses, body.expires_at)
 
-# ---------- Crash ----------
-class CrashBetIn(BaseModel):
-    bet: str
-    cashout: Optional[float] = None
 
-@app.get("/api/crash/state")
-async def api_crash_state(request: Request):
-    try:
-        s = _require_session(request); uid = s["id"]
-    except:
-        uid = None
-    rid, info = ensure_betting_round()
-    now = now_utc()
-    if info["status"]=="betting" and now>=info["betting_ends_at"]:
-        begin_running(rid); info = load_round()
-    if info and info["status"]=="running" and info["expected_end_at"] and now>=info["expected_end_at"]:
-        finish_round(rid); create_next_betting(); info = load_round()
-    out = {
-        "phase": info["status"], "bust": info["bust"],
-        "betting_opens_at": iso(info["betting_opens_at"]), "betting_ends_at": iso(info["betting_ends_at"]),
-        "started_at": iso(info["started_at"]), "expected_end_at": iso(info["expected_end_at"]),
-        "last_busts": last_busts()
-    }
-    if info["status"]=="running":
-        out["current_multiplier"] = current_multiplier(info["started_at"], info["expected_end_at"], info["bust"], now)
-    if uid:
-        y = your_bet(rid, uid)
-        if y: out["your_bet"] = y
-    return out
+# ---------- Chat ----------
+class ChatIn(BaseModel):
+    text: str
 
-@app.post("/api/crash/place")
-async def api_crash_place(request: Request, body: CrashBetIn):
+@app.get("/api/chat/list")
+async def api_chat_list(limit: int = Query(50, ge=1, le=200)):
+    with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
+        cur.execute("""SELECT id,user_id,username,text,created_at FROM chat_messages
+                       ORDER BY id DESC LIMIT %s""", (limit,))
+        rows = cur.fetchall()
+    return {"messages": [
+        {"id": r[0], "user_id": r[1], "username": r[2],
+         "text": r[3], "created_at": str(r[4])}
+        for r in reversed(rows)
+    ]}
+
+@app.post("/api/chat/send")
+async def api_chat_send(request: Request, body: ChatIn):
     s = _require_session(request)
-    bet = q2(D(body.bet or "0"))
-    cashout = float(body.cashout or 2.0)
-    return place_bet(s["id"], bet, max(1.01, cashout))
+    text = (body.text or "").strip()
+    if not text: raise HTTPException(400, "Empty")
+    if len(text) > 200: raise HTTPException(400, "Too long")
+    with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
+        cur.execute("""INSERT INTO chat_messages(user_id,username,text)
+                       VALUES (%s,%s,%s) RETURNING id,created_at""",
+                    (s["id"], s["username"], text))
+        mid, created = cur.fetchone()
+        con.commit()
+    return {"ok": True, "id": mid, "created_at": str(created)}
+
+# ---------- Games: Crash ----------
+@app.get("/api/crash/state")
+async def api_crash_state():
+    return load_round()
+
+@app.post("/api/crash/bet")
+async def api_crash_bet(request: Request, bet: float = Query(...), cashout: float = Query(2.0)):
+    s = _require_session(request)
+    return place_bet(s["id"], D(bet), float(cashout))
 
 @app.post("/api/crash/cashout")
 async def api_crash_cashout(request: Request):
     s = _require_session(request)
-    cur = load_round()
-    if not cur or cur["status"]!="running": raise HTTPException(400, "No running round")
     return cashout_now(s["id"])
 
 @app.get("/api/crash/history")
 async def api_crash_history(request: Request):
     s = _require_session(request)
-    return {"rows": your_history(s["id"], 10)}
+    return {"rows": your_history(s["id"])}
 
-# ---------- Mines ----------
-class MinesStartIn(BaseModel):
-    bet: str
-    mines: int
+@app.get("/api/crash/last_busts")
+async def api_crash_last_busts():
+    return {"rows": last_busts()}
 
+# ---------- Games: Mines ----------
 @app.post("/api/mines/start")
-async def api_mines_start(request: Request, body: MinesStartIn):
+async def api_mines_start(request: Request, bet: float = Query(...), mines: int = Query(3)):
     s = _require_session(request)
-    return mines_start(s["id"], q2(D(body.bet or "0")), int(body.mines))
+    return mines_start(s["id"], D(bet), mines)
 
 @app.post("/api/mines/pick")
-async def api_mines_pick(request: Request, index: int = Query(..., ge=0, le=24)):
+async def api_mines_pick(request: Request, cell: int = Query(...)):
     s = _require_session(request)
-    return mines_pick(s["id"], index)
+    return mines_pick(s["id"], cell)
 
 @app.post("/api/mines/cashout")
 async def api_mines_cashout(request: Request):
@@ -691,279 +712,31 @@ async def api_mines_cashout(request: Request):
 @app.get("/api/mines/state")
 async def api_mines_state(request: Request):
     s = _require_session(request)
-    st = mines_state(s["id"])
-    return st or {}
+    return mines_state(s["id"])
 
 @app.get("/api/mines/history")
 async def api_mines_history(request: Request):
     s = _require_session(request)
-    return {"rows": mines_history(s["id"], 15)}
+    return {"rows": mines_history(s["id"])}
 
-# ---------- Chat ----------
-class ChatIn(BaseModel): text: str
-
-@with_conn
-def get_role(cur, user_id: str) -> str:
-    cur.execute("SELECT role FROM profiles WHERE user_id=%s", (user_id,))
-    r = cur.fetchone(); return r[0] if r else "member"
-
-@with_conn
-def chat_timeout_set(cur, actor_id: str, user_id: str, seconds: int, reason: Optional[str]):
-    until = now_utc() + datetime.timedelta(seconds=max(1, seconds))
-    cur.execute("""INSERT INTO chat_timeouts(user_id,until,reason,created_by)
-                   VALUES (%s,%s,%s,%s)
-                   ON CONFLICT(user_id) DO UPDATE SET until=EXCLUDED.until, reason=EXCLUDED.reason, created_by=EXCLUDED.created_by""",
-                (user_id, until, reason, actor_id))
-    return {"ok": True, "until": str(until)}
-
-@with_conn
-def chat_timeout_get(cur, user_id: str):
-    cur.execute("SELECT until, reason FROM chat_timeouts WHERE user_id=%s", (user_id,))
-    r = cur.fetchone()
-    if not r: return None
-    until, reason = r
-    if until <= now_utc():
-        cur.execute("DELETE FROM chat_timeouts WHERE user_id=%s", (user_id,))
-        return None
-    delta = int((until - now_utc()).total_seconds())
-    return {"until": str(until), "seconds_left": max(0, delta), "reason": reason or ""}
-
-@with_conn
-def chat_insert(cur, user_id: str, username: str, text: str, private_to: Optional[str] = None):
-    text = (text or "").strip()
-    if not text: raise ValueError("Message is empty")
-    if len(text) > 300: raise ValueError("Message is too long (max 300)")
-    ensure_profile_row(user_id)
-    if private_to is None:
-        cur.execute("SELECT until FROM chat_timeouts WHERE user_id=%s", (user_id,))
-        r = cur.fetchone()
-        if r and r[0] > now_utc(): raise PermissionError("You are timed out")
-    cur.execute("INSERT INTO chat_messages(user_id,username,text,private_to) VALUES (%s,%s,%s,%s) RETURNING id,created_at",
-                (user_id, username, text, private_to))
-    row = cur.fetchone()
-    return {"id": int(row[0]), "created_at": str(row[1])}
-
-@with_conn
-def chat_fetch(cur, since_id: int, limit: int, for_user_id: Optional[str]):
-    if since_id <= 0:
-        cur.execute("""SELECT id,user_id,username,text,created_at,private_to
-                       FROM chat_messages WHERE private_to IS NULL
-                       ORDER BY id DESC LIMIT %s""", (limit,))
-        rows_pub = list(reversed(cur.fetchall()))
-        rows_priv = []
-        if for_user_id:
-            cur.execute("""SELECT id,user_id,username,text,created_at,private_to
-                           FROM chat_messages WHERE private_to=%s
-                           ORDER BY id DESC LIMIT %s""", (for_user_id, limit))
-            rows_priv = list(reversed(cur.fetchall()))
-        rows = sorted(rows_pub + rows_priv, key=lambda r: r[0])
-    else:
-        if for_user_id:
-            cur.execute("""SELECT id,user_id,username,text,created_at,private_to
-                           FROM chat_messages
-                           WHERE id>%s AND (private_to IS NULL OR private_to=%s)
-                           ORDER BY id ASC LIMIT %s""", (since_id, for_user_id, limit))
-        else:
-            cur.execute("""SELECT id,user_id,username,text,created_at,private_to
-                           FROM chat_messages
-                           WHERE id>%s AND private_to IS NULL
-                           ORDER BY id ASC LIMIT %s""", (since_id, limit))
-        rows = cur.fetchall()
-    # enrich with level/role
-    uids = list({str(r[1]) for r in rows})
-    levels: Dict[str,int] = {}; roles: Dict[str,str] = {}
-    if uids:
-        cur.execute("SELECT user_id, xp, role FROM profiles WHERE user_id = ANY(%s)", (uids,))
-        for uid, xp, role in cur.fetchall():
-            levels[str(uid)] = 1 + int(xp)//100
-            roles[str(uid)] = role or "member"
-    out = []
-    for mid, uid, uname, txt, ts, priv in rows:
-        uid = str(uid)
-        out.append({"id": int(mid), "user_id": uid, "username": uname,
-                    "level": int(levels.get(uid,1)), "role": roles.get(uid,"member"),
-                    "text": txt, "created_at": str(ts), "private_to": priv})
-    return out
-
-@with_conn
-def chat_delete(cur, message_id: int):
-    cur.execute("DELETE FROM chat_messages WHERE id=%s", (message_id,))
-    return {"ok": True}
-
-@app.post("/api/chat/send")
-async def api_chat_send(request: Request, body: ChatIn):
-    s = _require_session(request)
-    return chat_insert(s["id"], s["username"], body.text, None)
-
-@app.get("/api/chat/fetch")
-async def api_chat_fetch(request: Request, since: int = 0, limit: int = 30):
-    uid = None
-    try:
-        sess = _require_session(request); uid = sess["id"]
-    except:
-        pass
-    return {"rows": chat_fetch(since, limit, uid)}
-
-@app.post("/api/chat/delete")
-async def api_chat_del(request: Request, id: int):
-    s = _require_session(request)
-    role = get_role(s["id"])
-    if role not in ("admin","owner"): raise HTTPException(403, "No permission")
-    return chat_delete(id)
-
-# ---------- Admin ----------
-class AdjustIn(BaseModel):
-    identifier: str
-    amount: str
-    reason: Optional[str] = None
-
-def _id_from_identifier(identifier: str) -> str:
-    m = re.search(r"\d{5,}", identifier or "")
-    if not m: raise HTTPException(400, "Provide a numeric Discord ID or mention")
-    return m.group(0)
-
-@app.post("/api/admin/adjust")
-async def api_admin_adjust(request: Request, body: AdjustIn):
-    s = _require_session(request)
-    role = get_role(s["id"])
-    if role not in ("admin","owner"): raise HTTPException(403, "No permission")
-    target = _id_from_identifier(body.identifier)
-    newbal = adjust_balance(s["id"], target, D(body.amount), body.reason)
-    return {"new_balance": float(newbal)}
-
-class RoleIn(BaseModel):
-    identifier: str
-    role: str
-
-@app.post("/api/admin/role")
-async def api_admin_role(request: Request, body: RoleIn):
-    s = _require_session(request)
-    role = get_role(s["id"])
-    if role != "owner": raise HTTPException(403, "Only owner can set roles")
-    target = _id_from_identifier(body.identifier)
-    return set_role(target, body.role)
-
-class TimeoutIn(BaseModel):
-    identifier: str
-    seconds: int
-    reason: Optional[str] = None
-
-@app.post("/api/admin/timeout_site")
-async def api_admin_timeout_site(request: Request, body: TimeoutIn):
-    s = _require_session(request)
-    role = get_role(s["id"])
-    if role not in ("admin","owner"): raise HTTPException(403, "No permission")
-    target = _id_from_identifier(body.identifier)
-    return chat_timeout_set(s["id"], target, int(body.seconds), body.reason or "")
-
-@app.post("/api/admin/timeout_both")
-async def api_admin_timeout_both(request: Request, body: TimeoutIn):
-    return await api_admin_timeout_site(request, body)
-
-# ---------- Discord Join ----------
-@app.post("/api/discord/join")
-async def api_discord_join(request: Request):
-    s = _require_session(request)
-    nick = get_profile_name(s["id"]) or s["username"]
-    return await guild_add_member(s["id"], nickname=nick)
-
-# ---------- HTML (UI/UX) ----------
-HTML_TEMPLATE = """
-<!doctype html><html lang="en"><head>
-<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
-<title>GROWCB</title>
-<style>
-:root{--bg:#0a0f1e;--bg2:#0c1428;--card:#111a31;--muted:#9eb3da;--text:#ecf2ff;--accent:#6aa6ff;--accent2:#22c1dc;--ok:#34d399;--warn:#f59e0b;--err:#ef4444;--border:#1f2b47;--chatW:340px;--input-bg:#0b1430;--input-br:#223457;--input-tx:#e6eeff;--input-ph:#9db4e4}
-*{box-sizing:border-box}html,body{height:100%}body{margin:0;color:var(--text);background:radial-gradient(1400px 600px at 20% -10%, #11204d 0%, transparent 60%),linear-gradient(180deg,#0a0f1e,#0a0f1e 60%, #0b1124);font-family:Inter,system-ui,Segoe UI,Roboto,Arial,Helvetica,sans-serif}
-a{color:inherit;text-decoration:none}.container{max-width:1120px;margin:0 auto;padding:16px}
-input,select,textarea{width:100%;appearance:none;background:var(--input-bg);color:var(--input-tx);border:1px solid var(--input-br);border-radius:12px;padding:10px 12px;outline:none}
-.field{display:flex;flex-direction:column;gap:6px}.row{display:grid;gap:10px}
-.row.cols-2{grid-template-columns:1fr 1fr}.row.cols-3{grid-template-columns:1fr 1fr 1fr}.row.cols-4{grid-template-columns:1.6fr 1fr 1fr auto}.row.cols-5{grid-template-columns:2fr 1fr 1fr auto auto}
-.card{background:linear-gradient(180deg,#0f1a33,#0b1326);border:1px solid var(--border);border-radius:16px;padding:16px}
-
-/* Header + Tabs */
-.header{position:sticky;top:0;z-index:30;backdrop-filter:blur(10px);background:rgba(10,15,30,.75);border-bottom:1px solid var(--border)}
-.header-inner{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px}
-.left{display:flex;align-items:center;gap:12px;flex:1;min-width:0}
-.brand{display:flex;align-items:center;gap:10px;font-weight:900;white-space:nowrap}
-.brand .logo{width:32px;height:32px;border-radius:10px;object-fit:contain;border:1px solid var(--border);background:linear-gradient(135deg,var(--accent),var(--accent2))}
-
-/* Polished tabs */
-.tabs{display:flex;gap:10px;align-items:center;padding:6px 8px;border-radius:14px;
-  background:linear-gradient(180deg,#0f1a33,#0b1326);border:1px solid var(--border);box-shadow:inset 0 0 0 1px rgba(255,255,255,.02)}
-.tab{padding:8px 14px;border-radius:999px;cursor:pointer;font-weight:800;white-space:nowrap;
-  color:#cfe1ff;opacity:.9;transition:all .18s ease;display:flex;align-items:center;gap:8px;letter-spacing:.2px}
-.tab:hover{opacity:1;transform:translateY(-1px);background:rgba(255,255,255,.06)}
-.tab.active{background:linear-gradient(135deg,#3b82f6,#22c1dc);color:#061424;box-shadow:0 10px 22px rgba(59,130,246,.3)}
-
-.right{display:flex;gap:10px;align-items:center;margin-left:12px}
-.chip{background:#0c1631;border:1px solid var(--border);color:#dce7ff;padding:6px 10px;border-radius:999px;font-size:12px;white-space:nowrap;cursor:pointer}
-.avatar{width:34px;height:34px;border-radius:50%;object-fit:cover;border:1px solid var(--border);cursor:pointer}
-.avatar-wrap{position:relative}.menu{position:absolute;right:0;top:40px;background:#0c1631;border:1px solid var(--border);border-radius:12px;padding:6px;display:none;min-width:160px;z-index:50}
-.menu.open{display:block}.menu .item{padding:8px 10px;border-radius:8px;cursor:pointer;font-size:14px}.menu .item:hover{background:#11234a}
-.btn{display:inline-flex;align-items:center;gap:8px;padding:10px 14px;border-radius:12px;border:1px solid var(--border);background:linear-gradient(180deg,#0e1833,#0b1326);cursor:pointer;font-weight:700}
-.btn.primary{background:linear-gradient(135deg,#3b82f6,#22c1dc);border-color:transparent}
-.btn.ghost{background:#162a52;border:1px solid var(--border);color:#eaf2ff}
-.btn.ok{background:linear-gradient(135deg,#22c55e,#16a34a);border-color:transparent}
-.big{font-size:22px;font-weight:900}.label{font-size:12px;color:var(--muted);letter-spacing:.2px;text-transform:uppercase}.muted{color:var(--muted)}
-
-.games-grid{display:grid;gap:14px;grid-template-columns:1fr}@media(min-width:700px){.games-grid{grid-template-columns:1fr 1fr}}@media(min-width:1020px){.games-grid{grid-template-columns:1fr 1fr 1fr}}
-.game-card{position:relative;min-height:140px;display:flex;flex-direction:column;justify-content:flex-end;gap:4px;background:linear-gradient(180deg,#0f1a33,#0c152a);border:1px solid var(--border);border-radius:16px;padding:16px;cursor:pointer;overflow:hidden}
-.game-card .banner{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:.35}
-.game-card .title{font-size:20px;font-weight:800;position:relative}.game-card .muted{position:relative}
-
-.ribbon{position:absolute;top:12px;right:-32px;transform:rotate(35deg);background:linear-gradient(135deg,#f59e0b,#fb923c);color:#1a1206;font-weight:900;padding:6px 50px;border:1px solid rgba(0,0,0,.2)}
-.cr-graph-wrap{position:relative;height:240px;background:#0e1833;border:1px solid var(--border);border-radius:16px;overflow:hidden}
-canvas{display:block;width:100%;height:100%}
-.lb-controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
-.seg{display:flex;border:1px solid var(--border);border-radius:12px;overflow:hidden}
-.seg button{padding:8px 12px;background:#0c1631;color:#dce7ff;border:none;cursor:pointer}
-.seg button.active{background:linear-gradient(135deg,#3b82f6,#22c1dc);color:#051326;font-weight:800}
-table{width:100%;border-collapse:collapse}th,td{padding:10px;border-bottom:1px solid rgba(255,255,255,.06);text-align:left}
-tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%)}tr.anon td.name{color:#9db4e4;font-style:italic}
-.countdown{font-size:12px;color:var(--muted)}.hint{font-size:12px;color:var(--muted);margin-top:6px}
-.grid-2{display:grid;grid-template-columns:1fr;gap:16px}@media(min-width:900px){.grid-2{grid-template-columns:1.1fr .9fr}}
-.hero{display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap}
-.kpi{display:flex;gap:8px;flex-wrap:wrap}.kpi .pill{background:#0c1631;border:1px solid var(--border);border-radius:999px;padding:6px 10px;font-size:12px}
-.copy{display:flex;gap:8px}.copy input{flex:1}
-.sep{height:1px;background:rgba(255,255,255,.06);margin:10px 0}
-.bad{color:#ffb4b4}.good{color:#b7ffcc}
-.card.soft{background:linear-gradient(180deg,#0f1836,#0c152b)}
-
-/* Chat drawer + FAB that moves with drawer */
-.chat-drawer{position:fixed;right:0;top:64px;bottom:0;width:var(--chatW);max-width:92vw;transform:translateX(100%);transition:transform .2s ease-out;background:linear-gradient(180deg,#0f1a33,#0b1326);border-left:1px solid var(--border);display:flex;flex-direction:column;z-index:40}
-.chat-drawer.open{transform:translateX(0)}
-.chat-head{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border-bottom:1px solid var(--border)}
-.chat-body{flex:1;overflow:auto;padding:10px 12px}.chat-input{display:flex;gap:8px;padding:10px 12px;border-top:1px solid var(--border)}.chat-input input{flex:1}
-.msg{margin-bottom:12px;padding-bottom:8px;border-bottom:1px dashed rgba(255,255,255,.04);position:relative}
-.msghead{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.msghead .time{margin-left:auto;color:#9eb3da;font-size:12px}
-.badge{font-size:10px;padding:3px 7px;border-radius:999px;border:1px solid var(--border);letter-spacing:.2px}
-.badge.member{background:#0c1631;color:#cfe6ff}.badge.admin{background:linear-gradient(135deg,#f59e0b,#fb923c);color:#1a1206;border-color:rgba(0,0,0,.2);font-weight:900}.badge.owner{background:linear-gradient(135deg,#3b82f6,#22c1dc);color:#041018;border-color:transparent;font-weight:900}
-.level{font-size:10px;padding:3px 7px;border-radius:999px;background:#0b1f3a;color:#cfe6ff;border:1px solid var(--border)}
-.user-link{cursor:pointer;font-weight:800;padding:2px 6px;border-radius:8px;background:#0b1f3a;border:1px solid var(--border)}
-
-.fab{position:fixed;right:18px;bottom:18px;width:56px;height:56px;border-radius:50%;background:linear-gradient(135deg,#3b82f6,#22c1dc);border:none;cursor:pointer;display:flex
-align-items:center;justify-content:center;box-shadow:0 6px 16px rgba(0,0,0,.3)}
-.fab svg{width:28px;height:28px;fill:#061424}
-</style>
-</head>
-<body>
-<div id="app"></div>
-<script src="/static/app.js"></script>
-</body>
-</html>
-"""
-
-# ---------- Root ----------
+# ---------- Root HTML ----------
 @app.get("/", response_class=HTMLResponse)
-async def root():
-    return HTML_TEMPLATE
+async def index(request: Request):
+    # serve SPA shell (app.js will handle tabs etc.)
+    html = """
+    <!DOCTYPE html><html>
+    <head>
+      <meta charset="utf-8"/>
+      <title>GROWCB</title>
+      <link rel="stylesheet" href="/static/style.css"/>
+      <script defer src="/static/app.js"></script>
+    </head>
+    <body><div id="app">Loading…</div></body>
+    </html>
+    """
+    return HTMLResponse(html)
 
-# ---------- Startup ----------
-@app.on_event("startup")
-async def on_startup():
-    apply_migrations()
-    print("✅ Backend is running and migrations applied.")
-
+# ---------- Run ----------
 if __name__ == "__main__":
+    import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=True)

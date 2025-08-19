@@ -1,6 +1,6 @@
-# app/main.py — GrowCB full site + Discord bot
+# app/main.py — GrowCB full website + Discord bot
 
-import os, json, asyncio, re, random, string, datetime, base64
+import os, json, asyncio, re, random, string, datetime
 from urllib.parse import urlencode
 from typing import Optional, Dict
 from decimal import Decimal, ROUND_DOWN, getcontext
@@ -8,7 +8,7 @@ from decimal import Decimal, ROUND_DOWN, getcontext
 import httpx
 import psycopg
 from fastapi import FastAPI, Request, HTTPException, Query
-from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse, Response
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from itsdangerous import URLSafeSerializer, BadSignature
 from pydantic import BaseModel
@@ -49,7 +49,7 @@ def q2(x): return D(x).quantize(TWO, rounding=ROUND_DOWN)
 UTC = datetime.timezone.utc
 def now_utc(): return datetime.datetime.now(UTC)
 
-# ---------- FastAPI + static ----------
+# ---------- FastAPI ----------
 app = FastAPI()
 base = os.path.dirname(os.path.abspath(__file__))
 app.mount("/static", StaticFiles(directory=os.path.join(base, "static")), name="static")

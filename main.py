@@ -1,8 +1,8 @@
-# app/main.py — full GrowCB site + Discord bot
+# app/main.py — GrowCB full site + Discord bot
 
 import os, json, asyncio, re, random, string, datetime, base64
 from urllib.parse import urlencode
-from typing import Optional, Dict, List
+from typing import Optional, Dict
 from decimal import Decimal, ROUND_DOWN, getcontext
 
 import httpx
@@ -379,7 +379,13 @@ async def index():
 async def startup_event():
     init_db()
     if DISCORD_BOT_TOKEN:
-        asyncio.create_task(bot.start(DISCORD_BOT_TOKEN))
+        async def run_bot():
+            try:
+                await bot.start(DISCORD_BOT_TOKEN)
+            except Exception as e:
+                print("❌ Bot failed:", e)
+        asyncio.create_task(run_bot())
+    print("🚀 Website + Bot running")
 
 @app.on_event("shutdown")
 async def shutdown_event():

@@ -1,4 +1,4 @@
-# app/main.py — single-file site; images can sit next to main.py (no /static folder required)
+# app/main.py — single-file FastAPI site + Discord bot + UI (Part 1/2)
 
 import os, json, asyncio, re, random, string, datetime, base64
 from urllib.parse import urlencode
@@ -14,14 +14,8 @@ from fastapi.staticfiles import StaticFiles
 from itsdangerous import URLSafeSerializer, BadSignature
 from pydantic import BaseModel
 
-# -------- Optional Discord bot (comes online inside this FastAPI app) --------
-try:
-    import discord
-except Exception:
-    discord = None
-
-# ---------- Import games from separate files ----------
-# (ensure crash.py and mines.py are in the same folder)
+# ---------- Games imported from local files ----------
+# (ensure crash.py and mines.py are in the same folder as this file)
 from crash import (
     ensure_betting_round, place_bet, load_round, begin_running,
     finish_round, create_next_betting, last_busts, your_bet,
@@ -41,12 +35,12 @@ OAUTH_REDIRECT = os.getenv("OAUTH_REDIRECT", "")
 SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret")
 PORT = int(os.getenv("PORT", "8080"))
 DISCORD_API = "https://discord.com/api"
-OWNER_ID = int(os.getenv("OWNER_ID", "1128658280546320426"))
+OWNER_ID = int(os.getenv("OWNER_ID", "1128658280546320426"))  # your owner id
 DATABASE_URL = os.getenv("DATABASE_URL")
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
-DISCORD_INVITE = os.getenv("DISCORD_INVITE", "")  # optional vanity invite
-REF_PERCENT = Decimal(os.getenv("REF_PERCENT", "5"))  # % of referred users' wagered credited to referrer on withdraw
+DISCORD_INVITE = os.getenv("DISCORD_INVITE", "")  # optional
+PAYMENTS_CHANNEL_ID = int(os.getenv("PAYMENTS_CHANNEL_ID", "0"))  # optional notifications
 
 GEM = "💎"
 MIN_BET = Decimal("1.00")
@@ -68,38 +62,12 @@ def iso(dt: Optional[datetime.datetime]) -> Optional[str]:
 
 # ---------- App / Lifespan / Static ----------
 def _get_static_dir():
-    # We'll still mount /static as a fallback, but images can live right next to main.py.
     base = os.path.dirname(os.path.abspath(__file__))
     static_dir = os.path.join(base, "static")
-    try:
-        os.makedirs(static_dir, exist_ok=True)
-    except Exception:
-        pass
+    try: os.makedirs(static_dir, exist_ok=True)
+    except Exception: pass
     return static_dir
 
-app = FastAPI()
-# Optional fallback for anyone who still wants /static
-app.mount("/static", StaticFiles(directory=_get_static_dir()), name="static")
-
-# Serve images from the SAME directory as main.py (or fallback to /static).
-# If not found, we return a tiny transparent PNG so the UI never breaks.
-_TRANSPARENT_PNG = base64.b64decode(
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
-)
-
-@app.get("/img/{filename}")
-async def serve_img(filename: str):
-    base = os.path.dirname(os.path.abspath(__file__))
-    # Try same folder as main.py first
-    p1 = os.path.join(base, filename)
-    # Then /static as backup
-    p2 = os.path.join(base, "static", filename)
-    for p in (p1, p2):
-        if os.path.isfile(p):
-            return FileResponse(p)
-    return Response(content=_TRANSPARENT_PNG, media_type="image/png")
-
-# ---------- Sessions ----------
 SER = URLSafeSerializer(SECRET_KEY, salt="session-v1")
 
 def _set_session(resp, data: dict):
@@ -117,6 +85,23 @@ def _require_session(request: Request) -> dict:
         return sess
     except BadSignature:
         raise HTTPException(401, "Invalid session")
+
+app = FastAPI()
+app.mount("/static", StaticFiles(directory=_get_static_dir()), name="static")
+
+# Serve images from the SAME directory as main.py (or fallback to /static).
+_TRANSPARENT_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
+)
+@app.get("/img/{filename}")
+async def serve_img(filename: str):
+    base = os.path.dirname(os.path.abspath(__file__))
+    p1 = os.path.join(base, filename)
+    p2 = os.path.join(base, "static", filename)
+    for p in (p1, p2):
+        if os.path.isfile(p):
+            return FileResponse(p)
+    return Response(content=_TRANSPARENT_PNG, media_type="image/png")
 
 # ---------- DB helpers ----------
 def with_conn(fn):
@@ -139,7 +124,7 @@ def init_db(cur):
             balance NUMERIC(18,2) NOT NULL DEFAULT 0
         )
     """)
-    # balance_log
+    # balance log
     cur.execute("""
         CREATE TABLE IF NOT EXISTS balance_log (
             id BIGSERIAL PRIMARY KEY,
@@ -150,8 +135,7 @@ def init_db(cur):
             created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         )
     """)
-
-    # profiles (+ referral)
+    # profiles
     cur.execute("""
         CREATE TABLE IF NOT EXISTS profiles (
             user_id TEXT PRIMARY KEY,
@@ -164,8 +148,7 @@ def init_db(cur):
             created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         )
     """)
-
-    # oauth tokens for guild join
+    # oauth tokens
     cur.execute("""
         CREATE TABLE IF NOT EXISTS oauth_tokens (
             user_id TEXT PRIMARY KEY,
@@ -174,8 +157,7 @@ def init_db(cur):
             expires_at TIMESTAMPTZ
         )
     """)
-
-    # referral registry
+    # referrals
     cur.execute("""
         CREATE TABLE IF NOT EXISTS ref_names (
             user_id TEXT PRIMARY KEY,
@@ -191,17 +173,6 @@ def init_db(cur):
             created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         )
     """)
-
-    # referral payouts (commission withdraws)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS ref_payouts (
-            id BIGSERIAL PRIMARY KEY,
-            referrer_id TEXT NOT NULL,
-            amount NUMERIC(18,2) NOT NULL,
-            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
     # promos
     cur.execute("""
         CREATE TABLE IF NOT EXISTS promo_codes (
@@ -222,8 +193,7 @@ def init_db(cur):
             PRIMARY KEY(user_id, code)
         )
     """)
-
-    # crash tables
+    # crash
     cur.execute("""
         CREATE TABLE IF NOT EXISTS crash_rounds (
             id BIGSERIAL PRIMARY KEY,
@@ -261,7 +231,6 @@ def init_db(cur):
             created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         )
     """)
-
     # chat
     cur.execute("""
         CREATE TABLE IF NOT EXISTS chat_messages (
@@ -282,7 +251,6 @@ def init_db(cur):
             created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         )
     """)
-
     # mines
     cur.execute("""
         CREATE TABLE IF NOT EXISTS mines_games (
@@ -300,6 +268,27 @@ def init_db(cur):
             win NUMERIC(18,2) NOT NULL DEFAULT 0
         )
     """)
+    # payment requests (deposit / withdraw)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS payment_requests (
+            id BIGSERIAL PRIMARY KEY,
+            kind TEXT NOT NULL,             -- 'deposit' or 'withdraw'
+            user_id TEXT,
+            discord_identifier TEXT NOT NULL,
+            grow_id TEXT,
+            world TEXT,
+            amount NUMERIC(18,2),
+            status TEXT NOT NULL DEFAULT 'open',
+            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+@with_conn
+def apply_migrations(cur):
+    cur.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS is_anon BOOLEAN NOT NULL DEFAULT FALSE")
+    cur.execute("CREATE INDEX IF NOT EXISTS ix_crash_games_created_at ON crash_games (created_at)")
+    cur.execute("CREATE INDEX IF NOT EXISTS ix_mines_games_started_at ON mines_games (started_at)")
+    cur.execute("ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS private_to TEXT")
 
 # ---- balances / profiles ----
 @with_conn
@@ -338,22 +327,12 @@ NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{3,20}$")
 @with_conn
 def ensure_profile_row(cur, user_id: str):
     role = 'owner' if str(user_id) == str(OWNER_ID) else 'member'
-    default_name = f"user_{str(user_id)[-4:]}"
+    default_name = f"user_{user_id[-4:]}"
     cur.execute("""
         INSERT INTO profiles(user_id, display_name, name_lower, role, is_anon)
         VALUES (%s,%s,%s,%s,FALSE)
         ON CONFLICT (user_id) DO NOTHING
     """, (user_id, default_name, default_name, role))
-
-@with_conn
-def ensure_owner_role(cur):
-    uid = str(OWNER_ID)
-    default_name = f"owner_{uid[-4:]}"
-    cur.execute("""
-        INSERT INTO profiles(user_id, display_name, name_lower, role, is_anon)
-        VALUES (%s,%s,%s,'owner',FALSE)
-        ON CONFLICT (user_id) DO UPDATE SET role='owner'
-    """, (uid, default_name, default_name))
 
 @with_conn
 def get_profile_name(cur, user_id: str):
@@ -395,7 +374,7 @@ def profile_info(cur, user_id: str):
     }
 
 @with_conn
-def public_profile_db(cur, user_id: str) -> Optional[dict]:
+def public_profile(cur, user_id: str) -> Optional[dict]:
     ensure_profile_row(user_id)
     cur.execute("SELECT display_name, xp, role, created_at, is_anon FROM profiles WHERE user_id=%s", (user_id,))
     r = cur.fetchone()
@@ -418,51 +397,17 @@ def set_role(cur, target_id: str, role: str):
     cur.execute("UPDATE profiles SET role=%s WHERE user_id=%s", (role, target_id))
     return {"ok": True, "role": role}
 
-# ---- Referral earnings (withdraw % of referred users' wagered) ----
-@with_conn
-def referral_totals(cur, referrer_id: str):
-    # list referred users
-    cur.execute("SELECT user_id FROM profiles WHERE referred_by=%s", (referrer_id,))
-    rows = cur.fetchall()
-    if not rows:
-        return {"percent": float(REF_PERCENT), "earned": 0.0, "paid": 0.0, "available": 0.0}
-
-    uids = [str(r[0]) for r in rows]
-    # Sum wagers from both games
-    cur.execute("SELECT COALESCE(SUM(bet),0) FROM crash_games WHERE user_id = ANY(%s)", (uids,))
-    crash_total = D(cur.fetchone()[0] or 0)
-    cur.execute("SELECT COALESCE(SUM(bet),0) FROM mines_games WHERE user_id = ANY(%s)", (uids,))
-    mines_total = D(cur.fetchone()[0] or 0)
-
-    total_wagered = crash_total + mines_total
-    earned = q2(total_wagered * REF_PERCENT / Decimal("100"))
-    cur.execute("SELECT COALESCE(SUM(amount),0) FROM ref_payouts WHERE referrer_id=%s", (referrer_id,))
-    paid = q2(D(cur.fetchone()[0] or 0))
-    available = max(Decimal("0.00"), earned - paid)
-    return {"percent": float(REF_PERCENT), "earned": float(earned), "paid": float(paid), "available": float(available)}
-
-@with_conn
-def referral_withdraw_all(cur, referrer_id: str):
-    st = referral_totals(referrer_id)
-    av = q2(D(st["available"]))
-    if av <= 0:
-        raise ValueError("Nothing to withdraw")
-    # credit balance atomically
-    cur.execute("INSERT INTO balances(user_id,balance) VALUES (%s,0) ON CONFLICT(user_id) DO NOTHING", (referrer_id,))
-    cur.execute("UPDATE balances SET balance = balance + %s WHERE user_id=%s", (av, referrer_id))
-    cur.execute("INSERT INTO balance_log(actor_id,target_id,amount,reason) VALUES (%s,%s,%s,%s)",
-                ("referral", referrer_id, av, f"referral:{REF_PERCENT}%"))
-    cur.execute("INSERT INTO ref_payouts(referrer_id, amount) VALUES (%s,%s)", (referrer_id, av))
-    # return new balance
-    cur.execute("SELECT balance FROM balances WHERE user_id=%s", (referrer_id,))
-    nb = q2(D(cur.fetchone()[0] or 0))
-    return {"ok": True, "paid": float(av), "new_balance": float(nb)}
-
 # ---------- Leaderboard ----------
 def _start_of_utc_day(dt: datetime.datetime) -> datetime.datetime:
     return dt.astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
 def _start_of_utc_month(dt: datetime.datetime) -> datetime.datetime:
     return dt.astimezone(UTC).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+def _next_utc_midnight() -> datetime.datetime:
+    now = now_utc(); d = _start_of_utc_day(now) + datetime.timedelta(days=1); return d
+def _end_of_utc_month() -> datetime.datetime:
+    now = now_utc(); first_next = now.replace(day=1, tzinfo=UTC) + datetime.timedelta(days=32)
+    end = first_next.replace(day=1, hour=0, minute=0, second=0, microsecond=0)  # start of next month
+    return end
 
 @with_conn
 def get_leaderboard_rows_db(cur, period: str, limit: int = 50):
@@ -525,16 +470,6 @@ def get_leaderboard_rows_db(cur, period: str, limit: int = 50):
         })
     return out
 
-# ---------- Migrations ----------
-@with_conn
-def apply_migrations(cur):
-    # profiles extras / indexes
-    cur.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS is_anon BOOLEAN NOT NULL DEFAULT FALSE")
-    cur.execute("CREATE INDEX IF NOT EXISTS ix_crash_games_created_at ON crash_games (created_at)")
-    cur.execute("CREATE INDEX IF NOT EXISTS ix_mines_games_started_at ON mines_games (started_at)")
-    cur.execute("ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS private_to TEXT")
-    # referral payouts table ensured in init_db
-
 # ---------- OAuth token store & Discord join ----------
 @with_conn
 def save_tokens(cur, user_id: str, access_token: str, refresh_token: Optional[str], expires_in: Optional[int]):
@@ -595,156 +530,68 @@ async def guild_add_member(user_id: str, nickname: Optional[str] = None):
         if r.status_code == 409: return {"ok": True}  # already a member
         raise HTTPException(r.status_code, f"Discord join failed: {r.text}")
 
-# ---------- Discord Bot runtime (online + commands) ----------
-discord_client = None
+# ---------- Auth routes ----------
+@app.get("/login")
+async def login():
+    if not (CLIENT_ID and OAUTH_REDIRECT):
+        return HTMLResponse("OAuth not configured")
+    params = {
+        "client_id": CLIENT_ID,
+        "redirect_uri": OAUTH_REDIRECT,
+        "response_type": "code",
+        "scope": "identify guilds.join",
+        "prompt": "consent"
+    }
+    return RedirectResponse(f"{DISCORD_API}/oauth2/authorize?{urlencode(params)}")
 
-def _parse_id(identifier: str) -> Optional[str]:
-    if not identifier: return None
-    m = re.search(r"\d{5,}", identifier)
-    return m.group(0) if m else None
+@app.get("/callback")
+async def callback(code: str):
+    if not (CLIENT_ID and CLIENT_SECRET and OAUTH_REDIRECT):
+        return HTMLResponse("OAuth not configured")
+    async with httpx.AsyncClient(timeout=15) as cx:
+        data = {
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": OAUTH_REDIRECT
+        }
+        r = await cx.post(f"{DISCORD_API}/oauth2/token", data=data, headers={"Content-Type":"application/x-www-form-urlencoded"})
+        if r.status_code != 200:
+            return HTMLResponse(f"OAuth failed: {r.text}", status_code=400)
+        tok = r.json()
+        access = tok.get("access_token")
+        async with httpx.AsyncClient(timeout=15) as cx2:
+            u = await cx2.get(f"{DISCORD_API}/users/@me", headers={"Authorization": f"Bearer {access}"})
+            if u.status_code != 200:
+                return HTMLResponse(f"User fetch failed: {u.text}", status_code=400)
+            me = u.json()
 
-def setup_discord_bot():
-    global discord_client
-    if not (discord and DISCORD_BOT_TOKEN):
-        return None
-    intents = discord.Intents.default()
-    intents.message_content = True  # required for prefix commands
-    intents.guilds = True
-    discord_client = discord.Client(intents=intents)
+    user_id = str(me["id"])
+    username = f'{me.get("username","user")}#{me.get("discriminator","0")}'.replace("#0","")
+    avatar_hash = me.get("avatar")
+    avatar_url = f"https://cdn.discordapp.com/avatars/{user_id}/{avatar_hash}.png?size=64" if avatar_hash else "https://cdn.discordapp.com/embed/avatars/0.png"
 
-    @discord_client.event
-    async def on_ready():
-        try:
-            await discord_client.change_presence(
-                activity=discord.Game(name="GROWCB | .help"),
-                status=discord.Status.online
-            )
-        except Exception:
-            pass
-        print(f"[discord] Logged in as {discord_client.user} (online)")
+    ensure_profile_row(user_id)
+    save_tokens(user_id, tok.get("access_token",""), tok.get("refresh_token"), tok.get("expires_in"))
 
-    @discord_client.event
-    async def on_message(msg: "discord.Message"):
-        if msg.author.bot:
-            return
-        content = msg.content.strip()
-        if not content.startswith(PREFIX):
-            return
-        args = content[len(PREFIX):].strip().split()
-        if not args:
-            return
-        cmd = args[0].lower()
-        rest = args[1:]
+    resp = RedirectResponse("/")
+    _set_session(resp, {"id": user_id, "username": username, "avatar_url": avatar_url})
+    return resp
 
-        async def reply(txt: str):
-            try:
-                await msg.reply(txt, mention_author=False)
-            except Exception:
-                try:
-                    await msg.channel.send(txt)
-                except Exception:
-                    pass
-
-        try:
-            if cmd == "ping":
-                await reply("Pong 🏓")
-                return
-
-            if cmd == "help":
-                await reply("Commands: `.ping`, `.balance [@user|id]`, `.adjust <@user|id> <amount> [reason...]` (owner), `.role <@user|id> <member|admin|owner>` (owner)")
-                return
-
-            if cmd == "balance":
-                target = str(msg.author.id)
-                if rest:
-                    rid = _parse_id(rest[0])
-                    if rid: target = rid
-                bal = get_balance(target)
-                await reply(f"Balance for <@{target}>: {GEM} {bal:.2f} DL")
-                return
-
-            if cmd == "adjust":
-                if str(msg.author.id) != str(OWNER_ID):
-                    await reply("Only owner can use this.")
-                    return
-                if len(rest) < 2:
-                    await reply("Usage: `.adjust <@user|id> <amount> [reason...]`")
-                    return
-                target = _parse_id(rest[0])
-                if not target:
-                    await reply("Provide a valid user mention or ID.")
-                    return
-                amount = rest[1]
-                reason = " ".join(rest[2:]) if len(rest) > 2 else "bot-adjust"
-                nb = adjust_balance(str(msg.author.id), target, D(amount), reason)
-                await reply(f"Adjusted. New balance for <@{target}>: {GEM} {nb:.2f} DL")
-                return
-
-            if cmd == "role":
-                if str(msg.author.id) != str(OWNER_ID):
-                    await reply("Only owner can use this.")
-                    return
-                if len(rest) < 2:
-                    await reply("Usage: `.role <@user|id> <member|admin|owner>`")
-                    return
-                target = _parse_id(rest[0])
-                role = rest[1].lower()
-                if role not in ("member","admin","owner"):
-                    await reply("Role must be member|admin|owner")
-                    return
-                set_role(target, role)
-                await reply(f"Role for <@{target}> set to **{role.upper()}**")
-                return
-
-        except Exception as e:
-            await reply(f"Error: {e}")
-
-    return discord_client
-
-async def _run_discord_bot():
-    bot = setup_discord_bot()
-    if not bot:
-        return
-    try:
-        await bot.start(DISCORD_BOT_TOKEN)
-    except Exception as e:
-        print(f"[discord] Bot failed to start: {e}")
-
-# ---------- Lifespan: start DB, migrations, ensure owner, start bot ----------
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    init_db()
-    apply_migrations()
-    ensure_owner_role()
-    # start discord bot if configured
-    bot_task = None
-    if DISCORD_BOT_TOKEN and discord is not None:
-        bot_task = asyncio.create_task(_run_discord_bot())
-        app.state.discord_task = bot_task
-    try:
-        yield
-    finally:
-        # graceful shutdown
-        t = getattr(app.state, "discord_task", None)
-        if t:
-            try:
-                # close via client.close() if available
-                if discord_client and discord_client.is_ready():
-                    await discord_client.close()
-            except Exception:
-                pass
-            try:
-                await asyncio.wait_for(t, timeout=5)
-            except Exception:
-                pass
-
-# Recreate app with lifespan (so startup/shutdown run)
-app.router.lifespan_context = lifespan
+@app.get("/logout")
+async def logout():
+    resp = RedirectResponse("/")
+    _clear_session(resp)
+    return resp
 
 # ---------- Me / Profile / Balance ----------
 @app.get("/api/me")
 async def api_me(request: Request):
-    s = _require_session(request)
+    try:
+        s = _require_session(request)
+    except:
+        return {"id": None, "username": None, "avatar_url": None, "in_guild": False}
     in_guild = False
     if DISCORD_BOT_TOKEN and GUILD_ID:
         try:
@@ -766,13 +613,12 @@ async def api_profile(request: Request):
     s = _require_session(request)
     return profile_info(s["id"])
 
-# Public profile for clicking names in chat
+# public profile for chat popover / user card
 @app.get("/api/profile/public")
 async def api_profile_public(user_id: str = Query(...)):
-    info = public_profile_db(user_id)
-    if not info:
-        raise HTTPException(404, "User not found")
-    return info
+    data = public_profile(user_id)
+    if not data: raise HTTPException(404, "Not found")
+    return data
 
 # ---------- Settings (Anonymous mode) ----------
 class AnonIn(BaseModel):
@@ -789,7 +635,7 @@ async def api_settings_set_anon(request: Request, body: AnonIn):
     s = _require_session(request)
     return set_profile_is_anon(s["id"], bool(body.is_anon))
 
-# ---------- Leaderboard ----------
+# ---------- Leaderboard API ----------
 @app.get("/api/leaderboard")
 async def api_leaderboard(period: str = Query("daily"), limit: int = Query(50, ge=1, le=200)):
     rows = get_leaderboard_rows_db(period, limit)
@@ -870,31 +716,26 @@ async def api_ref_attach(request: Request, refname: str = ""):
         con.commit()
     return {"ok": True}
 
-# Referral earnings & withdraw endpoints
-@app.get("/api/referral/earnings")
-async def api_referral_earnings(request: Request):
-    s = _require_session(request)
-    return referral_totals(s["id"])
-
-@app.post("/api/referral/withdraw")
-async def api_referral_withdraw(request: Request):
-    s = _require_session(request)
-    return referral_withdraw_all(s["id"])
-
 # ---------- Promo ----------
+class PromoError(Exception): ...
+class PromoAlreadyRedeemed(PromoError): ...
+class PromoInvalid(PromoError): ...
+class PromoExpired(PromoError): ...
+class PromoExhausted(PromoError): ...
+
 @with_conn
 def redeem_promo(cur, user_id: str, code: str) -> Decimal:
     code = code.strip().upper()
     cur.execute("SELECT code, amount, max_uses, uses, expires_at FROM promo_codes WHERE code=%s", (code,))
     row = cur.fetchone()
-    if not row: raise ValueError("Invalid code")
+    if not row: raise PromoInvalid("Invalid code")
     _, amount, max_uses, uses, expires_at = row
     if expires_at is not None:
         cur.execute("SELECT NOW()>%s", (expires_at,))
-        if cur.fetchone()[0]: raise ValueError("Code expired")
-    if uses >= max_uses: raise ValueError("Code maxed out")
+        if cur.fetchone()[0]: raise PromoExpired("Code expired")
+    if uses >= max_uses: raise PromoExhausted("Code maxed out")
     cur.execute("SELECT 1 FROM promo_redemptions WHERE user_id=%s AND code=%s", (user_id, code))
-    if cur.fetchone(): raise ValueError("You already redeemed this code")
+    if cur.fetchone(): raise PromoAlreadyRedeemed("You already redeemed this code")
     cur.execute("INSERT INTO balances(user_id,balance) VALUES (%s,0) ON CONFLICT(user_id) DO NOTHING", (user_id,))
     cur.execute("UPDATE balances SET balance=balance+%s WHERE user_id=%s", (amount, user_id))
     cur.execute("UPDATE promo_codes SET uses=uses+1 WHERE code=%s", (code,))
@@ -934,10 +775,9 @@ async def api_promo_redeem(request: Request, body: PromoIn):
     try:
         bal = redeem_promo(s["id"], body.code)
         return {"ok": True, "new_balance": float(bal)}
-    except Exception as e:
+    except (PromoInvalid, PromoExpired, PromoExhausted, PromoAlreadyRedeemed) as e:
         raise HTTPException(400, str(e))
 
-# Admin create promo
 class PromoCreateIn(BaseModel):
     code: Optional[str] = None
     amount: str
@@ -947,11 +787,7 @@ class PromoCreateIn(BaseModel):
 @app.post("/api/admin/promo/create")
 async def api_admin_promo_create(request: Request, body: PromoCreateIn):
     s = _require_session(request)
-    role = None
-    try:
-        role = get_role(s["id"])
-    except Exception:
-        role = "member"
+    role = get_role(s["id"])
     if role not in ("admin", "owner"): raise HTTPException(403, "No permission")
     res = create_promo(s["id"], body.code, body.amount, int(body.max_uses or 1), body.expires_at)
     return res
@@ -963,18 +799,16 @@ class CrashBetIn(BaseModel):
 
 @app.get("/api/crash/state")
 async def api_crash_state(request: Request):
-    # not requiring login for readonly viewing
     try:
         s = _require_session(request)
         uid = s["id"]
     except:
-        s = None
         uid = None
 
     rid, info = ensure_betting_round()
     now = now_utc()
 
-    # Progress state machine
+    # state machine
     if info["status"] == "betting" and now >= info["betting_ends_at"]:
         begin_running(rid)
         info = load_round()
@@ -1136,10 +970,8 @@ def chat_fetch(cur, since_id: int, limit: int, for_user_id: Optional[str]):
     out = []
     for mid, uid, uname, txt, ts, priv in rows:
         uid = str(uid)
-        # force owner to display as owner even if row was old
-        rrole = "owner" if uid == str(OWNER_ID) else roles.get(uid, "member")
         out.append({"id": int(mid), "user_id": uid, "username": uname,
-                    "level": int(levels.get(uid,1)), "role": rrole,
+                    "level": int(levels.get(uid,1)), "role": roles.get(uid,"member"),
                     "text": txt, "created_at": str(ts), "private_to": priv})
     return out
 
@@ -1157,8 +989,7 @@ async def api_chat_send(request: Request, body: ChatIn):
 async def api_chat_fetch(request: Request, since: int = 0, limit: int = 30):
     uid = None
     try:
-        sess = _require_session(request)
-        uid = sess["id"]
+        sess = _require_session(request); uid = sess["id"]
     except:
         pass
     rows = chat_fetch(since, limit, uid)
@@ -1218,7 +1049,6 @@ async def api_admin_timeout_site(request: Request, body: TimeoutIn):
 
 @app.post("/api/admin/timeout_both")
 async def api_admin_timeout_both(request: Request, body: TimeoutIn):
-    # mirror site timeout; discord moderation (if any) should be handled in your bot
     return await api_admin_timeout_site(request, body)
 
 # ---------- Discord Join ----------
@@ -1227,13 +1057,253 @@ async def api_discord_join(request: Request):
     s = _require_session(request)
     nick = get_profile_name(s["id"]) or s["username"]
     return await guild_add_member(s["id"], nickname=nick)
+
+# ---------- Deposit / Withdraw API ----------
+class DepositIn(BaseModel):
+    discord_identifier: str
+    grow_id: str
+    world: str
+
+class WithdrawIn(BaseModel):
+    discord_identifier: str
+    amount: str
+    world: str
+
+@with_conn
+def _record_payment(cur, kind: str, user_id: Optional[str], discord_identifier: str,
+                    grow_id: Optional[str], world: str, amount: Optional[str]):
+    amt = q2(D(amount)) if amount is not None else None
+    cur.execute("""
+        INSERT INTO payment_requests(kind, user_id, discord_identifier, grow_id, world, amount)
+        VALUES (%s,%s,%s,%s,%s,%s)
+        RETURNING id, created_at
+    """, (kind, user_id, discord_identifier.strip(), (grow_id or '').strip() or None, world.strip(), amt))
+    rid, created = cur.fetchone()
+    return {"id": int(rid), "created_at": str(created)}
+
+@app.post("/api/payments/deposit")
+async def api_deposit(request: Request, body: DepositIn):
+    user_id = None
+    try:
+        s = _require_session(request)
+        user_id = s["id"]
+    except:
+        pass
+    rec = _record_payment("deposit", user_id, body.discord_identifier, body.grow_id, body.world, None)
+    # Optional: notify a Discord channel
+    if PAYMENTS_CHANNEL_ID and bot_ready():
+        await send_payment_notice(kind="deposit", rec_id=rec["id"], user_id=user_id, discord_identifier=body.discord_identifier,
+                                  grow_id=body.grow_id, world=body.world, amount=None)
+    return {"ok": True, "request_id": rec["id"]}
+
+@app.post("/api/payments/withdraw")
+async def api_withdraw(request: Request, body: WithdrawIn):
+    user_id = None
+    try:
+        s = _require_session(request)
+        user_id = s["id"]
+    except:
+        pass
+    rec = _record_payment("withdraw", user_id, body.discord_identifier, None, body.world, body.amount)
+    if PAYMENTS_CHANNEL_ID and bot_ready():
+        await send_payment_notice(kind="withdraw", rec_id=rec["id"], user_id=user_id, discord_identifier=body.discord_identifier,
+                                  grow_id=None, world=body.world, amount=body.amount)
+    return {"ok": True, "request_id": rec["id"]}
+
+# ---------- Discord Bot ----------
+# Uses discord.py (make sure it's installed)
+import discord
+from discord.ext import commands
+
+_intents = discord.Intents.default()
+_intents.members = True
+_intents.message_content = True
+
+bot = commands.Bot(command_prefix=PREFIX, intents=_intents)
+_bot_started = False
+
+def bot_ready() -> bool:
+    return _bot_started and bot.is_ready()
+
+async def send_payment_notice(kind: str, rec_id: int, user_id: Optional[str], discord_identifier: str,
+                              grow_id: Optional[str], world: str, amount: Optional[str]):
+    try:
+        if not PAYMENTS_CHANNEL_ID: return
+        ch = bot.get_channel(PAYMENTS_CHANNEL_ID)
+        if not ch: return
+        emb = discord.Embed(
+            title=("💰 Deposit Request" if kind=="deposit" else "💸 Withdraw Request"),
+            color=0x4f46e5 if kind=="deposit" else 0x10b981
+        )
+        emb.add_field(name="Request ID", value=str(rec_id), inline=True)
+        if user_id: emb.add_field(name="Site User ID", value=f"`{user_id}`", inline=True)
+        emb.add_field(name="Discord", value=discord_identifier, inline=False)
+        if grow_id: emb.add_field(name="GrowID", value=grow_id, inline=True)
+        emb.add_field(name="World", value=world, inline=True)
+        if amount is not None: emb.add_field(name="Amount (DL)", value=str(q2(D(amount))), inline=True)
+        emb.set_footer(text="GROWCB — payments queue")
+        await ch.send(embed=emb)
+    except Exception:
+        pass
+
+def _extract_id(s: str) -> Optional[str]:
+    if not s: return None
+    m = re.search(r"\d{5,}", s)
+    return m.group(0) if m else None
+
+async def _resolve_user_id_from_arg(ctx: commands.Context, arg: Optional[str]) -> Optional[str]:
+    if arg:
+        # try mention / raw id
+        rid = _extract_id(arg)
+        if rid: return rid
+        # try username#discrim (best effort: not guaranteed)
+        # NOTE: if you need exact mapping, persist discord <-> site id after OAuth.
+        return None
+    return str(ctx.author.id)
+
+def _fmt_dl(n: Decimal) -> str:
+    return f"{GEM} {q2(D(n)):.2f} DL"
+
+@bot.event
+async def on_ready():
+    global _bot_started
+    _bot_started = True
+    print(f"[bot] Logged in as {bot.user} (guild={GUILD_ID})")
+
+# --- Commands everyone can use ---
+
+@bot.command(name="help")
+async def help_cmd(ctx: commands.Context):
+    emb = discord.Embed(title="GROWCB Bot — Commands", color=0x60a5fa)
+    emb.add_field(name=f"{PREFIX}bal [@user|id]", value="Show your balance, or another user's if provided.", inline=False)
+    emb.add_field(name=f"{PREFIX}level", value="Show your site level and progress.", inline=False)
+    emb.add_field(name=f"{PREFIX}leaderboard", value="Show top wagered — Daily / Monthly / All-time with reset times.", inline=False)
+    emb.add_field(name=f"{PREFIX}help", value="This menu.", inline=False)
+    emb.add_field(name="Owner-only", value=f"{PREFIX}addbal <@user|id> <amount> • {PREFIX}removebal <@user|id> <amount>", inline=False)
+    await ctx.reply(embed=emb, mention_author=False)
+
+@bot.command(name="bal")
+async def bal_cmd(ctx: commands.Context, target: Optional[str] = None):
+    uid = await _resolve_user_id_from_arg(ctx, target)
+    if not uid:
+        await ctx.reply("Couldn't figure out that user. Provide a mention or numeric ID.", mention_author=False)
+        return
+    ensure_profile_row(uid)
+    bal = get_balance(uid)
+    name = f"<@{uid}>" if uid != str(ctx.author.id) else ctx.author.mention
+    emb = discord.Embed(title="Balance", description=f"{name}", color=0x22c55e)
+    emb.add_field(name="Amount", value=_fmt_dl(bal))
+    await ctx.reply(embed=emb, mention_author=False)
+
+@bot.command(name="level")
+async def level_cmd(ctx: commands.Context):
+    info = profile_info(str(ctx.author.id))
+    emb = discord.Embed(title="Your Level", color=0x8b5cf6)
+    emb.add_field(name="Level", value=str(info["level"]), inline=True)
+    emb.add_field(name="XP", value=f'{info["xp"]} / {(info["level"]*100)}', inline=True)
+    emb.add_field(name="Progress", value=f'{info["progress_pct"]}% to next', inline=True)
+    emb.add_field(name="Balance", value=_fmt_dl(info["balance"]), inline=True)
+    await ctx.reply(embed=emb, mention_author=False)
+
+@bot.command(name="leaderboard")
+async def leaderboard_cmd(ctx: commands.Context):
+    daily = get_leaderboard_rows_db("daily", 10)
+    monthly = get_leaderboard_rows_db("monthly", 10)
+    alltime = get_leaderboard_rows_db("alltime", 10)
+
+    def fmt(rows):
+        if not rows: return "—"
+        out = []
+        for i, r in enumerate(rows, 1):
+            name = "Anonymous" if r["is_anon"] else r["display_name"]
+            amt = "—" if r["is_anon"] else _fmt_dl(r["total_wagered"])
+            out.append(f"`{i:>2}.` **{name}** — {amt}")
+        return "\n".join(out)
+
+    now = now_utc()
+    d_reset = _next_utc_midnight()
+    m_reset = _end_of_utc_month()
+    d_left = str(d_reset - now).split(".")[0]
+    m_left = str(m_reset - now).split(".")[0]
+
+    emb = discord.Embed(title="🏆 Leaderboards — Top Wagered", color=0xf59e0b)
+    emb.add_field(name=f"Daily (resets in {d_left})", value=fmt(daily), inline=False)
+    emb.add_field(name=f"Monthly (resets in {m_left})", value=fmt(monthly), inline=False)
+    emb.add_field(name="All-time", value=fmt(alltime), inline=False)
+    await ctx.reply(embed=emb, mention_author=False)
+
+# --- Owner-only balance adjust ---
+
+def _owner_only(ctx: commands.Context) -> bool:
+    return str(ctx.author.id) == str(OWNER_ID)
+
+@bot.command(name="addbal")
+async def addbal_cmd(ctx: commands.Context, target: str, amount: str):
+    if not _owner_only(ctx):
+        await ctx.reply("Only the owner can use this.", mention_author=False)
+        return
+    uid = await _resolve_user_id_from_arg(ctx, target)
+    if not uid: 
+        await ctx.reply("Provide a valid @user or numeric ID.", mention_author=False); return
+    try:
+        newbal = adjust_balance(str(ctx.author.id), uid, D(amount), f"owner add via bot")
+        emb = discord.Embed(title="Balance Added", color=0x10b981)
+        emb.add_field(name="User", value=f"<@{uid}> (`{uid}`)", inline=False)
+        emb.add_field(name="Change", value=_fmt_dl(amount), inline=True)
+        emb.add_field(name="New Balance", value=_fmt_dl(newbal), inline=True)
+        await ctx.reply(embed=emb, mention_author=False)
+    except Exception as e:
+        await ctx.reply(f"Error: {e}", mention_author=False)
+
+@bot.command(name="removebal")
+async def removebal_cmd(ctx: commands.Context, target: str, amount: str):
+    if not _owner_only(ctx):
+        await ctx.reply("Only the owner can use this.", mention_author=False)
+        return
+    uid = await _resolve_user_id_from_arg(ctx, target)
+    if not uid: 
+        await ctx.reply("Provide a valid @user or numeric ID.", mention_author=False); return
+    try:
+        newbal = adjust_balance(str(ctx.author.id), uid, -D(amount), f"owner remove via bot")
+        emb = discord.Embed(title="Balance Removed", color=0xef4444)
+        emb.add_field(name="User", value=f"<@{uid}> (`{uid}`)", inline=False)
+        emb.add_field(name="Change", value=f"- {_fmt_dl(amount)}", inline=True)
+        emb.add_field(name="New Balance", value=_fmt_dl(newbal), inline=True)
+        await ctx.reply(embed=emb, mention_author=False)
+    except Exception as e:
+        await ctx.reply(f"Error: {e}", mention_author=False)
+
+# ---------- Lifespan: init DB + start/stop bot ----------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    apply_migrations()
+    # Start bot only if token present
+    bot_task = None
+    if DISCORD_BOT_TOKEN:
+        bot_task = asyncio.create_task(bot.start(DISCORD_BOT_TOKEN))
+    try:
+        yield
+    finally:
+        if bot_task:
+            await bot.close()
+            try:
+                await bot_task
+            except asyncio.CancelledError:
+                pass
+
+# rebind FastAPI with lifespan (after definition)
+app.router.lifespan_context = lifespan
+
+# ---------- HTML (UI/UX) ----------
+# (HTML_TEMPLATE and the rest of the file are in Part 2/2)
 # ---------- HTML (UI/UX) ----------
 HTML_TEMPLATE = """
 <!doctype html><html lang="en"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
 <title>GROWCB</title>
 <style>
-:root{--bg:#0a0f1e;--bg2:#0c1428;--card:#111a31;--muted:#9eb3da;--text:#ecf2ff;--accent:#6aa6ff;--accent2:#22c1dc;--ok:#34d399;--warn:#f59e0b;--err:#ef4444;--border:#1f2b47;--chatW:340px;--input-bg:#0b1430;--input-br:#223457;--input-tx:#e6eeff;--input-ph:#9db4e4}
+:root{--bg:#0a0f1e;--bg2:#0c1428;--card:#111a31;--muted:#9eb3da;--text:#ecf2ff;--accent:#6aa6ff;--accent2:#22c1dc;--ok:#34d399;--warn:#f59e0b;--err:#ef4444;--border:#1f2b47;--chatW:360px;--input-bg:#0b1430;--input-br:#223457;--input-tx:#e6eeff;--input-ph:#9db4e4}
 *{box-sizing:border-box}html,body{height:100%}body{margin:0;color:var(--text);background:radial-gradient(1400px 600px at 20% -10%, #11204d 0%, transparent 60%),linear-gradient(180deg,#0a0f1e,#0a0f1e 60%, #0b1124);font-family:Inter,system-ui,Segoe UI,Roboto,Arial,Helvetica,sans-serif}
 a{color:inherit;text-decoration:none}.container{max-width:1120px;margin:0 auto;padding:16px}
 input,select,textarea{width:100%;appearance:none;background:var(--input-bg);color:var(--input-tx);border:1px solid var(--input-br);border-radius:12px;padding:10px 12px;outline:none}
@@ -1257,16 +1327,12 @@ input,select,textarea{width:100%;appearance:none;background:var(--input-bg);colo
 .btn.ghost{background:#162a52;border:1px solid var(--border);color:#eaf2ff}
 .btn.ok{background:linear-gradient(135deg,#22c55e,#16a34a);border-color:transparent}
 .big{font-size:22px;font-weight:900}.label{font-size:12px;color:var(--muted);letter-spacing:.2px;text-transform:uppercase}.muted{color:var(--muted)}
-
-.games-grid{display:grid;gap:14px;grid-template-columns:1fr}
-@media(min-width:700px){.games-grid{grid-template-columns:1fr 1fr}}
-@media(min-width:1020px){.games-grid{grid-template-columns:1fr 1fr 1fr}}
-
-/* Game cards show only image, size by image itself */
-.game-card{border:1px solid var(--border);border-radius:16px;overflow:hidden;cursor:pointer;background:#0b1326;padding:0}
-.game-card .banner{display:block;width:100%;height:auto;opacity:1;object-fit:contain}
-
-/* Crash area */
+.games-grid{display:grid;gap:14px;grid-template-columns:1fr}@media(min-width:700px){.games-grid{grid-template-columns:1fr 1fr}}@media(min-width:1020px){.games-grid{grid-template-columns:1fr 1fr 1fr}}
+.game-card{position:relative;min-height:140px;display:flex;flex-direction:column;justify-content:flex-end;gap:4px;background:linear-gradient(180deg,#0f1a33,#0c152a);border:1px solid var(--border);border-radius:16px;padding:16px;cursor:pointer;overflow:hidden}
+.game-card .banner{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:.35}
+.game-card .title{font-size:20px;font-weight:800;position:relative}.game-card .muted{position:relative}
+.ribbon{position:absolute;top:12px;right:-32px;transform:rotate(35deg);background:linear-gradient(135deg,#f59e0b,#fb923c);color:#1a1206;font-weight:900;padding:6px 50px;border:1px solid rgba(0,0,0,.2)}
+/* Crash */
 .cr-graph-wrap{position:relative;height:240px;background:#0e1833;border:1px solid var(--border);border-radius:16px;overflow:hidden}
 canvas{display:block;width:100%;height:100%}
 .lb-controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
@@ -1280,36 +1346,35 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
 .hero{display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap}
 .kpi{display:flex;gap:8px;flex-wrap:wrap}
 .kpi .pill{background:#0c1631;border:1px solid var(--border);border-radius:999px;padding:6px 10px;font-size:12px}
-.copy{display:flex;gap:8px}
-.copy input{flex:1}
+.copy{display:flex;gap:8px}.copy input{flex:1}
 .sep{height:1px;background:rgba(255,255,255,.06);margin:10px 0}
 .discord-cta{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
 .bad{color:#ffb4b4}.good{color:#b7ffcc}
 .card.soft{background:linear-gradient(180deg,#0f1836,#0c152b)}
-
-/* Chat drawer sits above FAB; FAB hides while open */
+/* Chat drawer */
 .chat-drawer{position:fixed;right:0;top:64px;bottom:0;width:var(--chatW);max-width:92vw;transform:translateX(100%);transition:transform .2s ease-out;background:linear-gradient(180deg,#0f1a33,#0b1326);border-left:1px solid var(--border);display:flex;flex-direction:column;z-index:80}
-.chat-drawer.open{transform:translateX(0)}
-.chat-head{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border-bottom:1px solid var(--border)}
-.chat-body{flex:1;overflow:auto;padding:10px 12px}
-.chat-input{display:flex;gap:8px;padding:10px 12px;border-top:1px solid var(--border)}.chat-input input{flex:1}
+.chat-drawer.open{transform:translateX(0)}.chat-head{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border-bottom:1px solid var(--border)}
+.chat-body{flex:1;overflow:auto;padding:10px 12px}.chat-input{display:flex;gap:8px;padding:10px 12px;border-top:1px solid var(--border)}.chat-input input{flex:1}
 .msg{margin-bottom:12px;padding-bottom:8px;border-bottom:1px dashed rgba(255,255,255,.04);position:relative}
 .msghead{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.msghead .time{margin-left:auto;color:#9eb3da;font-size:12px}
 .badge{font-size:10px;padding:3px 7px;border-radius:999px;border:1px solid var(--border);letter-spacing:.2px}
 .badge.member{background:#0c1631;color:#cfe6ff}.badge.admin{background:linear-gradient(135deg,#f59e0b,#fb923c);color:#1a1206;border-color:rgba(0,0,0,.2);font-weight:900}.badge.owner{background:linear-gradient(135deg,#3b82f6,#22c1dc);color:#041018;border-color:transparent;font-weight:900}
 .level{font-size:10px;padding:3px 7px;border-radius:999px;background:#0b1f3a;color:#cfe6ff;border:1px solid var(--border)}
 .user-link{cursor:pointer;font-weight:800;padding:2px 6px;border-radius:8px;background:#0b1f3a;border:1px solid var(--border)}
-
 /* FAB */
-.fab{position:fixed;right:18px;bottom:18px;width:56px;height:56px;border-radius:50%;background:linear-gradient(135deg,#3b82f6,#22c1dc);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 14px 30px rgba(59,130,246,.35), 0 4px 10px rgba(0,0,0,.35);z-index:50}
+.fab{position:fixed;right:18px;bottom:18px;width:56px;height:56px;border-radius:50%;background:linear-gradient(135deg,#3b82f6,#22c1dc);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 14px 30px rgba(59,130,246,.35), 0 4px 10px rgba(0,0,0,.35);z-index:60}
 .fab.hide{display:none}
 .fab svg{width:26px;height:26px;fill:#041018}
-
-/* Profile modal */
-.modal{position:fixed;inset:0;background:rgba(0,0,0,.5);display:none;align-items:center;justify-content:center;z-index:90}
+/* Modal */
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;align-items:center;justify-content:center;z-index:120}
 .modal.open{display:flex}
-.modal .content{width:min(560px,92vw);background:#0c1631;border:1px solid var(--border);border-radius:16px;padding:14px}
-.modal .close{float:right;cursor:pointer;background:#11234a;border:1px solid var(--border);border-radius:8px;padding:6px 10px}
+.modal-card{width:min(720px,92vw);background:linear-gradient(180deg,#0f1a33,#0b1326);border:1px solid var(--border);border-radius:16px;padding:16px;box-shadow:0 20px 60px rgba(0,0,0,.45)}
+.modal-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+.modal-body{display:grid;gap:10px}
+.seg.sm button{padding:6px 10px}
+.warn{font-size:12px;color:#fbbf24}
+.success{color:#22c55e}
+.err{color:#ef4444}
 </style>
 </head>
 <body>
@@ -1339,15 +1404,31 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
           <div class="big">Welcome to GROWCB</div>
           <div class="discord-cta">
             <button class="btn ghost" id="btnJoinDiscord">Join Discord</button>
+            <button class="btn ghost" id="btnFundsHome">Deposit / Withdraw</button>
             <a class="chip" id="btnInvite" href="__INVITE__" target="_blank" rel="noopener">Invite Link</a>
           </div>
         </div>
         <div class="games-grid" style="margin-top:12px">
-          <div class="game-card" id="openCrash"><img class="banner" src="/img/crash.png" alt="Crash"/></div>
-          <div class="game-card" id="openMines"><img class="banner" src="/img/mines.png" alt="Mines"/></div>
-          <div class="game-card" id="openCoinflip"><img class="banner" src="/img/coinflip.png" alt="Coinflip"/></div>
-          <div class="game-card" id="openBlackjack"><img class="banner" src="/img/blackjack.png" alt="Blackjack"/></div>
-          <div class="game-card" id="openPump"><img class="banner" src="/img/pump.png" alt="Pump"/></div>
+          <div class="game-card" id="openCrash">
+            <img class="banner" src="/img/crash.png" alt="Crash" onerror="this.style.display='none'"/>
+            <div class="title">🚀 Crash</div><div class="muted">Shared rounds • 10s betting • Live cashout</div>
+          </div>
+          <div class="game-card" id="openMines">
+            <img class="banner" src="/img/mines.png" alt="Mines" onerror="this.style.display='none'"/>
+            <div class="title">💣 Mines</div><div class="muted">5×5 board • Choose mines • Cash out anytime</div>
+          </div>
+          <div class="game-card" id="openCoinflip">
+            <img class="banner" src="/img/coinflip.png" alt="Coinflip" onerror="this.style.display='none'"/>
+            <div class="title">🪙 Coinflip</div><div class="muted">Quick 50/50 — coming soon</div>
+          </div>
+          <div class="game-card" id="openBlackjack">
+            <img class="banner" src="/img/blackjack.png" alt="Blackjack" onerror="this.style.display='none'"/>
+            <div class="title">🃏 Blackjack</div><div class="muted">Beat the dealer — coming soon</div>
+          </div>
+          <div class="game-card" id="openPump">
+            <img class="banner" src="/img/pump.png" alt="Pump" onerror="this.style.display='none'"/>
+            <div class="title">📈 Pump</div><div class="muted">Ride the spike — coming soon</div>
+          </div>
         </div>
       </div>
     </div>
@@ -1406,7 +1487,7 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
       </div>
     </div>
 
-    <!-- Coming soon placeholders -->
+    <!-- Coming soon -->
     <div id="page-coinflip" style="display:none"><div class="card"><div class="hero"><div class="big">🪙 Coinflip</div><button class="chip" id="backToGames_cf">← Games</button></div><div class="muted" style="margin-top:8px">Coming soon.</div></div></div>
     <div id="page-blackjack" style="display:none"><div class="card"><div class="hero"><div class="big">🃏 Blackjack</div><button class="chip" id="backToGames_bj">← Games</button></div><div class="muted" style="margin-top:8px">Coming soon.</div></div></div>
     <div id="page-pump" style="display:none"><div class="card"><div class="hero"><div class="big">📈 Pump</div><button class="chip" id="backToGames_pu">← Games</button></div><div class="muted" style="margin-top:8px">Coming soon.</div></div></div>
@@ -1418,6 +1499,7 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
           <div class="big">🙌 Referral Program</div>
           <div class="discord-cta">
             <button class="btn ghost" id="btnJoinDiscord2">Join Discord</button>
+            <button class="btn ghost" id="btnFunds2">Deposit / Withdraw</button>
             <a class="chip" id="btnInvite2" href="__INVITE__" target="_blank" rel="noopener">Invite Link</a>
           </div>
         </div>
@@ -1443,16 +1525,7 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
               <span class="pill">Clicks: <strong id="refClicks">0</strong></span>
               <span class="pill">Joins: <strong id="refJoins">0</strong></span>
             </div>
-            <div class="sep"></div>
-            <div class="label">Earnings</div>
-            <div class="kpi" style="margin-top:8px">
-              <span class="pill">Percent: <strong id="refPct">0%</strong></span>
-              <span class="pill">Earned: <strong id="refEarned">0</strong></span>
-              <span class="pill">Paid: <strong id="refPaid">0</strong></span>
-              <span class="pill">Available: <strong id="refAvail">0</strong></span>
-            </div>
-            <div style="margin-top:8px"><button class="btn ok" id="refWithdraw">Withdraw to Balance</button> <span id="refWMsg" class="hint"></span></div>
-            <div class="hint" style="margin-top:6px">Withdraw credits the available amount to your balance.</div>
+            <div class="hint" style="margin-top:6px">Clicks count when someone opens your link. Joins count when they sign in.</div>
           </div>
         </div>
       </div>
@@ -1465,6 +1538,7 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
           <div class="big">🎁 Promo Codes</div>
           <div class="discord-cta">
             <button class="btn ghost" id="btnJoinDiscord3">Join Discord</button>
+            <button class="btn ghost" id="btnFunds3">Deposit / Withdraw</button>
             <a class="chip" id="btnInvite3" href="__INVITE__" target="_blank" rel="noopener">Invite Link</a>
           </div>
         </div>
@@ -1497,62 +1571,6 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
         <div id="lbWrap" class="muted">Loading…</div>
       </div>
     </div>
-
-    <!-- Settings -->
-    <div id="page-settings" style="display:none">
-      <div class="card">
-        <div class="label">Settings</div>
-        <div style="margin-top:8px">
-          <label style="display:flex;align-items:center;gap:10px">
-            <input type="checkbox" id="anonToggle" style="width:auto"/>
-            <span><strong>Anonymous Mode</strong> — hide your name & wager amounts from others. You still show as “Anonymous”.</span>
-          </label>
-          <div class="hint">Takes effect immediately.</div>
-          <div id="setMsg" class="muted" style="margin-top:8px"></div>
-          <div class="sep"></div>
-          <a class="btn ghost" href="/logout" style="margin-top:6px">Logout</a>
-        </div>
-      </div>
-    </div>
-
-    <!-- Profile -->
-    <div id="page-profile" style="display:none">
-      <div class="card">
-        <div class="label">Profile</div><div id="profileBox">Loading…</div>
-        <div id="ownerPanel" class="card soft" style="display:none;margin-top:12px">
-          <div class="label">Owner / Admin Panel</div>
-          <div class="row cols-4" style="margin-top:6px">
-            <div class="field"><div class="label">Discord ID or &lt;@mention&gt;</div><input id="tIdent" placeholder="ID or <@id>"/></div>
-            <div class="field"><div class="label">Amount (+/- DL)</div><input id="tAmt" type="text" placeholder="10 or -5.25"/></div>
-            <div class="field"><div class="label">Reason (optional)</div><input id="tReason" placeholder="promo/correction/prize"/></div>
-            <div style="align-self:end"><button class="btn primary" id="tApply">Apply</button></div>
-          </div>
-          <div id="tMsg" class="hint" style="margin-top:6px"></div>
-          <div class="sep"></div>
-          <div class="row cols-3">
-            <div class="field"><div class="label">Target</div><input id="rIdent" placeholder="ID or <@id>"/></div>
-            <button class="btn" id="rAdmin">Make ADMIN</button>
-            <button class="btn" id="rMember">Make MEMBER</button>
-          </div>
-          <div id="rMsg" class="hint" style="margin-top:6px"></div>
-          <div class="sep"></div>
-          <div class="row cols-5">
-            <div class="field"><div class="label">Target</div><input id="xIdent" placeholder="ID or <@id>"/></div>
-            <div class="field"><div class="label">Seconds</div><input id="xSecs" type="number" value="600"/></div>
-            <div class="field"><div class="label">Reason</div><input id="xReason" placeholder="spam / rude / etc"/></div>
-            <button class="btn" id="xSite">Site Only</button><button class="btn" id="xBoth">Site + Discord</button>
-          </div>
-          <div id="xMsg" class="hint" style="margin-top:6px"></div>
-          <div class="sep"></div>
-          <div class="row cols-3">
-            <div class="field"><div class="label">Code (optional)</div><input id="cCode" placeholder="auto-generate if empty"/></div>
-            <div class="field"><div class="label">Amount (DL)</div><input id="cAmount" type="text" placeholder="e.g. 10 or 1.24"/></div>
-            <div class="field"><div class="label">Max Uses</div><input id="cMax" type="number" placeholder="e.g. 100"/></div>
-          </div>
-          <div style="margin-top:8px"><button class="btn primary" id="cMake">Create</button> <span id="cMsg" class="hint"></span></div>
-        </div>
-      </div>
-    </div>
   </div>
 
   <!-- Floating chat -->
@@ -1563,18 +1581,72 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
     <div class="chat-input"><input id="chatText" placeholder="Say something…"/><button class="btn primary" id="chatSend">Send</button></div>
   </div>
 
-  <!-- Profile modal -->
-  <div class="modal" id="profModal" aria-hidden="true">
-    <div class="content">
-      <button class="close" id="profClose">Close</button>
-      <div id="profInner">Loading…</div>
+  <!-- Funds Modal -->
+  <div class="modal" id="fundsModal">
+    <div class="modal-card">
+      <div class="modal-head">
+        <div class="big" id="fundsTitle">💳 Deposit / Withdraw</div>
+        <button class="chip" id="fundsClose">Close</button>
+      </div>
+      <div class="modal-body">
+        <div class="seg sm" id="fundsSeg">
+          <button data-kind="deposit" class="active">Deposit</button>
+          <button data-kind="withdraw">Withdraw</button>
+        </div>
+
+        <div class="card soft">
+          <div class="label">Discord Account</div>
+          <div id="discRow" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:6px">
+            <span id="discShown" class="pill"></span>
+            <button class="btn ghost" id="discChange">Change Discord</button>
+          </div>
+          <div class="field" id="discInputWrap" style="display:none;margin-top:6px">
+            <input id="discInput" placeholder="@mention or numeric Discord ID"/>
+          </div>
+        </div>
+
+        <div class="card soft" id="depFields">
+          <div class="label">Deposit Details</div>
+          <div class="row cols-2" style="margin-top:6px">
+            <div class="field"><div class="label">GrowID</div><input id="growId" placeholder="Your GrowID"/></div>
+            <div class="field"><div class="label">World</div><input id="depWorld" placeholder="World name"/></div>
+          </div>
+          <div class="warn" style="margin-top:6px">⚠️ If your GrowID is incorrect, delivery may fail.</div>
+        </div>
+
+        <div class="card soft" id="wdFields" style="display:none">
+          <div class="label">Withdraw Details</div>
+          <div class="row cols-2" style="margin-top:6px">
+            <div class="field"><div class="label">Amount (DL)</div><input id="wdAmount" type="number" min="1" step="0.01" placeholder="e.g. 10.00"/></div>
+            <div class="field"><div class="label">World</div><input id="wdWorld" placeholder="World name"/></div>
+          </div>
+        </div>
+
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <button class="btn primary" id="fundsSubmit">Submit</button>
+          <span id="fundsMsg" class="muted"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Profile Modal (from chat) -->
+  <div class="modal" id="profileModal">
+    <div class="modal-card">
+      <div class="modal-head">
+        <div class="big">👤 Profile</div>
+        <button class="chip" id="profileClose">Close</button>
+      </div>
+      <div class="modal-body" id="profileBody">
+        Loading…
+      </div>
     </div>
   </div>
 
 <script>
 const qs = id => document.getElementById(id);
 
-// Robust JSON/text fetch helper (fixes earlier content-type bug)
+// Fetch helper
 const j = async (url, init) => {
   const r = await fetch(url, init);
   if(!r.ok){
@@ -1582,15 +1654,14 @@ const j = async (url, init) => {
     try{ const js = JSON.parse(t); throw new Error(js.detail || js.message || t || r.statusText); }
     catch{ throw new Error(t || r.statusText); }
   }
-  const ct = (r.headers.get('content-type') || '').toLowerCase();
+  const ct = (r.headers.get('content-type')||'').toLowerCase();
   if (ct.includes('application/json')) return r.json();
   return r.text();
 };
-
 const GEM = "💎"; const fmtDL = (n)=> `${GEM} ${(Number(n)||0).toFixed(2)} DL`;
 
-// -------- Simple router --------
-const pages = ['page-games','page-crash','page-mines','page-coinflip','page-blackjack','page-pump','page-ref','page-promo','page-lb','page-settings','page-profile'];
+// -------- Router --------
+const pages = ['page-games','page-crash','page-mines','page-coinflip','page-blackjack','page-pump','page-ref','page-promo','page-lb'];
 function showOnly(id){
   for(const p of pages){ const el = qs(p); if(el) el.style.display = (p===id) ? '' : 'none'; }
   const map = {'page-games':'tab-games','page-ref':'tab-ref','page-promo':'tab-promo','page-lb':'tab-lb'};
@@ -1603,12 +1674,13 @@ function showOnly(id){
 async function renderHeader(){
   try{
     const me = await j('/api/me');
-    const bal = await j('/api/balance');
+    const bal = me.id ? await j('/api/balance') : { balance: 0 };
     qs('authArea').innerHTML = `
-      <button class="btn primary" id="btnJoinSmall">${me.in_guild ? 'In Discord' : 'Join Discord'}</button>
-      <span class="chip">Balance: <strong>${fmtDL(bal.balance)}</strong></span>
+      <button class="btn ghost" id="btnFundsHeader">Deposit / Withdraw</button>
+      <button class="btn primary" id="btnJoinSmall">\${me.in_guild ? 'In Discord' : 'Join Discord'}</button>
+      <span class="chip">Balance: <strong>\${fmtDL(bal.balance)}</strong></span>
       <div class="avatar-wrap">
-        <img class="avatar" id="avatarBtn" src="${me.avatar_url||''}" title="${me.username||'user'}"/>
+        <img class="avatar" id="avatarBtn" src="\${me.avatar_url||''}" title="\${me.username||'user'}"/>
         <div id="userMenu" class="menu">
           <div class="item" id="menuProfile">Profile</div>
           <div class="item" id="menuSettings">Settings</div>
@@ -1622,8 +1694,14 @@ async function renderHeader(){
     document.body.addEventListener('click', ()=> menu.classList.remove('open'));
     qs('menuProfile').onclick = ()=>{ menu.classList.remove('open'); showOnly('page-profile'); renderProfile(); };
     qs('menuSettings').onclick = ()=>{ menu.classList.remove('open'); showOnly('page-settings'); loadSettings(); };
+    // Funds buttons
+    qs('btnFundsHeader').onclick = openFunds;
   }catch(_){
-    qs('authArea').innerHTML = `<a class="btn primary" href="/login">Login with Discord</a>`;
+    qs('authArea').innerHTML = `
+      <button class="btn ghost" id="btnFundsHeader">Deposit / Withdraw</button>
+      <a class="btn primary" href="/login">Login with Discord</a>
+    `;
+    qs('btnFundsHeader').onclick = openFunds;
   }
 }
 
@@ -1642,7 +1720,10 @@ for(const id of ['btnInvite','btnInvite2','btnInvite3']){
   const a = qs(id); if(a && a.getAttribute('href') === '__INVITE__'){ a.style.display='none'; }
 }
 
-// -------- Tabs / navigation --------
+// Extra funds buttons on pages
+['btnFundsHome','btnFunds2','btnFunds3'].forEach(i => { const el=qs(i); if(el) el.onclick=openFunds; });
+
+// -------- Tabs / nav --------
 qs('homeLink').onclick = (e)=>{ e.preventDefault(); showOnly('page-games'); };
 qs('tab-games').onclick = ()=> showOnly('page-games');
 qs('tab-ref').onclick = ()=> { showOnly('page-ref'); loadReferral(); };
@@ -1650,22 +1731,12 @@ qs('tab-promo').onclick = ()=> { showOnly('page-promo'); renderPromo(); };
 qs('tab-lb').onclick = ()=> { showOnly('page-lb'); refreshLeaderboard(); };
 
 // -------- Referral --------
-async function loadRefEarnings(){
-  try{
-    const r = await j('/api/referral/earnings');
-    qs('refPct').textContent = (r.percent||0) + '%';
-    qs('refEarned').textContent = fmtDL(r.earned||0);
-    qs('refPaid').textContent = fmtDL(r.paid||0);
-    qs('refAvail').textContent = fmtDL(r.available||0);
-  }catch(_){}
-}
 async function loadReferral(){
   try{
     const st = await j('/api/referral/state');
     if(st && st.name){ qs('refName').value = st.name; qs('refLink').value = location.origin + '/r/' + st.name; }
     qs('refClicks').textContent = st.clicks||0; qs('refJoins').textContent = st.joined||0;
   }catch(_){}
-  await loadRefEarnings();
 }
 qs('refSave').onclick = async()=>{
   const name = qs('refName').value.trim();
@@ -1675,17 +1746,7 @@ qs('refSave').onclick = async()=>{
     qs('refMsg').textContent = 'Saved.'; qs('refLink').value = location.origin + '/r/' + name.toLowerCase();
   }catch(e){ qs('refMsg').textContent = e.message; }
 };
-qs('refWithdraw').onclick = async()=>{
-  qs('refWMsg').textContent = '';
-  try{
-    const r = await j('/api/referral/withdraw', { method:'POST' });
-    qs('refWMsg').textContent = 'Withdrawn: ' + fmtDL(r.paid) + '. New balance: ' + fmtDL(r.new_balance);
-    renderHeader(); loadRefEarnings();
-  }catch(e){ qs('refWMsg').textContent = e.message; }
-};
-qs('copyRef').onclick = ()=>{
-  const inp = qs('refLink'); inp.select(); inp.setSelectionRange(0, 99999); document.execCommand('copy');
-};
+qs('copyRef').onclick = ()=>{ const inp = qs('refLink'); inp.select(); inp.setSelectionRange(0, 99999); document.execCommand('copy'); };
 
 // -------- Promo --------
 async function renderPromo(){
@@ -1693,7 +1754,7 @@ async function renderPromo(){
     const my = await j('/api/promo/my');
     qs('myCodes').innerHTML = (my.rows && my.rows.length)
       ? '<table><thead><tr><th>Code</th><th>Redeemed</th></tr></thead><tbody>' +
-        my.rows.map(r=>`<tr><td>${r.code}</td><td>${new Date(r.redeemed_at).toLocaleString()}</td></tr>`).join('') +
+        my.rows.map(r=>`<tr><td>\${r.code}</td><td>\${new Date(r.redeemed_at).toLocaleString()}</td></tr>`).join('') +
         '</tbody></table>' : '—';
   }catch(_){ qs('myCodes').textContent = '—'; }
 }
@@ -1707,74 +1768,30 @@ qs('redeemBtn').onclick = async ()=>{
   }catch(e){ qs('promoMsg').textContent = e.message; }
 };
 
-// -------- Profile / Admin --------
+// -------- Settings / Profile (basic) --------
 async function renderProfile(){
   try{
     const p = await j('/api/profile');
     const role = p.role || 'member';
     const isOwner = (role==='owner') || (String(p.id||'') === String('__OWNER_ID__'));
-    qs('profileBox').innerHTML = `
+    const box = `
       <div class="games-grid" style="grid-template-columns:1fr 1fr 1fr">
-        <div class="card soft"><div class="label">Level</div><div class="big">Lv ${p.level}</div><div class="muted">${p.xp} XP • ${p.progress_pct}% to next</div></div>
-        <div class="card soft"><div class="label">Balance</div><div class="big">${fmtDL(p.balance)}</div></div>
-        <div class="card soft"><div class="label">Role</div><div class="big" style="text-transform:uppercase">${role}</div></div>
-      </div>
-    `;
-    qs('ownerPanel').style.display = isOwner ? '' : 'none';
-
-    if(isOwner){
-      qs('tApply').onclick = async ()=>{
-        qs('tMsg').textContent='';
-        try{
-          const r = await j('/api/admin/adjust',{ method:'POST', headers:{'Content-Type':'application/json'},
-            body: JSON.stringify({ identifier: qs('tIdent').value.trim(), amount: qs('tAmt').value.trim(), reason: qs('tReason').value.trim() })});
-          qs('tMsg').textContent = 'OK. New balance: ' + fmtDL(r.new_balance); renderHeader();
-        }catch(e){ qs('tMsg').textContent = e.message; }
-      };
-      qs('rAdmin').onclick = ()=> setRole('admin');
-      qs('rMember').onclick = ()=> setRole('member');
-      async function setRole(role){
-        qs('rMsg').textContent='';
-        try{
-          await j('/api/admin/role',{ method:'POST', headers:{'Content-Type':'application/json'},
-            body: JSON.stringify({ identifier: qs('rIdent').value.trim(), role })});
-          qs('rMsg').textContent = 'Role updated.';
-        }catch(e){ qs('rMsg').textContent = e.message; }
-      }
-      qs('xSite').onclick = ()=> timeout('site');
-      qs('xBoth').onclick = ()=> timeout('both');
-      async function timeout(which){
-        qs('xMsg').textContent='';
-        try{
-          const payload = { identifier: qs('xIdent').value.trim(), seconds: parseInt(qs('xSecs').value||'600',10), reason: qs('xReason').value.trim() };
-          const url = which==='both' ? '/api/admin/timeout_both' : '/api/admin/timeout_site';
-          await j(url, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
-          qs('xMsg').textContent='Timeout set.';
-        }catch(e){ qs('xMsg').textContent = e.message; }
-      }
-      qs('cMake').onclick = async ()=>{
-        qs('cMsg').textContent='';
-        try{
-          const r = await j('/api/admin/promo/create',{ method:'POST', headers:{'Content-Type':'application/json'},
-            body: JSON.stringify({ code: (qs('cCode').value||'').trim() || null, amount: qs('cAmount').value.trim(), max_uses: parseInt(qs('cMax').value||'1',10)||1 })});
-          qs('cMsg').textContent = 'Created: ' + r.code;
-        }catch(e){ qs('cMsg').textContent = e.message; }
-      };
-    }
-  }catch(_){ qs('profileBox').textContent = '—'; }
+        <div class="card soft"><div class="label">Level</div><div class="big">Lv \${p.level}</div><div class="muted">\${p.xp} XP • \${p.progress_pct}% to next</div></div>
+        <div class="card soft"><div class="label">Balance</div><div class="big">\${fmtDL(p.balance)}</div></div>
+        <div class="card soft"><div class="label">Role</div><div class="big" style="text-transform:uppercase">\${role}</div></div>
+      </div>`;
+    document.getElementById('profileBox').innerHTML = box;
+    document.getElementById('ownerPanel').style.display = isOwner ? '' : 'none';
+  }catch(_){ document.getElementById('profileBox').textContent = '—'; }
 }
-
-// -------- Settings --------
 async function loadSettings(){
-  qs('setMsg').textContent='';
-  try{ const r = await j('/api/settings/get'); qs('anonToggle').checked = !!(r && r.is_anon); }catch(_){}
+  try{ const r = await j('/api/settings/get'); document.getElementById('anonToggle').checked = !!(r && r.is_anon); }catch(_){}
 }
-qs('anonToggle')?.addEventListener('change', async (e)=>{
-  qs('setMsg').textContent='';
+document.getElementById('anonToggle')?.addEventListener('change', async (e)=>{
   try{
     const r = await j('/api/settings/set_anon', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ is_anon: !!e.target.checked }) });
-    qs('setMsg').textContent = r && r.ok ? 'Saved.' : 'Updated.';
-  }catch(err){ qs('setMsg').textContent = err.message; }
+    document.getElementById('setMsg').textContent = r && r.ok ? 'Saved.' : 'Updated.';
+  }catch(err){ document.getElementById('setMsg').textContent = err.message; }
 });
 
 // -------- Leaderboard --------
@@ -1788,7 +1805,7 @@ function endOfUtcMonth(){
   return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth()+1, 1, 0,0,0,0));
 }
 async function refreshLeaderboard(){
-  const wrap = qs('lbWrap'); wrap.textContent = 'Loading…';
+  const wrap = document.getElementById('lbWrap'); wrap.textContent = 'Loading…';
   const res = await j('/api/leaderboard?period='+lbPeriod+'&limit=50');
   const rows = res.rows||[];
   const me = await j('/api/me').catch(()=>null);
@@ -1812,17 +1829,17 @@ async function refreshLeaderboard(){
     const tick = ()=>{
       const now = new Date();
       const ms = tgt-now; 
-      if(ms<=0){ qs('lbCountdown').textContent = 'Resets soon…'; return; }
+      if(ms<=0){ document.getElementById('lbCountdown').textContent = 'Resets soon…'; return; }
       const s = Math.floor(ms/1000); const h = Math.floor(s/3600); const m = Math.floor((s%3600)/60); const sc = s%60;
-      qs('lbCountdown').textContent = `Resets in ${h}h ${m}m ${sc}s`;
+      document.getElementById('lbCountdown').textContent = `Resets in ${h}h ${m}m ${sc}s`;
       requestAnimationFrame(()=>setTimeout(tick, 500));
     };
     tick();
   }else{
-    qs('lbCountdown').textContent = 'All-time';
+    document.getElementById('lbCountdown').textContent = 'All-time';
   }
 
-  const seg = qs('lbSeg');
+  const seg = document.getElementById('lbSeg');
   Array.from(seg.querySelectorAll('button')).forEach(b=>{
     b.classList.toggle('active', b.dataset.period===lbPeriod);
     b.onclick = ()=>{ lbPeriod = b.dataset.period; refreshLeaderboard(); };
@@ -1830,7 +1847,7 @@ async function refreshLeaderboard(){
 }
 
 // -------- Crash UI --------
-const crCanvas = ()=> qs('crCanvas');
+const crCanvas = ()=> document.getElementById('crCanvas');
 let crPollTimer=null, crBust=null, crPhase='betting';
 function drawCrash(mult){
   const c = crCanvas(); if(!c) return; const ctx = c.getContext('2d');
@@ -1851,50 +1868,50 @@ async function pollCrash(){
     const st = await j('/api/crash/state');
     crPhase = st.phase;
     crBust = st.bust;
-    qs('lastBusts').textContent = (st.last_busts||[]).map(v=> (Number(v)||0).toFixed(2)+'×').join(' • ') || '—';
-    const cashBtn = qs('crCashout');
+    document.getElementById('lastBusts').textContent = (st.last_busts||[]).map(v=> (Number(v)||0).toFixed(2)+'×').join(' • ') || '—';
+    const cashBtn = document.getElementById('crCashout');
     const you = st.your_bet;
     cashBtn.style.display = (you && crPhase==='running' && !you.cashed_out) ? '' : 'none';
 
     if(crPhase==='running' && st.current_multiplier){
       const m = Number(st.current_multiplier)||1.0;
-      qs('crNow').textContent = m.toFixed(2)+'×';
-      qs('crHint').textContent = 'In flight…';
+      document.getElementById('crNow').textContent = m.toFixed(2)+'×';
+      document.getElementById('crHint').textContent = 'In flight…';
       drawCrash(m);
     }else if(crPhase==='betting'){
-      qs('crNow').textContent = '0.00×';
+      document.getElementById('crNow').textContent = '0.00×';
       const ends = st.betting_ends_at? new Date(st.betting_ends_at): null;
       if(ends){
         const left = Math.max(0, Math.floor((ends - new Date())/1000));
-        qs('crHint').textContent = `Betting… ${left}s`;
-      }else qs('crHint').textContent = 'Betting…';
+        document.getElementById('crHint').textContent = `Betting… ${left}s`;
+      }else document.getElementById('crHint').textContent = 'Betting…';
       drawCrash(1);
     }else if(crPhase==='ended'){
-      qs('crNow').textContent = (Number(crBust)||0).toFixed(2)+'×';
-      qs('crHint').textContent = 'Round ended';
+      document.getElementById('crNow').textContent = (Number(crBust)||0).toFixed(2)+'×';
+      document.getElementById('crHint').textContent = 'Round ended';
       drawCrash(Number(crBust)||1);
     }
   }catch(e){
-    qs('crHint').textContent = e.message || 'Error';
+    document.getElementById('crHint').textContent = e.message || 'Error';
   }finally{
     crPollTimer = setTimeout(pollCrash, 900);
   }
 }
-qs('crPlace').onclick = async ()=>{
-  const bet = qs('crBet').value || '0';
-  const cash = qs('crCash').value || null;
-  qs('crMsg').textContent = '';
+document.getElementById('crPlace').onclick = async ()=>{
+  const bet = document.getElementById('crBet').value || '0';
+  const cash = document.getElementById('crCash').value || null;
+  document.getElementById('crMsg').textContent = '';
   try{
     await j('/api/crash/place', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ bet, cashout: cash? Number(cash): null })});
-    qs('crMsg').textContent = 'Bet placed.';
-  }catch(e){ qs('crMsg').textContent = e.message; }
+    document.getElementById('crMsg').textContent = 'Bet placed.';
+  }catch(e){ document.getElementById('crMsg').textContent = e.message; }
 };
-qs('crCashout').onclick = async ()=>{
-  qs('crMsg').textContent = '';
+document.getElementById('crCashout').onclick = async ()=>{
+  document.getElementById('crMsg').textContent = '';
   try{
     await j('/api/crash/cashout', { method:'POST' });
-    qs('crMsg').textContent = 'Cashed out!';
-  }catch(e){ qs('crMsg').textContent = e.message; }
+    document.getElementById('crMsg').textContent = 'Cashed out!';
+  }catch(e){ document.getElementById('crMsg').textContent = e.message; }
 };
 function openCrash(){
   showOnly('page-crash');
@@ -1904,7 +1921,7 @@ function openCrash(){
 
 // -------- Mines UI --------
 function buildMinesGrid(){
-  const grid = qs('mGrid'); grid.innerHTML='';
+  const grid = document.getElementById('mGrid'); grid.innerHTML='';
   for(let i=0;i<25;i++){
     const b = document.createElement('button');
     b.textContent = '?';
@@ -1916,104 +1933,89 @@ function buildMinesGrid(){
   }
 }
 async function pickCell(i){
-  try{
-    await j('/api/mines/pick?index='+i, { method:'POST' });
-    await refreshMines();
-  }catch(e){ alert(e.message); }
+  try{ await j('/api/mines/pick?index='+i, { method:'POST' }); await refreshMines(); }
+  catch(e){ alert(e.message); }
 }
 async function startMines(){
-  const bet = qs('mBet').value || '0';
-  const mines = parseInt(qs('mMines').value||'3',10);
-  qs('mMsg').textContent='';
+  const bet = document.getElementById('mBet').value || '0';
+  const mines = parseInt(document.getElementById('mMines').value||'3',10);
+  document.getElementById('mMsg').textContent='';
   try{
     await j('/api/mines/start', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ bet, mines })});
     await refreshMines();
-  }catch(e){ qs('mMsg').textContent = e.message; }
+  }catch(e){ document.getElementById('mMsg').textContent = e.message; }
 }
 async function cashoutMines(){
-  try{
-    await j('/api/mines/cashout', { method:'POST' });
-    await refreshMines();
-  }catch(e){ alert(e.message); }
+  try{ await j('/api/mines/cashout', { method:'POST' }); await refreshMines(); }
+  catch(e){ alert(e.message); }
 }
 async function refreshMines(){
   try{
     const st = await j('/api/mines/state');
-    const grid = qs('mGrid');
+    const grid = document.getElementById('mGrid');
     const status = st?.status || 'idle';
-    qs('mStatus').textContent = 'Status: ' + status;
-    qs('mPicks').textContent = 'Picks: ' + (st?.picks||0);
-    qs('mBombs').textContent = 'Mines: ' + (st?.mines|| (qs('mMines').value||3));
-    qs('mHash').textContent = 'Commit: ' + (st?.commit_hash || '—');
-    qs('mMult').textContent = 'Multiplier: ' + (st?.multiplier ? (Number(st.multiplier)||1).toFixed(4)+'×' : '1.0000×');
-    qs('mPotential').textContent = 'Potential: ' + (st?.potential_win ? fmtDL(st.potential_win) : '—');
+    document.getElementById('mStatus').textContent = 'Status: ' + status;
+    document.getElementById('mPicks').textContent = 'Picks: ' + (st?.picks||0);
+    document.getElementById('mBombs').textContent = 'Mines: ' + (st?.mines|| (document.getElementById('mMines').value||3));
+    document.getElementById('mHash').textContent = 'Commit: ' + (st?.commit_hash || '—');
+    document.getElementById('mMult').textContent = 'Multiplier: ' + (st?.multiplier ? (Number(st.multiplier)||1).toFixed(4)+'×' : '1.0000×');
+    document.getElementById('mPotential').textContent = 'Potential: ' + (st?.potential_win ? fmtDL(st.potential_win) : '—');
 
     const playing = status==='active';
-    qs('mCash').style.display = playing ? '' : 'none';
-    qs('mSetup').style.display = playing ? 'none' : '';
+    document.getElementById('mCash').style.display = playing ? '' : 'none';
+    document.getElementById('mSetup').style.display = playing ? 'none' : '';
 
     if(grid.children.length!==25) buildMinesGrid();
-
     if(st?.reveals && Array.isArray(st.reveals)){
       st.reveals.forEach((cell, idx)=>{
-        const b = grid.children[idx];
-        if(!b) return;
+        const b = grid.children[idx]; if(!b) return;
         if(cell === 'u'){ b.textContent = '?'; b.disabled = false; b.style.background='#0f1a33'; }
         else if(cell === 'g'){ b.textContent = '✅'; b.disabled = true; b.style.background='#163a2a'; }
         else if(cell === 'b'){ b.textContent = '💣'; b.disabled = true; b.style.background='#3a1620'; }
       });
     }
     const h = await j('/api/mines/history');
-    qs('mHist').innerHTML = (h.rows && h.rows.length)
+    document.getElementById('mHist').innerHTML = (h.rows && h.rows.length)
       ? '<table><thead><tr><th>Time</th><th>Bet</th><th>Mines</th><th>Win</th><th>Status</th></tr></thead><tbody>' +
-        h.rows.map(r=>`<tr><td>${new Date(r.started_at).toLocaleString()}</td><td>${fmtDL(r.bet)}</td><td>${r.mines}</td><td>${fmtDL(r.win)}</td><td>${r.status}</td></tr>`).join('') +
+        h.rows.map(r=>`<tr><td>\${new Date(r.started_at).toLocaleString()}</td><td>\${fmtDL(r.bet)}</td><td>\${r.mines}</td><td>\${fmtDL(r.win)}</td><td>\${r.status}</td></tr>`).join('') +
         '</tbody></table>' : '—';
   }catch(_){}
 }
-qs('mStart').onclick = startMines;
-qs('mCash').onclick = cashoutMines;
+document.getElementById('mStart').onclick = startMines;
+document.getElementById('mCash').onclick = cashoutMines;
 
-// -------- Chat UI --------
+// -------- Chat UI + profile popover --------
 let chatOpen = false, chatTimer=null, lastChatId=0;
 function toggleChat(open){
   chatOpen = open;
-  qs('chatDrawer').classList.toggle('open', open);
-  qs('fabChat').classList.toggle('hide', open); // hide FAB when drawer is open
+  document.getElementById('chatDrawer').classList.toggle('open', open);
+  document.getElementById('fabChat').classList.toggle('hide', open);
   if(open){ pollChat(); } else { if(chatTimer) clearTimeout(chatTimer); }
 }
-qs('fabChat').onclick = ()=> toggleChat(true);
-qs('chatClose').onclick = ()=> toggleChat(false);
-
-// delegated profile open on username click
-qs('chatBody').addEventListener('click', (e)=>{
-  const t = e.target;
-  if(t && t.classList.contains('user-link')){
-    const uid = t.getAttribute('data-uid');
-    if(uid) openProfile(uid);
-  }
-});
+document.getElementById('fabChat').onclick = ()=> toggleChat(true);
+document.getElementById('chatClose').onclick = ()=> toggleChat(false);
 
 async function pollChat(){
   try{
     const r = await j('/api/chat/fetch?since='+lastChatId+'&limit=50');
     const arr = r.rows||[];
     if(arr.length){
-      const body = qs('chatBody');
+      const body = document.getElementById('chatBody');
       for(const m of arr){
         lastChatId = Math.max(lastChatId, m.id||0);
         const row = document.createElement('div'); row.className='msg';
         row.innerHTML = `
           <div class="msghead">
-            <span class="user-link" data-uid="${m.user_id}">${m.username}</span>
-            <span class="badge ${m.role}">${m.role}</span>
-            <span class="level">Lv ${m.level}</span>
-            <span class="time">${new Date(m.created_at).toLocaleTimeString()}</span>
+            <span class="user-link" data-uid="\${m.user_id}">\${m.username}</span>
+            <span class="badge \${m.role}">\${m.role}</span>
+            <span class="level">Lv \${m.level}</span>
+            <span class="time">\${new Date(m.created_at).toLocaleTimeString()}</span>
           </div>
-          <div>${escapeHtml(m.text)}</div>
+          <div>\${escapeHtml(m.text)}</div>
         `;
         body.appendChild(row);
       }
-      qs('chatBody').scrollTop = qs('chatBody').scrollHeight;
+      document.getElementById('chatBody').scrollTop = document.getElementById('chatBody').scrollHeight;
     }
   }catch(_){}
   finally{
@@ -2023,67 +2025,122 @@ async function pollChat(){
 function escapeHtml(s){
   return String(s||'').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
-qs('chatSend').onclick = async ()=>{
-  const t = qs('chatText').value.trim();
+document.getElementById('chatSend').onclick = async ()=>{
+  const t = document.getElementById('chatText').value.trim();
   if(!t) return;
   try{
     await j('/api/chat/send', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ text: t })});
-    qs('chatText').value = '';
+    document.getElementById('chatText').value = '';
   }catch(e){ alert(e.message); }
 };
-
-// -------- Profile modal logic --------
-function closeProfile(){ qs('profModal').classList.remove('open'); qs('profInner').innerHTML = 'Loading…'; }
-qs('profClose').onclick = closeProfile;
-qs('profModal').addEventListener('click', (e)=>{ if(e.target === qs('profModal')) closeProfile(); });
-
+// profile open on username click
+document.getElementById('chatBody').addEventListener('click', async (e)=>{
+  const u = e.target.closest('.user-link'); if(!u) return;
+  const uid = u.getAttribute('data-uid'); if(!uid) return;
+  openProfile(uid);
+});
 async function openProfile(uid){
   try{
     const p = await j('/api/profile/public?user_id='+encodeURIComponent(uid));
-    const badge = p.role || 'member';
-    const name = p.name || ('user_'+String(p.id).slice(-4));
-    qs('profInner').innerHTML = `
-      <div class="label">User</div>
-      <div class="big" style="display:flex;align-items:center;gap:8px">
-        <span>${name}</span>
-        <span class="badge ${badge}">${badge}</span>
-      </div>
-      <div class="kpi" style="margin-top:10px">
-        <span class="pill">Level: <strong>${p.level}</strong></span>
-        <span class="pill">XP: <strong>${p.xp}</strong></span>
-        <span class="pill">Balance: <strong>${fmtDL(p.balance)}</strong></span>
+    const body = `
+      <div class="games-grid" style="grid-template-columns:1fr 1fr 1fr">
+        <div class="card soft"><div class="label">User</div><div class="big">\${p.name}</div><div class="muted">ID: \${p.id}</div></div>
+        <div class="card soft"><div class="label">Level</div><div class="big">Lv \${p.level}</div><div class="muted">\${p.xp} XP</div></div>
+        <div class="card soft"><div class="label">Balance</div><div class="big">\${fmtDL(p.balance)}</div></div>
       </div>
       <div class="kpi" style="margin-top:8px">
-        <span class="pill">Crash games: <strong>${p.crash_games}</strong></span>
-        <span class="pill">Mines games: <strong>${p.mines_games}</strong></span>
-      </div>
-      <div class="hint" style="margin-top:8px">Joined: ${new Date(p.created_at).toLocaleString()}</div>
-    `;
-    qs('profModal').classList.add('open');
+        <span class="pill">Role: <strong style="text-transform:uppercase">\${p.role}</strong></span>
+        <span class="pill">Crash games: <strong>\${p.crash_games}</strong></span>
+        <span class="pill">Mines games: <strong>\${p.mines_games}</strong></span>
+      </div>`;
+    document.getElementById('profileBody').innerHTML = body;
+    document.getElementById('profileModal').classList.add('open');
   }catch(e){
-    qs('profInner').innerHTML = `<div class="bad">${e.message||'Failed to load profile'}</div>`;
-    qs('profModal').classList.add('open');
+    document.getElementById('profileBody').innerHTML = '<span class="err">'+(e.message||'Error')+'</span>';
+    document.getElementById('profileModal').classList.add('open');
   }
 }
+document.getElementById('profileClose').onclick = ()=> document.getElementById('profileModal').classList.remove('open');
+
+// -------- Funds modal logic --------
+let fundsKind = 'deposit'; // or 'withdraw'
+function openFunds(){ document.getElementById('fundsModal').classList.add('open'); initFunds(); }
+function closeFunds(){ document.getElementById('fundsModal').classList.remove('open'); }
+document.getElementById('fundsClose').onclick = closeFunds;
+
+// tabs
+Array.from(document.getElementById('fundsSeg').querySelectorAll('button')).forEach(b=>{
+  b.onclick = ()=>{
+    fundsKind = b.dataset.kind;
+    document.getElementById('depFields').style.display = fundsKind==='deposit' ? '' : 'none';
+    document.getElementById('wdFields').style.display  = fundsKind==='withdraw' ? '' : 'none';
+    Array.from(document.getElementById('fundsSeg').children).forEach(x=> x.classList.toggle('active', x===b));
+    document.getElementById('fundsMsg').textContent='';
+  };
+});
+
+async function initFunds(){
+  try{
+    const me = await j('/api/me');
+    if(me && me.id){
+      document.getElementById('discShown').textContent = `${me.username} (${me.id})`;
+      document.getElementById('discInputWrap').style.display = 'none';
+    }else{
+      document.getElementById('discShown').textContent = 'Not logged in';
+      document.getElementById('discInputWrap').style.display = '';
+    }
+  }catch(_){}
+}
+document.getElementById('discChange').onclick = ()=>{
+  const wrap = document.getElementById('discInputWrap');
+  wrap.style.display = wrap.style.display ? '' : 'none';
+};
+
+document.getElementById('fundsSubmit').onclick = async ()=>{
+  const msg = document.getElementById('fundsMsg'); msg.textContent='';
+  // discord identifier
+  let disc = document.getElementById('discShown').textContent;
+  const override = document.getElementById('discInput').value.trim();
+  const discIdent = override || disc || '';
+  try{
+    if(fundsKind==='deposit'){
+      const grow = document.getElementById('growId').value.trim();
+      const world = document.getElementById('depWorld').value.trim();
+      if(!discIdent) throw new Error('Discord is required');
+      if(!grow) throw new Error('GrowID is required');
+      if(!world) throw new Error('World is required');
+      const r = await j('/api/payments/deposit', { method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ discord_identifier: discIdent, grow_id: grow, world }) });
+      msg.innerHTML = '<span class="success">Request submitted. ID #' + r.request_id + '</span>';
+    }else{
+      const amount = document.getElementById('wdAmount').value;
+      const world = document.getElementById('wdWorld').value.trim();
+      if(!discIdent) throw new Error('Discord is required');
+      if(!(Number(amount)>0)) throw new Error('Enter a valid amount');
+      if(!world) throw new Error('World is required');
+      const r = await j('/api/payments/withdraw', { method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ discord_identifier: discIdent, amount, world }) });
+      msg.innerHTML = '<span class="success">Withdraw submitted. ID #' + r.request_id + '</span>';
+    }
+  }catch(e){
+    msg.innerHTML = '<span class="err">'+(e.message||'Error')+'</span>';
+  }
+};
 
 // -------- Games navigation --------
-qs('openCrash').onclick = openCrash;
-qs('backToGames').onclick = ()=>{ showOnly('page-games'); if(crPollTimer) clearTimeout(crPollTimer); };
-qs('openMines').onclick = ()=>{ showOnly('page-mines'); refreshMines(); };
-qs('backToGames2').onclick = ()=> showOnly('page-games');
-qs('openCoinflip').onclick = ()=> showOnly('page-coinflip');
-qs('backToGames_cf').onclick = ()=> showOnly('page-games');
-qs('openBlackjack').onclick = ()=> showOnly('page-blackjack');
-qs('backToGames_bj').onclick = ()=> showOnly('page-games');
-qs('openPump').onclick = ()=> showOnly('page-pump');
-qs('backToGames_pu').onclick = ()=> showOnly('page-games');
+document.getElementById('openCrash').onclick = openCrash;
+document.getElementById('backToGames').onclick = ()=>{ showOnly('page-games'); if(crPollTimer) clearTimeout(crPollTimer); };
+document.getElementById('openMines').onclick = ()=>{ showOnly('page-mines'); refreshMines(); };
+document.getElementById('backToGames2').onclick = ()=> showOnly('page-games');
+document.getElementById('openCoinflip').onclick = ()=> showOnly('page-coinflip');
+document.getElementById('backToGames_cf').onclick = ()=> showOnly('page-games');
+document.getElementById('openBlackjack').onclick = ()=> showOnly('page-blackjack');
+document.getElementById('backToGames_bj').onclick = ()=> showOnly('page-games');
+document.getElementById('openPump').onclick = ()=> showOnly('page-pump');
+document.getElementById('backToGames_pu').onclick = ()=> showOnly('page-games');
 
 // -------- Boot --------
-(function boot(){
-  // Attach referral by cookie if present
-  const m = document.cookie.match(/(?:^|; )refname=([^;]+)/);
-  if(m){ const refname = decodeURIComponent(m[1]||''); if(refname){ j('/api/referral/attach?refname='+encodeURIComponent(refname)).catch(()=>{}); } }
-
+(async function boot(){
   buildMinesGrid();
   showOnly('page-games');
   renderHeader();
@@ -2094,61 +2151,6 @@ qs('backToGames_pu').onclick = ()=> showOnly('page-games');
 </html>
 """
 
-# ---------- OAuth / Auth ----------
-@app.get("/login")
-async def login():
-    if not (CLIENT_ID and OAUTH_REDIRECT):
-        return HTMLResponse("OAuth not configured")
-    params = {
-        "client_id": CLIENT_ID,
-        "redirect_uri": OAUTH_REDIRECT,
-        "response_type": "code",
-        "scope": "identify guilds.join",
-        "prompt": "consent"
-    }
-    return RedirectResponse(f"{DISCORD_API}/oauth2/authorize?{urlencode(params)}")
-
-@app.get("/callback")
-async def callback(request: Request, code: str):
-    if not (CLIENT_ID and CLIENT_SECRET and OAUTH_REDIRECT):
-        return HTMLResponse("OAuth not configured")
-    async with httpx.AsyncClient(timeout=15) as cx:
-        data = {
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": OAUTH_REDIRECT
-        }
-        r = await cx.post(f"{DISCORD_API}/oauth2/token", data=data, headers={"Content-Type":"application/x-www-form-urlencoded"})
-        if r.status_code != 200:
-            return HTMLResponse(f"OAuth failed: {r.text}", status_code=400)
-        tok = r.json()
-        access = tok.get("access_token")
-        async with httpx.AsyncClient(timeout=15) as cx2:
-            u = await cx2.get(f"{DISCORD_API}/users/@me", headers={"Authorization": f"Bearer {access}"})
-            if u.status_code != 200:
-                return HTMLResponse(f"User fetch failed: {u.text}", status_code=400)
-            me = u.json()
-
-    user_id = str(me["id"])
-    username = f'{me.get("username","user")}#{me.get("discriminator","0")}'.replace("#0","")
-    avatar_hash = me.get("avatar")
-    avatar_url = f"https://cdn.discordapp.com/avatars/{user_id}/{avatar_hash}.png?size=64" if avatar_hash else "https://cdn.discordapp.com/embed/avatars/0.png"
-
-    ensure_profile_row(user_id)
-    save_tokens(user_id, tok.get("access_token",""), tok.get("refresh_token"), tok.get("expires_in"))
-
-    resp = RedirectResponse("/")
-    _set_session(resp, {"id": user_id, "username": username, "avatar_url": avatar_url})
-    return resp
-
-@app.get("/logout")
-async def logout():
-    resp = RedirectResponse("/")
-    _clear_session(resp)
-    return resp
-
 # ---------- Root page ----------
 @app.get("/", response_class=HTMLResponse)
 async def index():
@@ -2158,6 +2160,5 @@ async def index():
 
 # ---------- Utility: run local (optional) ----------
 if __name__ == "__main__":
-    init_db(); apply_migrations(); ensure_owner_role()
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=True)

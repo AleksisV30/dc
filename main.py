@@ -1,14 +1,7 @@
-# app/main.py — single-file site that does everything (backend + inline UI)
-# - Polished header tabs
-# - “Join Discord” only in the header
-# - No demo accounts (actions require login)
-# - Logout only in Settings
-# - Clicking names in chat could open public profile (endpoint included; basic UI link)
-# - Inline HTML/CSS/JS so it never gets stuck on “Loading…”
-
+# app/main.py — single-file site with games + chat + profile + balance
 import os, json, asyncio, re, random, string, datetime, base64
 from urllib.parse import urlencode
-from typing import Optional, Dict, List
+from typing import Optional, Dict
 from decimal import Decimal, ROUND_DOWN, getcontext
 from contextlib import asynccontextmanager
 
@@ -20,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from itsdangerous import URLSafeSerializer, BadSignature
 from pydantic import BaseModel
 
-# ---------- Import games (ensure crash.py & mines.py are next to this file) ----------
+# ---------- Import games ----------
 from crash import (
     ensure_betting_round, place_bet, load_round, begin_running,
     finish_round, create_next_betting, last_busts, your_bet,
@@ -33,7 +26,7 @@ from mines import (
 # ---------- Config ----------
 getcontext().prec = 28
 CLIENT_ID = os.getenv("DISCORD_CLIENT_ID", "")
-CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET") or os.getenv("CLIENT_SECRET", "")
+CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "")
 OAUTH_REDIRECT = os.getenv("OAUTH_REDIRECT", "")
 SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret")
 PORT = int(os.getenv("PORT", "8080"))
@@ -53,14 +46,7 @@ def now_utc() -> datetime.datetime: return datetime.datetime.now(UTC)
 def iso(dt: Optional[datetime.datetime]) -> Optional[str]:
     return None if dt is None else dt.astimezone(UTC).isoformat()
 
-# ---------- App / Lifespan ----------
-def _get_static_dir():
-    base = os.path.dirname(os.path.abspath(__file__))
-    static_dir = os.path.join(base, "static")
-    try: os.makedirs(static_dir, exist_ok=True)
-    except Exception: pass
-    return static_dir
-
+# ---------- App ----------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
@@ -68,18 +54,7 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(lifespan=lifespan)
-app.mount("/static", StaticFiles(directory=_get_static_dir()), name="static")
-
-# ---------- Image Fallback ----------
-_TRANSPARENT_PNG = base64.b64decode(
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
-)
-@app.get("/img/{filename}")
-async def serve_img(filename: str):
-    base = os.path.dirname(os.path.abspath(__file__))
-    for p in (os.path.join(base, filename), os.path.join(base, "static", filename)):
-        if os.path.isfile(p): return FileResponse(p)
-    return Response(content=_TRANSPARENT_PNG, media_type="image/png")
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # ---------- Sessions ----------
 SER = URLSafeSerializer(SECRET_KEY, salt="session-v1")
@@ -114,49 +89,17 @@ def init_db(cur):
     cur.execute("""CREATE TABLE IF NOT EXISTS profiles (
         user_id TEXT PRIMARY KEY, display_name TEXT NOT NULL, name_lower TEXT NOT NULL UNIQUE,
         xp INTEGER NOT NULL DEFAULT 0, role TEXT NOT NULL DEFAULT 'member', is_anon BOOLEAN NOT NULL DEFAULT FALSE,
-        referred_by TEXT, created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP)""")
+        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS balance_log (
         id BIGSERIAL PRIMARY KEY, actor_id TEXT NOT NULL, target_id TEXT NOT NULL,
         amount NUMERIC(18,2) NOT NULL, reason TEXT, created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS oauth_tokens (
         user_id TEXT PRIMARY KEY, access_token TEXT NOT NULL, refresh_token TEXT, expires_at TIMESTAMPTZ)""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS ref_names (
-        user_id TEXT PRIMARY KEY, name_lower TEXT UNIQUE NOT NULL, created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP)""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS ref_visits (
-        id BIGSERIAL PRIMARY KEY, referrer_id TEXT NOT NULL, joined_user_id TEXT, created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP)""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS promo_codes (
-        code TEXT PRIMARY KEY, amount NUMERIC(18,2) NOT NULL, max_uses INTEGER NOT NULL DEFAULT 1,
-        uses INTEGER NOT NULL DEFAULT 0, expires_at TIMESTAMPTZ, created_by TEXT,
-        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP)""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS promo_redemptions (
-        user_id TEXT NOT NULL, code TEXT NOT NULL, redeemed_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-        PRIMARY KEY(user_id, code))""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS crash_rounds (
-        id BIGSERIAL PRIMARY KEY, status TEXT NOT NULL, bust NUMERIC(10,2),
-        betting_opens_at TIMESTAMPTZ NOT NULL, betting_ends_at TIMESTAMPTZ NOT NULL,
-        started_at TIMESTAMPTZ, expected_end_at TIMESTAMPTZ, ended_at TIMESTAMPTZ)""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS crash_bets (
-        round_id BIGINT NOT NULL, user_id TEXT NOT NULL, bet NUMERIC(18,2) NOT NULL,
-        cashout NUMERIC(8,2) NOT NULL, cashed_out NUMERIC(8,2), cashed_out_at TIMESTAMPTZ,
-        win NUMERIC(18,2) NOT NULL DEFAULT 0, resolved BOOLEAN NOT NULL DEFAULT FALSE,
-        PRIMARY KEY(round_id, user_id))""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS crash_games (
-        id BIGSERIAL PRIMARY KEY, user_id TEXT NOT NULL, bet NUMERIC(18,2) NOT NULL,
-        cashout NUMERIC(8,2) NOT NULL, bust NUMERIC(10,2) NOT NULL, win NUMERIC(18,2) NOT NULL,
-        xp_gain INTEGER NOT NULL, created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS chat_messages (
         id BIGSERIAL PRIMARY KEY, user_id TEXT NOT NULL, username TEXT NOT NULL, text TEXT NOT NULL,
-        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP, private_to TEXT)""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS chat_timeouts (
-        user_id TEXT PRIMARY KEY, until TIMESTAMPTZ NOT NULL, reason TEXT, created_by TEXT,
         created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP)""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS mines_games (
-        id BIGSERIAL PRIMARY KEY, user_id TEXT NOT NULL, bet NUMERIC(18,2) NOT NULL, mines INTEGER NOT NULL,
-        board TEXT NOT NULL, picks BIGINT NOT NULL DEFAULT 0, started_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-        ended_at TIMESTAMPTZ, status TEXT NOT NULL DEFAULT 'active', seed TEXT NOT NULL, commit_hash TEXT NOT NULL,
-        win NUMERIC(18,2) NOT NULL DEFAULT 0)""")
 
-# ---------- Profile/Balance helpers ----------
+# ---------- Balance/Profile ----------
 @with_conn
 def get_balance(cur, user_id: str) -> Decimal:
     cur.execute("SELECT balance FROM balances WHERE user_id=%s", (user_id,))
@@ -173,97 +116,132 @@ def adjust_balance(cur, actor_id: str, target_id: str, amount, reason: Optional[
     cur.execute("SELECT balance FROM balances WHERE user_id=%s", (target_id,))
     return q2(cur.fetchone()[0])
 
-@with_conn
-def tip_transfer(cur, from_id: str, to_id: str, amount: Decimal):
-    amount = q2(D(amount))
-    if amount <= 0: raise ValueError("Amount must be > 0")
-    if from_id == to_id: raise ValueError("Cannot tip yourself")
-    for uid in (from_id, to_id):
-        cur.execute("INSERT INTO balances(user_id,balance) VALUES (%s,0) ON CONFLICT(user_id) DO NOTHING", (uid,))
-    cur.execute("SELECT balance FROM balances WHERE user_id=%s FOR UPDATE", (from_id,))
-    sbal = D(cur.fetchone()[0])
-    if sbal < amount: raise ValueError("Insufficient balance")
-    cur.execute("UPDATE balances SET balance=balance-%s WHERE user_id=%s", (amount, from_id))
-    cur.execute("UPDATE balances SET balance=balance+%s WHERE user_id=%s", (amount, to_id))
-    cur.execute("INSERT INTO balance_log(actor_id,target_id,amount,reason) VALUES (%s,%s,%s,%s)",
-                (from_id, to_id, -amount, "tip"))
-    cur.execute("INSERT INTO balance_log(actor_id,target_id,amount,reason) VALUES (%s,%s,%s,%s)",
-                (from_id, to_id, amount, "tip"))
-    return True
-
 NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{3,20}$")
 
 @with_conn
 def ensure_profile_row(cur, user_id: str):
-    role = 'owner' if str(user_id) == str(OWNER_ID) else 'member'
     defname = f"user_{str(user_id)[-4:]}"
-    cur.execute("""
-        INSERT INTO profiles(user_id, display_name, name_lower, role, is_anon)
-        VALUES (%s,%s,%s,%s,FALSE)
-        ON CONFLICT(user_id) DO NOTHING
-    """, (user_id, defname, defname, role))
-
-@with_conn
-def get_profile_name(cur, user_id: str):
-    cur.execute("SELECT display_name FROM profiles WHERE user_id=%s", (user_id,))
-    r = cur.fetchone(); return r[0] if r else None
-
-@with_conn
-def set_profile_name(cur, user_id: str, name: str):
-    if not NAME_RE.match(name): raise ValueError("Name must be 3-20 chars [a-zA-Z0-9_-]")
-    lower = name.lower()
-    cur.execute("SELECT 1 FROM profiles WHERE name_lower=%s AND user_id<>%s", (lower, user_id))
-    if cur.fetchone(): raise ValueError("Name is already taken")
     cur.execute("""
         INSERT INTO profiles(user_id, display_name, name_lower)
         VALUES (%s,%s,%s)
-        ON CONFLICT (user_id) DO UPDATE SET display_name=EXCLUDED.display_name, name_lower=EXCLUDED.name_lower
-    """, (user_id, name, lower))
-    return {"ok": True, "name": name}
-
-@with_conn
-def set_profile_is_anon(cur, user_id: str, is_anon: bool):
-    ensure_profile_row(user_id)
-    cur.execute("UPDATE profiles SET is_anon=%s WHERE user_id=%s", (bool(is_anon), user_id))
-    return {"ok": True, "is_anon": bool(is_anon)}
+        ON CONFLICT(user_id) DO NOTHING
+    """, (user_id, defname, defname))
 
 @with_conn
 def profile_info(cur, user_id: str):
     ensure_profile_row(user_id)
     cur.execute("SELECT display_name, xp, role, is_anon, created_at FROM profiles WHERE user_id=%s", (user_id,))
     row = cur.fetchone()
-    if not row:
-        return {"id": str(user_id), "level": 1, "xp": 0, "role": "member", "is_anon": False, "balance": 0.0}
     display_name, xp, role, is_anon, created_at = row
-    level = 1 + int(xp)//100
-    base = (level-1)*100
-    progress = int(xp) - base
-    need = level*100 - base
-    pct = 0 if need==0 else int(progress*100/need)
-    bal = get_balance(user_id)
     return {
-        "id": str(user_id), "display_name": display_name, "xp": int(xp), "level": level,
-        "progress": progress, "next_needed": need, "progress_pct": pct,
-        "balance": float(bal), "role": role, "is_anon": bool(is_anon),
+        "id": str(user_id), "display_name": display_name,
+        "balance": float(get_balance(user_id)), "role": role,
+        "xp": int(xp), "is_anon": bool(is_anon),
         "created_at": str(created_at)
     }
 
+# ---------- Promo ----------
+class PromoInvalid(Exception): pass
+class PromoExpired(Exception): pass
+class PromoExhausted(Exception): pass
+class PromoAlreadyRedeemed(Exception): pass
+
 @with_conn
-def public_profile(cur, user_id: str) -> Optional[dict]:
-    cur.execute("SELECT display_name, xp, role, created_at, is_anon FROM profiles WHERE user_id=%s", (user_id,))
+def redeem_promo(cur, user_id: str, code: str) -> Decimal:
+    code = (code or "").strip().lower()
+    cur.execute("SELECT code, amount, max_uses, uses, expires_at FROM promo_codes WHERE code=%s", (code,))
     r = cur.fetchone()
-    if not r: return None
-    display_name, xp, role, created_at, is_anon = r
-    level = 1 + int(xp)//100
-    return {
-        "id": str(user_id),
-        "name": ("Anonymous" if is_anon else display_name),
-        "role": role,
-        "is_anon": bool(is_anon),
-        "xp": int(xp),
-        "level": level,
-        "created_at": str(created_at)
+    if not r: raise PromoInvalid("Invalid code")
+    _, amount, max_uses, uses, expires_at = r
+    if expires_at and now_utc() > expires_at: raise PromoExpired("Code expired")
+    if uses >= max_uses: raise PromoExhausted("Code fully used")
+    cur.execute("SELECT 1 FROM promo_redemptions WHERE user_id=%s AND code=%s", (user_id, code))
+    if cur.fetchone(): raise PromoAlreadyRedeemed("You already redeemed this code")
+    cur.execute("UPDATE promo_codes SET uses=uses+1 WHERE code=%s", (code,))
+    cur.execute("INSERT INTO promo_redemptions(user_id,code) VALUES(%s,%s)", (user_id, code))
+    newbal = adjust_balance(user_id, user_id, amount, f"promo:{code}")
+    return newbal
+@with_conn
+def create_promo(cur, creator_id: str, code: Optional[str], amount: str, max_uses: int, expires_at: Optional[str]):
+    if not code:
+        code = ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(8))
+    code = code.lower()
+    amt = q2(D(amount))
+    exp_dt = None
+    if expires_at:
+        try:
+            exp_dt = datetime.datetime.fromisoformat(expires_at).astimezone(UTC)
+        except Exception:
+            raise ValueError("Invalid expires_at format")
+    cur.execute("""CREATE TABLE IF NOT EXISTS promo_codes (
+                     code TEXT PRIMARY KEY, amount NUMERIC(18,2) NOT NULL,
+                     max_uses INTEGER NOT NULL DEFAULT 1, uses INTEGER NOT NULL DEFAULT 0,
+                     expires_at TIMESTAMPTZ, created_by TEXT, created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP)""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS promo_redemptions (
+                     user_id TEXT NOT NULL, code TEXT NOT NULL, redeemed_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                     PRIMARY KEY(user_id, code))""")
+    cur.execute("""INSERT INTO promo_codes(code,amount,max_uses,expires_at,created_by)
+                   VALUES(%s,%s,%s,%s,%s)""",
+                (code, amt, max_uses, exp_dt, creator_id))
+    return {"ok": True, "code": code, "amount": float(amt), "max_uses": max_uses,
+            "expires_at": (exp_dt.isoformat() if exp_dt else None)}
+
+# ---------- OAuth / Auth ----------
+@app.get("/login")
+async def login():
+    if not (CLIENT_ID and OAUTH_REDIRECT):
+        return HTMLResponse("OAuth not configured")
+    params = {
+        "client_id": CLIENT_ID, "redirect_uri": OAUTH_REDIRECT, "response_type": "code",
+        "scope": "identify guilds.join", "prompt": "consent"
     }
+    return RedirectResponse(f"{DISCORD_API}/oauth2/authorize?{urlencode(params)}")
+
+@app.get("/callback")
+async def callback(code: str):
+    if not (CLIENT_ID and CLIENT_SECRET and OAUTH_REDIRECT):
+        return HTMLResponse("OAuth not configured")
+    async with httpx.AsyncClient(timeout=15) as cx:
+        data = {"client_id": CLIENT_ID, "client_secret": CLIENT_SECRET,
+                "grant_type": "authorization_code", "code": code, "redirect_uri": OAUTH_REDIRECT}
+        r = await cx.post(f"{DISCORD_API}/oauth2/token", data=data,
+                          headers={"Content-Type":"application/x-www-form-urlencoded"})
+        if r.status_code != 200:
+            return HTMLResponse(f"OAuth failed: {r.text}", status_code=400)
+        tok = r.json()
+        access = tok.get("access_token")
+        u = await cx.get(f"{DISCORD_API}/users/@me", headers={"Authorization": f"Bearer {access}"})
+        if u.status_code != 200:
+            return HTMLResponse(f"User fetch failed: {u.text}", status_code=400)
+        me = u.json()
+    user_id = str(me["id"])
+    username = f'{me.get("username","user")}#{me.get("discriminator","0")}'.replace("#0","")
+    avatar_hash = me.get("avatar")
+    avatar_url = (f"https://cdn.discordapp.com/avatars/{user_id}/{avatar_hash}.png?size=64"
+                  if avatar_hash else "https://cdn.discordapp.com/embed/avatars/0.png")
+    ensure_profile_row(user_id)
+    save_tokens(user_id, tok.get("access_token",""), tok.get("refresh_token"), tok.get("expires_in"))
+    resp = RedirectResponse("/")
+    _set_session(resp, {"id": user_id, "username": username, "avatar_url": avatar_url})
+    return resp
+
+@app.get("/logout")
+async def logout():
+    resp = RedirectResponse("/")
+    _clear_session(resp)
+    return resp
+
+# ---------- Tokens ----------
+@with_conn
+def get_role(cur, user_id: str) -> str:
+    cur.execute("SELECT role FROM profiles WHERE user_id=%s", (user_id,))
+    r = cur.fetchone()
+    return r[0] if r else "member"
+
+@with_conn
+def get_profile_name(cur, user_id: str):
+    cur.execute("SELECT display_name FROM profiles WHERE user_id=%s", (user_id,))
+    r = cur.fetchone(); return r[0] if r else None
 
 @with_conn
 def set_role(cur, target_id: str, role: str):
@@ -272,12 +250,24 @@ def set_role(cur, target_id: str, role: str):
     return {"ok": True, "role": role}
 
 @with_conn
-def get_role(cur, user_id: str) -> str:
-    cur.execute("SELECT role FROM profiles WHERE user_id=%s", (user_id,))
-    r = cur.fetchone()
-    return r[0] if r else "member"
+def set_profile_is_anon(cur, user_id: str, is_anon: bool):
+    ensure_profile_row(user_id)
+    cur.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS is_anon BOOLEAN NOT NULL DEFAULT FALSE")
+    cur.execute("UPDATE profiles SET is_anon=%s WHERE user_id=%s", (bool(is_anon), user_id))
+    return {"ok": True, "is_anon": bool(is_anon)}
 
-# ---------- Leaderboard ----------
+@with_conn
+def public_profile(cur, user_id: str) -> Optional[dict]:
+    cur.execute("SELECT display_name, xp, role, created_at, is_anon FROM profiles WHERE user_id=%s", (user_id,))
+    r = cur.fetchone()
+    if not r: return None
+    display_name, xp, role, created_at, is_anon = r
+    level = 1 + int(xp)//100
+    return {"id": str(user_id), "name": ("Anonymous" if is_anon else display_name),
+            "role": role, "is_anon": bool(is_anon), "xp": int(xp), "level": level,
+            "created_at": str(created_at)}
+
+# ---------- Leaderboard helpers ----------
 def _start_of_utc_day(dt: datetime.datetime) -> datetime.datetime:
     return dt.astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
 def _start_of_utc_month(dt: datetime.datetime) -> datetime.datetime:
@@ -316,172 +306,49 @@ def get_leaderboard_rows_db(cur, period: str, limit: int = 50):
     params.append(limit)
     cur.execute(sql, tuple(params))
     rows = cur.fetchall()
-    return [
-        {"user_id": str(uid), "display_name": name, "is_anon": bool(is_anon),
-         "total_wagered": float(q2(D(total)))}
-        for uid, name, is_anon, total in rows
-    ]
+    return [{"user_id": str(uid), "display_name": name, "is_anon": bool(is_anon),
+             "total_wagered": float(q2(D(total)))} for uid, name, is_anon, total in rows]
 
-# ---------- Migrations ----------
-@with_conn
-def apply_migrations(cur):
-    cur.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS is_anon BOOLEAN NOT NULL DEFAULT FALSE")
-    cur.execute("CREATE INDEX IF NOT EXISTS ix_crash_games_created_at ON crash_games(created_at)")
-    cur.execute("CREATE INDEX IF NOT EXISTS ix_mines_games_started_at ON mines_games(started_at)")
-    cur.execute("ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS private_to TEXT")
-
-# ---------- OAuth tokens & Discord join ----------
-@with_conn
-def save_tokens(cur, user_id: str, access_token: str, refresh_token: Optional[str], expires_in: Optional[int]):
-    expires_at = now_utc() + datetime.timedelta(seconds=int(expires_in or 0)) if expires_in else None
-    cur.execute("""
-        INSERT INTO oauth_tokens(user_id,access_token,refresh_token,expires_at)
-        VALUES (%s,%s,%s,%s)
-        ON CONFLICT(user_id) DO UPDATE SET access_token=EXCLUDED.access_token,
-          refresh_token=EXCLUDED.refresh_token, expires_at=EXCLUDED.expires_at
-    """, (user_id, access_token, refresh_token, expires_at))
+# ---------- Referral helpers ----------
+NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{3,20}$")
 
 @with_conn
-def get_tokens(cur, user_id: str):
-    cur.execute("SELECT access_token, refresh_token, expires_at FROM oauth_tokens WHERE user_id=%s", (user_id,))
-    r = cur.fetchone()
-    return {"access_token": r[0], "refresh_token": r[1], "expires_at": r[2]} if r else None
-
-async def discord_refresh_token(user_id: str):
-    rec = get_tokens(user_id)
-    if not rec or not rec.get("refresh_token"): return None
-    if not CLIENT_ID or not CLIENT_SECRET: return None
-    async with httpx.AsyncClient(timeout=15) as cx:
-        data = {"client_id": CLIENT_ID, "client_secret": CLIENT_SECRET, "grant_type": "refresh_token",
-                "refresh_token": rec["refresh_token"]}
-        r = await cx.post(f"{DISCORD_API}/oauth2/token", data=data, headers={"Content-Type":"application/x-www-form-urlencoded"})
-        if r.status_code != 200: return None
-        js = r.json()
-        save_tokens(user_id, js.get("access_token",""), js.get("refresh_token"), js.get("expires_in"))
-        return js.get("access_token")
-
-async def discord_get_valid_access_token(user_id: str):
-    rec = get_tokens(user_id)
-    if not rec: return None
-    exp = rec.get("expires_at")
-    if exp and isinstance(exp, datetime.datetime) and exp.tzinfo is None:
-        exp = exp.replace(tzinfo=UTC)
-    if (not exp) or (exp - now_utc() < datetime.timedelta(seconds=30)):
-        tok = await discord_refresh_token(user_id)
-        if tok: return tok
-    return rec.get("access_token")
-
-async def guild_add_member(user_id: str, nickname: Optional[str] = None):
-    if not (DISCORD_BOT_TOKEN and GUILD_ID):
-        raise HTTPException(500, "Discord bot or guild not configured")
-    access = await discord_get_valid_access_token(user_id)
-    if not access: raise HTTPException(400, "Missing OAuth token. Re-login needed.")
-    payload = {"access_token": access}
-    if nickname: payload["nick"] = nickname
-    async with httpx.AsyncClient(timeout=15) as cx:
-        url = f"{DISCORD_API}/guilds/{GUILD_ID}/members/{user_id}"
-        r = await cx.put(url, json=payload, headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"})
-        if r.status_code in (201, 204, 409): return {"ok": True}
-        raise HTTPException(r.status_code, f"Discord join failed: {r.text}")
-
-# ---------- Promo helpers (placed before endpoints for clarity) ----------
-class PromoInvalid(Exception): pass
-class PromoExpired(Exception): pass
-class PromoExhausted(Exception): pass
-class PromoAlreadyRedeemed(Exception): pass
+def set_ref_name(cur, user_id: str, name: str):
+    if not NAME_RE.match(name): raise ValueError("3–20 chars: letters, numbers, _ or -")
+    lower = name.lower()
+    cur.execute("""CREATE TABLE IF NOT EXISTS ref_names (
+                     user_id TEXT PRIMARY KEY, name_lower TEXT UNIQUE NOT NULL,
+                     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP)""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS ref_visits (
+                     id BIGSERIAL PRIMARY KEY, referrer_id TEXT NOT NULL,
+                     joined_user_id TEXT, created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP)""")
+    cur.execute("SELECT user_id FROM ref_names WHERE name_lower=%s AND user_id<>%s", (lower, user_id))
+    if cur.fetchone(): raise ValueError("Name is already taken")
+    cur.execute("""INSERT INTO ref_names(user_id, name_lower) VALUES (%s,%s)
+                   ON CONFLICT(user_id) DO UPDATE SET name_lower=EXCLUDED.name_lower""", (user_id, lower))
+    return {"ok": True, "name": lower}
 
 @with_conn
-def redeem_promo(cur, user_id: str, code: str) -> Decimal:
-    code = (code or "").strip().lower()
-    cur.execute("SELECT code, amount, max_uses, uses, expires_at FROM promo_codes WHERE code=%s", (code,))
-    r = cur.fetchone()
-    if not r: raise PromoInvalid("Invalid code")
-    _, amount, max_uses, uses, expires_at = r
-    if expires_at and now_utc() > expires_at: raise PromoExpired("Code expired")
-    if uses >= max_uses: raise PromoExhausted("Code fully used")
-    cur.execute("SELECT 1 FROM promo_redemptions WHERE user_id=%s AND code=%s", (user_id, code))
-    if cur.fetchone(): raise PromoAlreadyRedeemed("You already redeemed this code")
-    cur.execute("UPDATE promo_codes SET uses=uses+1 WHERE code=%s", (code,))
-    cur.execute("INSERT INTO promo_redemptions(user_id,code) VALUES(%s,%s)", (user_id, code))
-    newbal = adjust_balance(user_id, user_id, amount, f"promo:{code}")
-    return newbal
+def get_ref_state(cur, user_id: str):
+    cur.execute("SELECT name_lower FROM ref_names WHERE user_id=%s", (user_id,))
+    r = cur.fetchone(); name = r[0] if r else None
+    cur.execute("SELECT COUNT(*) FROM ref_visits WHERE referrer_id=%s AND joined_user_id IS NOT NULL", (user_id,))
+    joined = int(cur.fetchone()[0])
+    cur.execute("SELECT COUNT(*) FROM ref_visits WHERE referrer_id=%s", (user_id,))
+    clicks = int(cur.fetchone()[0])
+    return {"name": name, "joined": joined, "clicks": clicks}
 
-@with_conn
-def create_promo(cur, creator_id: str, code: Optional[str], amount: str, max_uses: int, expires_at: Optional[str]):
-    if not code:
-        code = ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(8))
-    code = code.lower()
-    amt = q2(D(amount))
-    exp_dt = None
-    if expires_at:
-        try:
-            exp_dt = datetime.datetime.fromisoformat(expires_at).astimezone(UTC)
-        except Exception:
-            raise ValueError("Invalid expires_at format")
-    cur.execute("""INSERT INTO promo_codes(code,amount,max_uses,expires_at,created_by)
-                   VALUES(%s,%s,%s,%s,%s)""",
-                (code, amt, max_uses, exp_dt, creator_id))
-    return {
-        "ok": True,
-        "code": code,
-        "amount": float(amt),
-        "max_uses": max_uses,
-        "expires_at": exp_dt.isoformat() if exp_dt else None
-    }
+# ---------- Mines/Crash imports ----------
+from crash import (
+    ensure_betting_round, place_bet, load_round, begin_running,
+    finish_round, create_next_betting, last_busts, your_bet,
+    your_history, cashout_now, current_multiplier
+)
+from mines import (
+    mines_start, mines_pick, mines_cashout, mines_state, mines_history
+)
 
-# ---------- OAuth / Auth ----------
-@app.get("/login")
-async def login():
-    if not (CLIENT_ID and OAUTH_REDIRECT):
-        return HTMLResponse("OAuth not configured")
-    params = {
-        "client_id": CLIENT_ID, "redirect_uri": OAUTH_REDIRECT, "response_type": "code",
-        "scope": "identify guilds.join", "prompt": "consent"
-    }
-    return RedirectResponse(f"{DISCORD_API}/oauth2/authorize?{urlencode(params)}")
-
-@app.get("/callback")
-async def callback(code: str):
-    if not (CLIENT_ID and CLIENT_SECRET and OAUTH_REDIRECT):
-        return HTMLResponse("OAuth not configured")
-    async with httpx.AsyncClient(timeout=15) as cx:
-        data = {
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": OAUTH_REDIRECT
-        }
-        r = await cx.post(f"{DISCORD_API}/oauth2/token", data=data, headers={"Content-Type":"application/x-www-form-urlencoded"})
-        if r.status_code != 200:
-            return HTMLResponse(f"OAuth failed: {r.text}", status_code=400)
-        tok = r.json()
-        access = tok.get("access_token")
-        async with httpx.AsyncClient(timeout=15) as cx2:
-            u = await cx2.get(f"{DISCORD_API}/users/@me", headers={"Authorization": f"Bearer {access}"})
-            if u.status_code != 200:
-                return HTMLResponse(f"User fetch failed: {u.text}", status_code=400)
-            me = u.json()
-
-    user_id = str(me["id"])
-    username = f'{me.get("username","user")}#{me.get("discriminator","0")}'.replace("#0","")
-    avatar_hash = me.get("avatar")
-    avatar_url = f"https://cdn.discordapp.com/avatars/{user_id}/{avatar_hash}.png?size=64" if avatar_hash else "https://cdn.discordapp.com/embed/avatars/0.png"
-
-    ensure_profile_row(user_id)
-    save_tokens(user_id, tok.get("access_token",""), tok.get("refresh_token"), tok.get("expires_in"))
-
-    resp = RedirectResponse("/")
-    _set_session(resp, {"id": user_id, "username": username, "avatar_url": avatar_url})
-    return resp
-
-@app.get("/logout")
-async def logout():
-    resp = RedirectResponse("/")
-    _clear_session(resp)
-    return resp
-
-# ---------- Me / Profile / Balance ----------
+# ---------- API: Me/Profile ----------
 @app.get("/api/me")
 async def api_me(request: Request):
     s = _require_session(request)
@@ -513,9 +380,8 @@ async def api_public(user_id: str):
     info.pop("balance", None)
     return info
 
-# ---------- Settings (Anonymous mode) ----------
-class AnonIn(BaseModel):
-    is_anon: bool
+# ---------- Settings ----------
+class AnonIn(BaseModel): is_anon: bool
 
 @app.get("/api/settings/get")
 async def api_settings_get(request: Request):
@@ -535,37 +401,12 @@ async def api_leaderboard(period: str = Query("daily"), limit: int = Query(50, g
     return {"rows": rows}
 
 # ---------- Referral ----------
-@with_conn
-def get_ref_state(cur, user_id: str):
-    cur.execute("SELECT name_lower FROM ref_names WHERE user_id=%s", (user_id,))
-    r = cur.fetchone()
-    name = r[0] if r else None
-    cur.execute("SELECT COUNT(*) FROM ref_visits WHERE referrer_id=%s AND joined_user_id IS NOT NULL", (user_id,))
-    joined = int(cur.fetchone()[0])
-    cur.execute("SELECT COUNT(*) FROM ref_visits WHERE referrer_id=%s", (user_id,))
-    clicks = int(cur.fetchone()[0])
-    return {"name": name, "joined": joined, "clicks": clicks}
-
-@with_conn
-def set_ref_name(cur, user_id: str, name: str):
-    if not NAME_RE.match(name): raise ValueError("3–20 chars: letters, numbers, _ or -")
-    lower = name.lower()
-    cur.execute("SELECT user_id FROM ref_names WHERE name_lower=%s AND user_id<>%s", (lower, user_id))
-    if cur.fetchone(): raise ValueError("Name is already taken")
-    cur.execute("""
-        INSERT INTO ref_names(user_id, name_lower)
-        VALUES(%s,%s)
-        ON CONFLICT (user_id) DO UPDATE SET name_lower=EXCLUDED.name_lower
-    """, (user_id, lower))
-    return {"ok": True, "name": lower}
+class RefIn(BaseModel): name: str
 
 @app.get("/api/referral/state")
 async def api_ref_state(request: Request):
     s = _require_session(request)
     return get_ref_state(s["id"])
-
-class RefIn(BaseModel):
-    name: str
 
 @app.post("/api/referral/set")
 async def api_ref_set(request: Request, body: RefIn):
@@ -574,20 +415,17 @@ async def api_ref_set(request: Request, body: RefIn):
 
 @app.get("/r/{refname}")
 async def referral_landing(refname: str, request: Request):
-    refname = (refname or "").lower()
+    rn = (refname or "").lower()
     with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
-        cur.execute("SELECT user_id FROM ref_names WHERE name_lower=%s", (refname,))
+        cur.execute("SELECT user_id FROM ref_names WHERE name_lower=%s", (rn,))
         r = cur.fetchone()
         if r:
             referrer = str(r[0])
             cur.execute("INSERT INTO ref_visits(referrer_id) VALUES (%s)", (referrer,))
             con.commit()
-    html = f"""
-    <script>
-      document.cookie = "refname={refname}; path=/; max-age=1209600; samesite=lax";
-      location.href = "/";
-    </script>
-    """
+    html = f"""<script>
+      document.cookie = "refname={rn}; path=/; max-age=1209600; samesite=lax"; location.href="/";
+    </script>"""
     return HTMLResponse(html)
 
 @app.get("/api/referral/attach")
@@ -604,22 +442,31 @@ async def api_ref_attach(request: Request, refname: str = ""):
         cur.execute("SELECT referred_by FROM profiles WHERE user_id=%s", (s["id"],))
         already = cur.fetchone()
         if already and already[0]: return {"ok": True}
+        cur.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS referred_by TEXT")
         cur.execute("UPDATE profiles SET referred_by=%s WHERE user_id=%s", (referrer, s["id"]))
-        cur.execute("INSERT INTO ref_visits(referrer_id, joined_user_id) VALUES (%s,%s)", (referrer, s["id"]))
+        cur.execute("""INSERT INTO ref_visits(referrer_id, joined_user_id) VALUES (%s,%s)""",
+                    (referrer, s["id"]))
         con.commit()
     return {"ok": True}
 
-# ---------- Promo ----------
+# ---------- Promo endpoints ----------
+class PromoIn(BaseModel): code: str
+class PromoCreateIn(BaseModel):
+    code: Optional[str] = None
+    amount: str
+    max_uses: int = 1
+    expires_at: Optional[str] = None
+
 @app.get("/api/promo/my")
 async def api_promo_my(request: Request):
     s = _require_session(request)
     with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
+        cur.execute("""CREATE TABLE IF NOT EXISTS promo_redemptions (
+                         user_id TEXT NOT NULL, code TEXT NOT NULL, redeemed_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                         PRIMARY KEY(user_id, code))""")
         cur.execute("SELECT code, redeemed_at FROM promo_redemptions WHERE user_id=%s ORDER BY redeemed_at DESC LIMIT 50", (s["id"],))
         rows = [{"code": r[0], "redeemed_at": str(r[1])} for r in cur.fetchall()]
     return {"rows": rows}
-
-class PromoIn(BaseModel):
-    code: str
 
 @app.post("/api/promo/redeem")
 async def api_promo_redeem(request: Request, body: PromoIn):
@@ -630,59 +477,87 @@ async def api_promo_redeem(request: Request, body: PromoIn):
     except (PromoInvalid, PromoExpired, PromoExhausted, PromoAlreadyRedeemed) as e:
         raise HTTPException(400, str(e))
 
-# Admin create promo
-class PromoCreateIn(BaseModel):
-    code: Optional[str] = None
-    amount: str
-    max_uses: int = 1
-    expires_at: Optional[str] = None
-
 @app.post("/api/admin/promo/create")
 async def api_admin_promo_create(request: Request, body: PromoCreateIn):
     s = _require_session(request)
     role = get_role(s["id"])
-    if role not in ("admin", "owner"): raise HTTPException(403, "No permission")
-    res = create_promo(s["id"], body.code, body.amount, int(body.max_uses or 1), body.expires_at)
-    return res
+    if role not in ("admin","owner"): raise HTTPException(403, "No permission")
+    return create_promo(s["id"], body.code, body.amount, int(body.max_uses or 1), body.expires_at)
 
-# ---------- Crash endpoints ----------
+# ---------- Chat ----------
+class ChatIn(BaseModel): text: str
+
+@with_conn
+def chat_insert(cur, user_id: str, username: str, text: str):
+    text = (text or "").strip()
+    if not text: raise ValueError("Message is empty")
+    if len(text) > 300: raise ValueError("Message too long")
+    cur.execute("""INSERT INTO chat_messages(user_id,username,text) VALUES (%s,%s,%s)
+                   RETURNING id,created_at""", (user_id, username, text))
+    row = cur.fetchone()
+    return {"id": int(row[0]), "created_at": str(row[1])}
+
+@with_conn
+def chat_fetch(cur, since_id: int, limit: int):
+    if since_id <= 0:
+        cur.execute("""SELECT id,user_id,username,text,created_at
+                       FROM chat_messages ORDER BY id DESC LIMIT %s""", (limit,))
+        rows = list(reversed(cur.fetchall()))
+    else:
+        cur.execute("""SELECT id,user_id,username,text,created_at
+                       FROM chat_messages WHERE id>%s ORDER BY id ASC LIMIT %s""", (since_id, limit))
+        rows = cur.fetchall()
+    out = []
+    uids = list({str(r[1]) for r in rows})
+    levels: Dict[str,int] = {}; roles: Dict[str,str] = {}
+    if uids:
+        cur.execute("SELECT user_id, xp, role FROM profiles WHERE user_id = ANY(%s)", (uids,))
+        for uid, xp, role in cur.fetchall():
+            levels[str(uid)] = 1 + int(xp)//100
+            roles[str(uid)] = role or "member"
+    for mid, uid, uname, txt, ts in rows:
+        uid = str(uid)
+        out.append({"id": int(mid), "user_id": uid, "username": uname,
+                    "level": int(levels.get(uid,1)), "role": roles.get(uid,"member"),
+                    "text": txt, "created_at": str(ts)})
+    return out
+
+@app.get("/api/chat/fetch")
+async def api_chat_fetch(since: int = 0, limit: int = 30):
+    return {"rows": chat_fetch(since, limit)}
+
+@app.post("/api/chat/send")
+async def api_chat_send(request: Request, body: ChatIn):
+    s = _require_session(request)
+    return chat_insert(s["id"], s["username"], body.text)
+
+# ---------- Crash ----------
 class CrashBetIn(BaseModel):
     bet: str
     cashout: Optional[float] = None
 
 @app.get("/api/crash/state")
 async def api_crash_state(request: Request):
-    # not requiring login for readonly viewing
     try:
-        s = _require_session(request)
-        uid = s["id"]
+        s = _require_session(request); uid = s["id"]
     except:
-        s = None
         uid = None
-
     rid, info = ensure_betting_round()
     now = now_utc()
-
-    # Progress state machine
-    if info["status"] == "betting" and now >= info["betting_ends_at"]:
-        begin_running(rid)
-        info = load_round()
-    if info and info["status"] == "running" and info["expected_end_at"] and now >= info["expected_end_at"]:
-        finish_round(rid)
-        create_next_betting()
-        info = load_round()
-
-    out = {
-        "phase": info["status"],
-        "bust": info["bust"],
-        "betting_opens_at": iso(info["betting_opens_at"]),
-        "betting_ends_at": iso(info["betting_ends_at"]),
-        "started_at": iso(info["started_at"]),
-        "expected_end_at": iso(info["expected_end_at"]),
-        "last_busts": last_busts()
-    }
+    if info["status"]=="betting" and now>=info["betting_ends_at"]:
+        begin_running(rid); info = load_round()
+    if info and info["status"]=="running" and info["expected_end_at"] and now>=info["expected_end_at"]:
+        finish_round(rid); create_next_betting(); info = load_round()
+    out = {"phase": info["status"], "bust": info["bust"],
+           "betting_opens_at": iso(info["betting_opens_at"]),
+           "betting_ends_at": iso(info["betting_ends_at"]),
+           "started_at": iso(info["started_at"]),
+           "expected_end_at": iso(info["expected_end_at"]),
+           "last_busts": last_busts()}
     if info["status"] == "running":
-        out["current_multiplier"] = current_multiplier(info["started_at"], info["expected_end_at"], info["bust"], now)
+        out["current_multiplier"] = current_multiplier(
+            info["started_at"], info["expected_end_at"], info["bust"], now
+        )
     if uid:
         y = your_bet(rid, uid)
         if y: out["your_bet"] = y
@@ -708,7 +583,7 @@ async def api_crash_history(request: Request):
     s = _require_session(request)
     return {"rows": your_history(s["id"], 10)}
 
-# ---------- Mines endpoints ----------
+# ---------- Mines ----------
 class MinesStartIn(BaseModel):
     bet: str
     mines: int
@@ -719,9 +594,9 @@ async def api_mines_start(request: Request, body: MinesStartIn):
     return mines_start(s["id"], q2(D(body.bet or "0")), int(body.mines))
 
 @app.post("/api/mines/pick")
-async def api_mines_pick(request: Request, index: int = Query(..., ge=0, le=24)):
+async def api_mines_pick(request: Request, cell: int = Query(..., ge=0, le=24)):
     s = _require_session(request)
-    return mines_pick(s["id"], index)
+    return mines_pick(s["id"], cell)
 
 @app.post("/api/mines/cashout")
 async def api_mines_cashout(request: Request):
@@ -731,135 +606,65 @@ async def api_mines_cashout(request: Request):
 @app.get("/api/mines/state")
 async def api_mines_state(request: Request):
     s = _require_session(request)
-    st = mines_state(s["id"])
-    return st or {}
+    return mines_state(s["id"]) or {}
 
 @app.get("/api/mines/history")
 async def api_mines_history(request: Request):
     s = _require_session(request)
     return {"rows": mines_history(s["id"], 15)}
 
-# ---------- Chat endpoints ----------
-class ChatIn(BaseModel):
-    text: str
-
-@with_conn
-def chat_timeout_set(cur, actor_id: str, user_id: str, seconds: int, reason: Optional[str]):
-    until = now_utc() + datetime.timedelta(seconds=max(1, seconds))
-    cur.execute("""INSERT INTO chat_timeouts(user_id, until, reason, created_by)
-                   VALUES (%s,%s,%s,%s)
-                   ON CONFLICT (user_id) DO UPDATE SET until=EXCLUDED.until, reason=EXCLUDED.reason, created_by=EXCLUDED.created_by""",
-                (user_id, until, reason, actor_id))
-    return {"ok": True, "until": str(until)}
-
-@with_conn
-def chat_timeout_get(cur, user_id: str):
-    cur.execute("SELECT until, reason FROM chat_timeouts WHERE user_id=%s", (user_id,))
-    r = cur.fetchone()
-    if not r: return None
-    until, reason = r
-    if until <= now_utc():
-        cur.execute("DELETE FROM chat_timeouts WHERE user_id=%s", (user_id,))
-        return None
-    delta = int((until - now_utc()).total_seconds())
-    return {"until": str(until), "seconds_left": max(0, delta), "reason": reason or ""}
-
-@with_conn
-def chat_insert(cur, user_id: str, username: str, text: str, private_to: Optional[str] = None):
-    text = (text or "").strip()
-    if not text: raise ValueError("Message is empty")
-    if len(text) > 300: raise ValueError("Message is too long (max 300)")
-    ensure_profile_row(user_id)
-    if private_to is None:
-        cur.execute("SELECT until FROM chat_timeouts WHERE user_id=%s", (user_id,))
-        r = cur.fetchone()
-        if r and r[0] > now_utc(): raise PermissionError("You are timed out")
-    cur.execute("INSERT INTO chat_messages(user_id, username, text, private_to) VALUES (%s,%s,%s,%s) RETURNING id, created_at",
-                (user_id, username, text, private_to))
-    row = cur.fetchone()
-    return {"id": int(row[0]), "created_at": str(row[1])}
-
-@with_conn
-def chat_fetch(cur, since_id: int, limit: int, for_user_id: Optional[str]):
-    if since_id <= 0:
-        cur.execute("""SELECT id, user_id, username, text, created_at, private_to
-                       FROM chat_messages
-                       WHERE private_to IS NULL
-                       ORDER BY id DESC LIMIT %s""", (limit,))
-        rows_pub = list(reversed(cur.fetchall()))
-        rows_priv = []
-        if for_user_id:
-            cur.execute("""SELECT id, user_id, username, text, created_at, private_to
-                           FROM chat_messages
-                           WHERE private_to=%s
-                           ORDER BY id DESC LIMIT %s""", (for_user_id, limit))
-            rows_priv = list(reversed(cur.fetchall()))
-        rows = sorted(rows_pub + rows_priv, key=lambda r: r[0])
-    else:
-        if for_user_id:
-            cur.execute("""SELECT id, user_id, username, text, created_at, private_to
-                           FROM chat_messages
-                           WHERE id>%s AND (private_to IS NULL OR private_to=%s)
-                           ORDER BY id ASC LIMIT %s""", (since_id, for_user_id, limit))
-        else:
-            cur.execute("""SELECT id, user_id, username, text, created_at, private_to
-                           FROM chat_messages
-                           WHERE id>%s AND private_to IS NULL
-                           ORDER BY id ASC LIMIT %s""", (since_id, limit))
-        rows = cur.fetchall()
-
-    uids = list({str(r[1]) for r in rows})
-    levels: Dict[str, int] = {}
-    roles: Dict[str, str] = {}
-    if uids:
-        cur.execute("SELECT user_id, xp, role FROM profiles WHERE user_id = ANY(%s)", (uids,))
-        for uid, xp, role in cur.fetchall():
-            levels[str(uid)] = 1 + int(xp) // 100
-            roles[str(uid)] = role or "member"
-    out = []
-    for mid, uid, uname, txt, ts, priv in rows:
-        uid = str(uid)
-        out.append({"id": int(mid), "user_id": uid, "username": uname,
-                    "level": int(levels.get(uid,1)), "role": roles.get(uid,"member"),
-                    "text": txt, "created_at": str(ts), "private_to": priv})
-    return out
-
-@with_conn
-def chat_delete(cur, message_id: int):
-    cur.execute("DELETE FROM chat_messages WHERE id=%s", (message_id,))
-    return {"ok": True}
-
-@app.post("/api/chat/send")
-async def api_chat_send(request: Request, body: ChatIn):
-    s = _require_session(request)
-    return chat_insert(s["id"], s["username"], body.text, None)
-
-@app.get("/api/chat/fetch")
-async def api_chat_fetch(request: Request, since: int = 0, limit: int = 30):
-    uid = None
-    try:
-        sess = _require_session(request)
-        uid = sess["id"]
-    except:
-        pass
-    rows = chat_fetch(since, limit, uid)
-    return {"rows": rows}
-
-@app.post("/api/chat/delete")
-async def api_chat_del(request: Request, id: int):
-    s = _require_session(request)
-    role = get_role(s["id"])
-    if role not in ("admin","owner"): raise HTTPException(403, "No permission")
-    return chat_delete(id)
-
 # ---------- Discord Join ----------
+async def discord_refresh_token(user_id: str):
+    rec = get_tokens(user_id)
+    if not rec or not rec.get("refresh_token"): return None
+    if not CLIENT_ID or not CLIENT_SECRET: return None
+    async with httpx.AsyncClient(timeout=15) as cx:
+        data = {"client_id": CLIENT_ID, "client_secret": CLIENT_SECRET, "grant_type": "refresh_token",
+                "refresh_token": rec["refresh_token"]}
+        r = await cx.post(f"{DISCORD_API}/oauth2/token", data=data,
+                          headers={"Content-Type":"application/x-www-form-urlencoded"})
+        if r.status_code != 200: return None
+        js = r.json()
+        save_tokens(user_id, js.get("access_token",""), js.get("refresh_token"), js.get("expires_in"))
+        return js.get("access_token")
+
+@with_conn
+def get_tokens(cur, user_id: str):
+    cur.execute("SELECT access_token, refresh_token, expires_at FROM oauth_tokens WHERE user_id=%s", (user_id,))
+    r = cur.fetchone()
+    return {"access_token": r[0], "refresh_token": r[1], "expires_at": r[2]} if r else None
+
+async def discord_get_valid_access_token(user_id: str):
+    rec = get_tokens(user_id)
+    if not rec: return None
+    exp = rec.get("expires_at")
+    if exp and isinstance(exp, datetime.datetime) and exp.tzinfo is None:
+        exp = exp.replace(tzinfo=UTC)
+    if (not exp) or (exp - now_utc() < datetime.timedelta(seconds=30)):
+        tok = await discord_refresh_token(user_id)
+        if tok: return tok
+    return rec.get("access_token")
+
+async def guild_add_member(user_id: str, nickname: Optional[str] = None):
+    if not (DISCORD_BOT_TOKEN and GUILD_ID):
+        raise HTTPException(500, "Discord bot or guild not configured")
+    access = await discord_get_valid_access_token(user_id)
+    if not access: raise HTTPException(400, "Missing OAuth token. Re-login needed.")
+    payload = {"access_token": access}
+    if nickname: payload["nick"] = nickname
+    async with httpx.AsyncClient(timeout=15) as cx:
+        url = f"{DISCORD_API}/guilds/{GUILD_ID}/members/{user_id}"
+        r = await cx.put(url, json=payload, headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"})
+        if r.status_code in (201, 204, 409): return {"ok": True}
+        raise HTTPException(r.status_code, f"Discord join failed: {r.text}")
+
 @app.post("/api/discord/join")
 async def api_discord_join(request: Request):
     s = _require_session(request)
     nick = get_profile_name(s["id"]) or s["username"]
     return await guild_add_member(s["id"], nickname=nick)
 
-# ---------- HTML (UI/UX) ----------
+# ---------- Inline UI (About Us last tab) ----------
 HTML_TEMPLATE = """
 <!doctype html><html lang="en"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
@@ -867,10 +672,10 @@ HTML_TEMPLATE = """
 <style>
 :root{--bg:#0b0f14;--bg2:#111825;--card:#121a2a;--text:#e7eefc;--muted:#9db0ce;--pri:#52a7ff;--good:#27d17f;--bad:#ff5c7a}
 *{box-sizing:border-box}html,body{height:100%}
-body{margin:0;background:linear-gradient(180deg,#0b0f14,#0b0f14 60%,#0b1826);color:var(--text);font:14px/1.3 system-ui,Segoe UI,Roboto,Ubuntu,sans-serif}
+body{margin:0;background:linear-gradient(180deg,#0b0f14,#0b0f14 60%,#0b1826);color:var(--text);font:14px/1.35 system-ui,Segoe UI,Roboto,Ubuntu,sans-serif}
 a{color:var(--pri);text-decoration:none}
 header{position:sticky;top:0;z-index:50;background:rgba(11,15,20,.7);backdrop-filter:blur(8px);border-bottom:1px solid #1d2740}
-.container{max-width:1000px;margin:0 auto;padding:12px}
+.container{max-width:1024px;margin:0 auto;padding:12px}
 .row{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
 .brand{font-weight:700;letter-spacing:.5px}
 .tabs{display:flex;gap:8px;flex-wrap:wrap}
@@ -893,12 +698,14 @@ input[type=number]{width:120px}
 table{width:100%;border-collapse:collapse}
 th,td{padding:6px;border-bottom:1px solid #20304e;font-size:13px}
 ul{margin:0;padding-left:18px}
-#chatList{max-height:340px;overflow:auto}
+#chatList{max-height:360px;overflow:auto}
 .chat-row{padding:6px 0;border-bottom:1px solid #1b2a45}
 .chat-name{color:#abd0ff;cursor:pointer}
 .badge{display:inline-block;padding:2px 6px;border-radius:6px;background:#20314f;color:#cfe1ff;font-size:11px;margin-left:6px}
 .mono{font-family:ui-monospace, Menlo, Consolas, monospace}
 footer{color:#6c84a7;text-align:center;padding:20px 0}
+.kv{display:inline-grid;grid-template-columns:auto auto;gap:4px 10px}
+.kv b{text-align:right}
 </style>
 </head>
 <body>
@@ -906,13 +713,13 @@ footer{color:#6c84a7;text-align:center;padding:20px 0}
   <div class="container row">
     <div class="brand">💎 GROWCB</div>
     <nav class="tabs" id="tabs">
-      <div class="tab active" data-tab="home">Home</div>
-      <div class="tab" data-tab="games">Games</div>
+      <div class="tab active" data-tab="games">Games</div>
       <div class="tab" data-tab="promo">Promo</div>
       <div class="tab" data-tab="referral">Referral</div>
       <div class="tab" data-tab="settings">Settings</div>
       <div class="tab" data-tab="chat">Chat</div>
       <div class="tab" data-tab="leaderboard">Leaderboard</div>
+      <div class="tab" data-tab="about">About Us</div>
     </nav>
     <div class="right">
       <a id="joinGuild" class="btn" style="display:none" target="_blank" rel="noopener">Join Discord</a>
@@ -922,27 +729,24 @@ footer{color:#6c84a7;text-align:center;padding:20px 0}
 </header>
 
 <main class="container">
-  <section id="home" class="active">
+  <section id="games" class="active">
     <div class="grid cols-2">
       <div class="card">
-        <h3>Welcome</h3>
-        <p class="small">Use the tabs above to play Crash/Mines, redeem promos, manage your referral, or chat.</p>
-      </div>
-      <div class="card">
-        <h3>Your Account</h3>
+        <h3>Account</h3>
         <div id="acctBox" class="small">Checking session…</div>
         <div id="balBox" class="small"></div>
       </div>
+      <div class="card">
+        <h3>Quick Links</h3>
+        <div class="small">Use the tabs to explore games, chat, promos, and more.</div>
+      </div>
     </div>
-  </section>
-
-  <section id="games">
-    <div class="grid cols-2">
+    <div class="grid cols-2" style="margin-top:12px">
       <div class="card">
         <h3>Crash</h3>
         <div class="small" id="crashState">Loading…</div>
         <div class="row" style="margin-top:8px">
-          <input id="crBet" type="number" step="0.01" min="1" placeholder="Bet"/>
+          <input id="crBet" type="number" step="0.01" min="0.01" placeholder="Bet"/>
           <input id="crCash" type="number" step="0.01" min="1.01" value="2.0" />
           <button class="btn primary" id="crPlace">Place</button>
           <button class="btn good" id="crCashout">Cashout</button>
@@ -952,7 +756,7 @@ footer{color:#6c84a7;text-align:center;padding:20px 0}
       <div class="card">
         <h3>Mines</h3>
         <div class="row">
-          <input id="mnBet" type="number" step="0.01" min="1" placeholder="Bet"/>
+          <input id="mnBet" type="number" step="0.01" min="0.01" placeholder="Bet"/>
           <select id="mnMines">
             <option value="3">3 mines</option><option value="5">5</option><option value="8">8</option>
           </select>
@@ -1005,259 +809,163 @@ footer{color:#6c84a7;text-align:center;padding:20px 0}
     <div class="card">
       <h3>Chat</h3>
       <div id="chatList"></div>
-      <div class="row" style="margin-top:8px">
-        <input id="chatInput" placeholder="Say something…"/>
+      <div class="row">
+        <input id="chatMsg" placeholder="Type a message…" style="flex:1"/>
         <button id="chatSend" class="btn primary">Send</button>
       </div>
-      <div class="small">Tip: click a name to view their public profile.</div>
     </div>
   </section>
 
   <section id="leaderboard">
     <div class="card">
       <h3>Leaderboard</h3>
-      <div class="row">
-        <select id="lbPeriod">
-          <option value="daily">Daily</option>
-          <option value="monthly">Monthly</option>
-          <option value="all">All-time</option>
-        </select>
-        <button id="lbLoad" class="btn primary">Load</button>
-      </div>
       <table id="lbTable"><thead><tr><th>User</th><th>Total Wagered</th></tr></thead><tbody></tbody></table>
     </div>
   </section>
 
-  <footer class="small">© GROWCB</footer>
+  <section id="about">
+    <div class="card">
+      <h3>About Us</h3>
+      <p class="small">
+        Welcome to GROWCB.  
+        This section is for your own custom text.  
+        You can edit it later in <code>main.py</code> under the About tab.
+      </p>
+    </div>
+  </section>
 </main>
 
+<footer><div class="container">© 2025 GROWCB</div></footer>
+
 <script>
-const el = (id)=>document.getElementById(id);
-const $ = (sel,root=document)=>root.querySelector(sel);
-const $$ = (sel,root=document)=>Array.from(root.querySelectorAll(sel));
-
-function setActive(tab){
-  $$("#tabs .tab").forEach(t=>t.classList.toggle("active", t.dataset.tab===tab));
-  $$("main section").forEach(s=>s.classList.toggle("active", s.id===tab));
-}
-
-$("#tabs").addEventListener("click",e=>{
-  const t=e.target.closest(".tab"); if(!t) return;
-  setActive(t.dataset.tab);
+const tabs = document.querySelectorAll(".tab");
+tabs.forEach(t => t.onclick = () => {
+  tabs.forEach(x => x.classList.remove("active"));
+  document.querySelectorAll("main section").forEach(s => s.classList.remove("active"));
+  t.classList.add("active");
+  document.getElementById(t.dataset.tab).classList.add("active");
 });
 
-async function jget(u){ const r=await fetch(u); if(!r.ok) throw r; return r.json(); }
-async function jpost(u,body){ const r=await fetch(u,{method:"POST",headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})}); if(!r.ok) throw r; return r.json(); }
+async function fetchJSON(url, opts) {
+  const r = await fetch(url, opts);
+  if (!r.ok) throw new Error(await r.text());
+  return await r.json();
+}
 
-let authed=false;
-
-async function loadMe(){
-  try{
-    const me = await jget("/api/me");
-    authed = true;
-    el("userBox").innerHTML = \`<span class="small">👤 \${me.username}</span>\`;
-    el("joinGuild").style.display = "inline-block";
-    el("joinGuild").href = "${DISCORD_INVITE or ''}" || "#";
-    el("joinGuild").textContent = "Join Discord";
-    await loadBalance();
-  }catch(e){
-    authed = false;
-    el("userBox").innerHTML = '<a class="btn primary" href="/login">Login with Discord</a>';
-    el("joinGuild").style.display = "none";
+// --- Session & Balance ---
+async function loadMe() {
+  try {
+    const me = await fetchJSON("/api/me");
+    document.getElementById("userBox").innerHTML =
+      `<img src="${me.avatar_url}" style="width:20px;border-radius:50%;vertical-align:middle;margin-right:6px"/> ${me.username}`;
+    if (me.in_guild) document.getElementById("joinGuild").style.display = "none";
+    else {
+      document.getElementById("joinGuild").style.display = "";
+      document.getElementById("joinGuild").href = "${DISCORD_INVITE}";
+    }
+    const bal = await fetchJSON("/api/balance");
+    document.getElementById("acctBox").textContent = "Logged in as " + me.username;
+    document.getElementById("balBox").textContent = "Balance: " + bal.balance.toFixed(2) + " DL";
+  } catch {
+    document.getElementById("acctBox").innerHTML = '<a href="/login" class="btn primary">Login with Discord</a>';
   }
 }
-async function loadBalance(){
-  try{
-    const b = await jget("/api/balance");
-    el("acctBox").textContent = "Logged in.";
-    el("balBox").textContent = "Balance: " + b.balance.toFixed(2);
-  }catch(e){
-    el("acctBox").innerHTML = 'Not logged in. <a href="/login">Login</a> to play.';
+loadMe();
+
+// --- Crash ---
+async function loadCrash() {
+  try {
+    const st = await fetchJSON("/api/crash/state");
+    document.getElementById("crashState").textContent = "Phase: " + st.phase + (st.current_multiplier ? (" ×" + st.current_multiplier) : "");
+    document.getElementById("crBusts").textContent = (st.last_busts||[]).join(", ");
+  } catch(e) {
+    document.getElementById("crashState").textContent = "Error loading crash";
   }
 }
+document.getElementById("crPlace").onclick = async () => {
+  try {
+    const b = document.getElementById("crBet").value;
+    const c = document.getElementById("crCash").value;
+    await fetchJSON("/api/crash/place", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({bet:b,cashout:c})});
+    loadCrash();
+  } catch(e){ alert(e); }
+};
+document.getElementById("crCashout").onclick = async () => {
+  try { await fetchJSON("/api/crash/cashout",{method:"POST"}); loadCrash(); } catch(e){ alert(e); }
+};
+setInterval(loadCrash, 5000);
 
-async function loadPromo(){
-  if(!authed) return;
-  try{
-    const d = await jget("/api/promo/my");
-    const tb = $("#promoTable tbody"); tb.innerHTML="";
-    d.rows.forEach(r=>{
-      const tr = document.createElement("tr");
-      tr.innerHTML = \`<td class="mono">\${r.code}</td><td>\${r.redeemed_at}</td>\`;
-      tb.appendChild(tr);
-    });
-  }catch(e){}
+// --- Mines ---
+let mnState=null;
+document.getElementById("mnStart").onclick = async () => {
+  try {
+    const b=document.getElementById("mnBet").value;
+    const m=document.getElementById("mnMines").value;
+    mnState=await fetchJSON("/api/mines/start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({bet:b,mines:m})});
+    renderMines();
+  } catch(e){ alert(e); }
+};
+document.getElementById("mnCashout").onclick = async () => {
+  try{ await fetchJSON("/api/mines/cashout",{method:"POST"}); mnState=null; renderMines(); }catch(e){ alert(e); }
+};
+function renderMines(){
+  const g=document.getElementById("mnGrid"); g.innerHTML="";
+  if(!mnState||!mnState.cells) return;
+  mnState.cells.forEach((c,i)=>{
+    const d=document.createElement("div");
+    d.className="card"; d.style.padding="20px"; d.style.textAlign="center"; d.textContent=c==="?"?"?":c;
+    d.onclick=async()=>{ try{ mnState=await fetchJSON("/api/mines/pick?cell="+i,{method:"POST"}); renderMines(); }catch(e){ alert(e);} };
+    g.appendChild(d);
+  });
+  document.getElementById("mnInfo").textContent="Bet: "+mnState.bet+" | Mines: "+mnState.mines;
 }
-$("#promoBtn").addEventListener("click", async ()=>{
-  if(!authed) return alert("Login first");
-  const code = el("promoCode").value.trim();
-  if(!code) return;
-  el("promoMsg").textContent = "Redeeming…";
-  try{
-    const res = await jpost("/api/promo/redeem",{code});
-    el("promoMsg").textContent = "Redeemed! New balance: "+res.new_balance.toFixed(2);
-    await loadBalance(); await loadPromo();
-  }catch(e){
-    const txt = await e.text(); el("promoMsg").textContent = "Error: "+txt;
-  }
-});
 
-async function loadRef(){
-  if(!authed) return;
-  try{
-    const d = await jget("/api/referral/state");
-    el("refName").value = d.name || "";
-    const url = location.origin + "/r/" + (d.name || "yourname");
-    el("refInfo").innerHTML = \`Referral link: <span class="mono">\${url}</span><br/>Clicks: \${d.clicks} • Joined: \${d.joined}\`;
-  }catch(e){}
-}
-$("#refSet").addEventListener("click", async ()=>{
-  if(!authed) return alert("Login first");
-  const name = el("refName").value.trim();
-  if(!name) return;
-  try{
-    await jpost("/api/referral/set",{name});
-    await loadRef();
-  }catch(e){ alert("Failed: "+await e.text()); }
-});
-
-async function loadSettings(){
-  if(!authed) return;
-  try{
-    const d = await jget("/api/settings/get");
-    el("anonChk").checked = !!d.is_anon;
-  }catch(e){}
-}
-$("#saveAnon").addEventListener("click", async ()=>{
-  if(!authed) return alert("Login first");
-  try{
-    await jpost("/api/settings/set_anon",{is_anon: el("anonChk").checked});
-    el("setMsg").textContent = "Saved.";
-  }catch(e){ el("setMsg").textContent = "Failed: "+await e.text(); }
-});
-
-async function loadLb(){
-  try{
-    const d = await jget("/api/leaderboard?period="+el("lbPeriod").value);
-    const tb = $("#lbTable tbody"); tb.innerHTML="";
-    d.rows.forEach(r=>{
-      const name = r.is_anon ? "Anonymous" : r.display_name;
-      const tr = document.createElement("tr");
-      tr.innerHTML = \`<td>\${name}</td><td class="mono">\${r.total_wagered.toFixed(2)}</td>\`;
-      tb.appendChild(tr);
-    });
-  }catch(e){}
-}
-$("#lbLoad").addEventListener("click", loadLb);
-
-let crashTimer = null;
-async function loadCrash(){
-  try{
-    const d = await jget("/api/crash/state");
-    el("crashState").textContent = \`Phase: \${d.phase} \${d.current_multiplier?("• x"+d.current_multiplier.toFixed(2)):""}\`;
-    el("crBusts").textContent = (d.last_busts||[]).map(x=>"x"+Number(x).toFixed(2)).join(" · ");
-  }catch(e){ el("crashState").textContent = "Failed to load."; }
-}
-$("#crPlace").addEventListener("click", async ()=>{
-  if(!authed) return alert("Login first");
-  const bet = el("crBet").value||"0"; const cashout = parseFloat(el("crCash").value||"2");
-  try{ await jpost("/api/crash/place",{bet, cashout}); await loadCrash(); await loadBalance(); }
-  catch(e){ alert("Bet failed: "+await e.text()); }
-});
-$("#crCashout").addEventListener("click", async ()=>{
-  if(!authed) return alert("Login first");
-  try{ await jpost("/api/crash/cashout",{}); await loadCrash(); await loadBalance(); }
-  catch(e){ alert("Cashout failed: "+await e.text()); }
-});
-
-function renderMines(st){
-  const g = el("mnGrid"); g.innerHTML="";
-  const info = el("mnInfo");
-  if(!st || !st.board){ info.textContent = "No active game."; return; }
-  info.textContent = \`Bet: \${Number(st.bet).toFixed(2)} • Cashout: \${Number(st.cashout).toFixed(2)} • Mines: \${st.mines}\`;
-  for(let i=0;i<25;i++){
-    const b=document.createElement("button");
-    b.className="btn"; b.textContent = st.revealed && st.revealed.includes(i) ? (st.mines_positions && st.mines_positions.includes(i)?"💥":"💎") : i+1;
-    b.disabled = !!(st.ended || (st.revealed && st.revealed.includes(i)));
-    b.style.minHeight="44px";
-    b.addEventListener("click", async ()=>{
-      try{ const r=await jpost("/api/mines/pick?index="+i,{}); renderMines(r); await loadBalance(); }
-      catch(e){ alert("Pick failed: "+await e.text()); }
-    });
-    g.appendChild(b);
-  }
-}
-async function loadMines(){
-  if(!authed) return;
-  try{ const st=await jget("/api/mines/state"); renderMines(st); }
-  catch(e){ el("mnInfo").textContent="No game."; }
-}
-$("#mnStart").addEventListener("click", async ()=>{
-  if(!authed) return alert("Login first");
-  try{
-    const r = await jpost("/api/mines/start",{bet: el("mnBet").value||"0", mines: Number(el("mnMines").value)});
-    renderMines(r); await loadBalance();
-  }catch(e){ alert("Start failed: "+await e.text()); }
-});
-$("#mnCashout").addEventListener("click", async ()=>{
-  if(!authed) return alert("Login first");
-  try{ const r=await jpost("/api/mines/cashout",{}); renderMines(r); await loadBalance(); }
-  catch(e){ alert("Cashout failed: "+await e.text()); }
-});
-
-async function loadChat(since=0){
-  try{
-    const d = await jget("/api/chat/fetch?since="+since+"&limit=50");
-    const list = el("chatList");
-    d.rows.forEach(m=>{
-      const div = document.createElement("div"); div.className="chat-row";
-      const nm = document.createElement("span"); nm.className="chat-name"; nm.textContent=m.username;
-      nm.title="click to view public profile"; nm.addEventListener("click",()=>viewPublic(m.user_id));
-      div.appendChild(nm);
-      const lvl = document.createElement("span"); lvl.className="badge"; lvl.textContent="Lv"+m.level; div.appendChild(lvl);
-      const rl = document.createElement("span"); rl.className="badge"; rl.textContent=m.role; div.appendChild(rl);
-      const t = document.createElement("div"); t.textContent=m.text; div.appendChild(t);
+// --- Chat ---
+let lastChatId=0;
+async function loadChat(){
+  try {
+    const data=await fetchJSON("/api/chat/fetch?since="+lastChatId);
+    const list=document.getElementById("chatList");
+    data.rows.forEach(r=>{
+      lastChatId=r.id;
+      const div=document.createElement("div");
+      div.className="chat-row";
+      div.innerHTML=`<span class="chat-name" data-uid="${r.user_id}">${r.username}</span> <span class="badge">Lv${r.level}</span>: ${r.text}`;
       list.appendChild(div);
-      list.scrollTop = list.scrollHeight;
     });
-    return d.rows.length? d.rows[d.rows.length-1].id : since;
-  }catch(e){ return since; }
+    list.scrollTop=list.scrollHeight;
+  }catch(e){}
 }
-
-async function viewPublic(uid){
+document.getElementById("chatSend").onclick=async()=>{
   try{
-    const d = await jget("/api/public/"+uid);
-    alert("Public profile\\nName: "+d.name+"\\nLevel: "+d.level+"\\nXP: "+d.xp+"\\nRole: "+d.role);
-  }catch(e){ alert("User not found"); }
-}
+    const t=document.getElementById("chatMsg").value;
+    if(!t) return;
+    await fetchJSON("/api/chat/send",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text:t})});
+    document.getElementById("chatMsg").value="";
+    loadChat();
+  }catch(e){alert(e);}
+};
+setInterval(loadChat,4000);
 
-$("#chatSend").addEventListener("click", async ()=>{
-  if(!authed) return alert("Login first");
-  const text = el("chatInput").value.trim(); if(!text) return;
-  try{ await jpost("/api/chat/send",{text}); el("chatInput").value=""; await loadChat(); }
-  catch(e){ alert("Send failed: "+await e.text()); }
-});
-
-async function boot(){
-  setActive("home");
-  await loadMe();
-  await Promise.all([loadPromo(), loadRef(), loadSettings(), loadLb(), loadCrash(), loadMines(), loadChat()]);
-  // pollers
-  setInterval(loadCrash, 1200);
+// --- Leaderboard ---
+async function loadLb(){
+  const d=await fetchJSON("/api/leaderboard");
+  const tb=document.querySelector("#lbTable tbody"); tb.innerHTML="";
+  d.rows.forEach(r=>{
+    const tr=document.createElement("tr");
+    tr.innerHTML="<td>"+r.display_name+"</td><td>"+r.total_wagered.toFixed(2)+"</td>";
+    tb.appendChild(tr);
+  });
 }
-boot();
+setInterval(loadLb,10000); loadLb();
 </script>
 </body></html>
 """
 
-# ---------- Root page ----------
-@app.get("/", response_class=HTMLResponse)
+@app.get("/")
 async def index():
-    html = HTML_TEMPLATE.replace("__INVITE__", DISCORD_INVITE or "__INVITE__") \
-                        .replace("__OWNER_ID__", str(OWNER_ID))
-    return HTMLResponse(html)
+    return HTMLResponse(HTML_TEMPLATE)
 
-# ---------- Utility: run local (optional) ----------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=True)

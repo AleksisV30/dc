@@ -1,4 +1,4 @@
-# app/main.py — single-file site + bot
+# app/main.py
 
 import os, json, asyncio, re, random, string, datetime, base64
 from urllib.parse import urlencode
@@ -18,8 +18,7 @@ from pydantic import BaseModel
 import discord
 from discord.ext import commands
 
-# ---------- Import games from separate files ----------
-# (ensure crash.py and mines.py are in the same folder)
+# ---------- Game engines (local modules) ----------
 from crash import (
     ensure_betting_round, place_bet, load_round, begin_running,
     finish_round, create_next_betting, last_busts, your_bet,
@@ -43,7 +42,8 @@ OWNER_ID = int(os.getenv("OWNER_ID", "1128658280546320426"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
-DISCORD_INVITE = os.getenv("DISCORD_INVITE", "")  # optional vanity invite
+DISCORD_INVITE = os.getenv("DISCORD_INVITE", "")
+SITE_BASE = os.getenv("SITE_BASE", "https://growcb.net")
 
 GEM = "💎"
 MIN_BET = Decimal("1.00")
@@ -63,45 +63,40 @@ def iso(dt: Optional[datetime.datetime]) -> Optional[str]:
     if dt is None: return None
     return dt.astimezone(UTC).isoformat()
 
-# ---------- App / Lifespan / Static ----------
+# ---------- App / Lifespan ----------
 def _get_static_dir():
     base = os.path.dirname(os.path.abspath(__file__))
     static_dir = os.path.join(base, "static")
     try: os.makedirs(static_dir, exist_ok=True)
-    except: pass
+    except Exception: pass
     return static_dir
 
-# Discord bot setup (help disabled so we can register our own)
+# Discord bot (disable default help, allow message content)
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
-_bot_task: Optional[asyncio.Task] = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
     apply_migrations()
-    # start discord bot in background
-    global _bot_task
+    bot_task = None
     if DISCORD_BOT_TOKEN:
-        async def _run():
+        bot_task = asyncio.create_task(bot.start(DISCORD_BOT_TOKEN))
+    try:
+        yield
+    finally:
+        if bot_task:
             try:
-                await bot.start(DISCORD_BOT_TOKEN)
-            except Exception as e:
-                print("Bot failed to start:", e)
-        _bot_task = asyncio.create_task(_run())
-    yield
-    # shutdown
-    if _bot_task:
-        try:
-            await bot.close()
-        except Exception:
-            pass
+                await bot.close()
+            except Exception:
+                pass
+            bot_task.cancel()
 
 app = FastAPI(lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=_get_static_dir()), name="static")
 
-# Serve images from same dir or /static fallback
+# ---------- Images from local folder or /static ----------
 _TRANSPARENT_PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
 )
@@ -109,19 +104,20 @@ _TRANSPARENT_PNG = base64.b64decode(
 @app.get("/img/{filename}")
 async def serve_img(filename: str):
     base = os.path.dirname(os.path.abspath(__file__))
-    p1 = os.path.join(base, filename)
-    p2 = os.path.join(base, "static", filename)
-    for p in (p1, p2):
+    for p in (os.path.join(base, filename), os.path.join(base, "static", filename)):
         if os.path.isfile(p):
             return FileResponse(p)
     return Response(content=_TRANSPARENT_PNG, media_type="image/png")
 
 # ---------- Sessions ----------
 SER = URLSafeSerializer(SECRET_KEY, salt="session-v1")
+
 def _set_session(resp, data: dict):
     resp.set_cookie("session", SER.dumps(data), max_age=30*86400, httponly=True, samesite="lax")
+
 def _clear_session(resp):
     resp.delete_cookie("session")
+
 def _require_session(request: Request) -> dict:
     raw = request.cookies.get("session")
     if not raw: raise HTTPException(401, "Not logged in")
@@ -153,7 +149,7 @@ def init_db(cur):
             balance NUMERIC(18,2) NOT NULL DEFAULT 0
         )
     """)
-    # balance_log
+    # balance log
     cur.execute("""
         CREATE TABLE IF NOT EXISTS balance_log (
             id BIGSERIAL PRIMARY KEY,
@@ -177,7 +173,7 @@ def init_db(cur):
             created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # oauth tokens
+    # oauth
     cur.execute("""
         CREATE TABLE IF NOT EXISTS oauth_tokens (
             user_id TEXT PRIMARY KEY,
@@ -187,117 +183,138 @@ def init_db(cur):
         )
     """)
     # referral
-    cur.execute("""CREATE TABLE IF NOT EXISTS ref_names (
-        user_id TEXT PRIMARY KEY,
-        name_lower TEXT UNIQUE NOT NULL,
-        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-    )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS ref_visits (
-        id BIGSERIAL PRIMARY KEY,
-        referrer_id TEXT NOT NULL,
-        joined_user_id TEXT,
-        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-    )""")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS ref_names (
+            user_id TEXT PRIMARY KEY,
+            name_lower TEXT UNIQUE NOT NULL,
+            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS ref_visits (
+            id BIGSERIAL PRIMARY KEY,
+            referrer_id TEXT NOT NULL,
+            joined_user_id TEXT,
+            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
     # promos
-    cur.execute("""CREATE TABLE IF NOT EXISTS promo_codes (
-        code TEXT PRIMARY KEY,
-        amount NUMERIC(18,2) NOT NULL,
-        max_uses INTEGER NOT NULL DEFAULT 1,
-        uses INTEGER NOT NULL DEFAULT 0,
-        expires_at TIMESTAMPTZ,
-        created_by TEXT,
-        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-    )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS promo_redemptions (
-        user_id TEXT NOT NULL,
-        code TEXT NOT NULL,
-        redeemed_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-        PRIMARY KEY(user_id, code)
-    )""")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS promo_codes (
+            code TEXT PRIMARY KEY,
+            amount NUMERIC(18,2) NOT NULL,
+            max_uses INTEGER NOT NULL DEFAULT 1,
+            uses INTEGER NOT NULL DEFAULT 0,
+            expires_at TIMESTAMPTZ,
+            created_by TEXT,
+            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS promo_redemptions (
+            user_id TEXT NOT NULL,
+            code TEXT NOT NULL,
+            redeemed_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(user_id, code)
+        )
+    """)
     # crash
-    cur.execute("""CREATE TABLE IF NOT EXISTS crash_rounds (
-        id BIGSERIAL PRIMARY KEY,
-        status TEXT NOT NULL,
-        bust NUMERIC(10,2),
-        betting_opens_at TIMESTAMPTZ NOT NULL,
-        betting_ends_at TIMESTAMPTZ NOT NULL,
-        started_at TIMESTAMPTZ,
-        expected_end_at TIMESTAMPTZ,
-        ended_at TIMESTAMPTZ
-    )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS crash_bets (
-        round_id BIGINT NOT NULL,
-        user_id TEXT NOT NULL,
-        bet NUMERIC(18,2) NOT NULL,
-        cashout NUMERIC(8,2) NOT NULL,
-        cashed_out NUMERIC(8,2),
-        cashed_out_at TIMESTAMPTZ,
-        win NUMERIC(18,2) NOT NULL DEFAULT 0,
-        resolved BOOLEAN NOT NULL DEFAULT FALSE,
-        PRIMARY KEY(round_id, user_id)
-    )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS crash_games (
-        id BIGSERIAL PRIMARY KEY,
-        user_id TEXT NOT NULL,
-        bet NUMERIC(18,2) NOT NULL,
-        cashout NUMERIC(8,2) NOT NULL,
-        bust NUMERIC(10,2) NOT NULL,
-        win NUMERIC(18,2) NOT NULL,
-        xp_gain INTEGER NOT NULL,
-        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-    )""")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS crash_rounds (
+            id BIGSERIAL PRIMARY KEY,
+            status TEXT NOT NULL,
+            bust NUMERIC(10,2),
+            betting_opens_at TIMESTAMPTZ NOT NULL,
+            betting_ends_at TIMESTAMPTZ NOT NULL,
+            started_at TIMESTAMPTZ,
+            expected_end_at TIMESTAMPTZ,
+            ended_at TIMESTAMPTZ
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS crash_bets (
+            round_id BIGINT NOT NULL,
+            user_id TEXT NOT NULL,
+            bet NUMERIC(18,2) NOT NULL,
+            cashout NUMERIC(8,2) NOT NULL,
+            cashed_out NUMERIC(8,2),
+            cashed_out_at TIMESTAMPTZ,
+            win NUMERIC(18,2) NOT NULL DEFAULT 0,
+            resolved BOOLEAN NOT NULL DEFAULT FALSE,
+            PRIMARY KEY(round_id, user_id)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS crash_games (
+            id BIGSERIAL PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            bet NUMERIC(18,2) NOT NULL,
+            cashout NUMERIC(8,2) NOT NULL,
+            bust NUMERIC(10,2) NOT NULL,
+            win NUMERIC(18,2) NOT NULL,
+            xp_gain INTEGER NOT NULL,
+            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
     # chat
-    cur.execute("""CREATE TABLE IF NOT EXISTS chat_messages (
-        id BIGSERIAL PRIMARY KEY,
-        user_id TEXT NOT NULL,
-        username TEXT NOT NULL,
-        text TEXT NOT NULL,
-        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-        private_to TEXT
-    )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS chat_timeouts (
-        user_id TEXT PRIMARY KEY,
-        until TIMESTAMPTZ NOT NULL,
-        reason TEXT,
-        created_by TEXT,
-        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-    )""")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS chat_messages (
+            id BIGSERIAL PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            username TEXT NOT NULL,
+            text TEXT NOT NULL,
+            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+            private_to TEXT
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS chat_timeouts (
+            user_id TEXT PRIMARY KEY,
+            until TIMESTAMPTZ NOT NULL,
+            reason TEXT,
+            created_by TEXT,
+            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
     # mines
-    cur.execute("""CREATE TABLE IF NOT EXISTS mines_games (
-        id BIGSERIAL PRIMARY KEY,
-        user_id TEXT NOT NULL,
-        bet NUMERIC(18,2) NOT NULL,
-        mines INTEGER NOT NULL,
-        board TEXT NOT NULL,
-        picks BIGINT NOT NULL DEFAULT 0,
-        started_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-        ended_at TIMESTAMPTZ,
-        status TEXT NOT NULL DEFAULT 'active',
-        seed TEXT NOT NULL,
-        commit_hash TEXT NOT NULL,
-        win NUMERIC(18,2) NOT NULL DEFAULT 0
-    )""")
-    # deposit/withdraw requests
-    cur.execute("""CREATE TABLE IF NOT EXISTS transfer_requests (
-        id BIGSERIAL PRIMARY KEY,
-        kind TEXT NOT NULL, -- 'deposit' or 'withdraw'
-        user_id TEXT,
-        discord_identity TEXT,
-        grow_id TEXT,
-        world TEXT,
-        amount NUMERIC(18,2),
-        status TEXT NOT NULL DEFAULT 'pending',
-        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-    )""")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS mines_games (
+            id BIGSERIAL PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            bet NUMERIC(18,2) NOT NULL,
+            mines INTEGER NOT NULL,
+            board TEXT NOT NULL,
+            picks BIGINT NOT NULL DEFAULT 0,
+            started_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+            ended_at TIMESTAMPTZ,
+            status TEXT NOT NULL DEFAULT 'active',
+            seed TEXT NOT NULL,
+            commit_hash TEXT NOT NULL,
+            win NUMERIC(18,2) NOT NULL DEFAULT 0
+        )
+    """)
+    # transfers (deposit/withdraw)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS transfer_requests (
+            id BIGSERIAL PRIMARY KEY,
+            kind TEXT NOT NULL,           -- 'deposit' | 'withdraw'
+            user_id TEXT,
+            discord_identity TEXT,
+            grow_id TEXT,
+            world TEXT NOT NULL,
+            amount NUMERIC(18,2),
+            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
 
 # ---- balances / profiles ----
 @with_conn
 def get_balance(cur, user_id: str) -> Decimal:
-    cur.execute("SELECT balance FROM balances WHERE user_id = %s", (user_id,))
+    cur.execute("SELECT balance FROM balances WHERE user_id=%s", (user_id,))
     row = cur.fetchone(); return q2(row[0]) if row else Decimal("0.00")
 
 @with_conn
-def adjust_balance(cur, actor_id: str, target_id: str, amount, reason: Optional[str]) -> Decimal:
+def adjust_balance(cur, actor_id: str, target_id: str, amount, reason: Optional[str]):
     amount = q2(D(amount))
     cur.execute("INSERT INTO balances (user_id, balance) VALUES (%s, 0) ON CONFLICT (user_id) DO NOTHING", (target_id,))
     cur.execute("UPDATE balances SET balance = balance + %s WHERE user_id = %s", (amount, target_id))
@@ -513,6 +530,8 @@ def apply_migrations(cur):
     cur.execute("CREATE INDEX IF NOT EXISTS ix_crash_games_created_at ON crash_games (created_at)")
     cur.execute("CREATE INDEX IF NOT EXISTS ix_mines_games_started_at ON mines_games (started_at)")
     cur.execute("ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS private_to TEXT")
+    cur.execute("CREATE INDEX IF NOT EXISTS ix_transfer_kind ON transfer_requests(kind)")
+    cur.execute("CREATE INDEX IF NOT EXISTS ix_ref_names ON ref_names(name_lower)")
 
 # ---------- OAuth token store & Discord join ----------
 @with_conn
@@ -632,10 +651,7 @@ async def logout():
 # ---------- Me / Profile / Balance ----------
 @app.get("/api/me")
 async def api_me(request: Request):
-    try:
-        s = _require_session(request)
-    except:
-        return {"id": None, "username": None, "avatar_url": None, "in_guild": False}
+    s = _require_session(request)
     in_guild = False
     if DISCORD_BOT_TOKEN and GUILD_ID:
         try:
@@ -657,13 +673,11 @@ async def api_profile(request: Request):
     s = _require_session(request)
     return profile_info(s["id"])
 
-# Public profile for chat clicks
 @app.get("/api/profile/public")
 async def api_profile_public(user_id: str = Query(...)):
-    data = public_profile(user_id)
-    if not data:
-        raise HTTPException(404, "User not found")
-    return data
+    p = public_profile(user_id)
+    if not p: raise HTTPException(404, "Not found")
+    return p
 
 # ---------- Settings (Anonymous mode) ----------
 class AnonIn(BaseModel):
@@ -680,7 +694,7 @@ async def api_settings_set_anon(request: Request, body: AnonIn):
     s = _require_session(request)
     return set_profile_is_anon(s["id"], bool(body.is_anon))
 
-# ---------- Leaderboard ----------
+# ---------- Leaderboard API ----------
 @app.get("/api/leaderboard")
 async def api_leaderboard(period: str = Query("daily"), limit: int = Query(50, ge=1, le=200)):
     rows = get_leaderboard_rows_db(period, limit)
@@ -711,6 +725,31 @@ def set_ref_name(cur, user_id: str, name: str):
     """, (user_id, lower))
     return {"ok": True, "name": lower}
 
+def _record_ref_visit(refname: str):
+    with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
+        cur.execute("SELECT user_id FROM ref_names WHERE name_lower=%s", (refname,))
+        r = cur.fetchone()
+        if r:
+            referrer = str(r[0])
+            cur.execute("INSERT INTO ref_visits(referrer_id) VALUES (%s)", (referrer,))
+            con.commit()
+
+@app.get("/referral/{refname}")
+async def referral_landing_new(refname: str):
+    rn = (refname or "").lower()
+    _record_ref_visit(rn)
+    html = f"""
+    <script>
+      document.cookie = "refname={rn}; path=/; max-age=1209600; samesite=lax";
+      location.href = "/";
+    </script>
+    """
+    return HTMLResponse(html)
+
+@app.get("/r/{refname}")
+async def referral_landing_old(refname: str):
+    return await referral_landing_new(refname)
+
 @app.get("/api/referral/state")
 async def api_ref_state(request: Request):
     s = _require_session(request)
@@ -723,24 +762,6 @@ class RefIn(BaseModel):
 async def api_ref_set(request: Request, body: RefIn):
     s = _require_session(request)
     return set_ref_name(s["id"], body.name)
-
-@app.get("/r/{refname}")
-async def referral_landing(refname: str, request: Request):
-    refname = (refname or "").lower()
-    with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
-        cur.execute("SELECT user_id FROM ref_names WHERE name_lower=%s", (refname,))
-        r = cur.fetchone()
-        if r:
-            referrer = str(r[0])
-            cur.execute("INSERT INTO ref_visits(referrer_id) VALUES (%s)", (referrer,))
-            con.commit()
-    html = f"""
-    <script>
-      document.cookie = "refname={refname}; path=/; max-age=1209600; samesite=lax";
-      location.href = "/";
-    </script>
-    """
-    return HTMLResponse(html)
 
 @app.get("/api/referral/attach")
 async def api_ref_attach(request: Request, refname: str = ""):
@@ -782,20 +803,6 @@ async def api_promo_redeem(request: Request, body: PromoIn):
     except (PromoInvalid, PromoExpired, PromoExhausted, PromoAlreadyRedeemed) as e:
         raise HTTPException(400, str(e))
 
-class PromoCreateIn(BaseModel):
-    code: Optional[str] = None
-    amount: str
-    max_uses: int = 1
-    expires_at: Optional[str] = None
-
-@app.post("/api/admin/promo/create")
-async def api_admin_promo_create(request: Request, body: PromoCreateIn):
-    s = _require_session(request)
-    role = get_role(s["id"])
-    if role not in ("admin", "owner"): raise HTTPException(403, "No permission")
-    res = create_promo(s["id"], body.code, body.amount, int(body.max_uses or 1), body.expires_at)
-    return res
-
 # ---------- Crash endpoints ----------
 class CrashBetIn(BaseModel):
     bet: str
@@ -803,7 +810,6 @@ class CrashBetIn(BaseModel):
 
 @app.get("/api/crash/state")
 async def api_crash_state(request: Request):
-    # allow anonymous to view
     try:
         s = _require_session(request)
         uid = s["id"]
@@ -814,12 +820,11 @@ async def api_crash_state(request: Request):
     rid, info = ensure_betting_round()
     now = now_utc()
 
-    # state machine
     if info["status"] == "betting" and now >= info["betting_ends_at"]:
         begin_running(rid)
         info = load_round()
     if info and info["status"] == "running" and info["expected_end_at"] and now >= info["expected_end_at"]:
-        finish_round(rid)  # NOTE: crash.py should call resolve_round_end(round_id, bust) WITHOUT passing cur
+        finish_round(rid)
         create_next_betting()
         info = load_round()
 
@@ -986,7 +991,7 @@ async def api_chat_send(request: Request, body: ChatIn):
     return chat_insert(s["id"], s["username"], body.text, None)
 
 @app.get("/api/chat/fetch")
-async def api_chat_fetch(request: Request, since: int = 0, limit: int = 50):
+async def api_chat_fetch(request: Request, since: int = 0, limit: int = 30):
     uid = None
     try:
         sess = _require_session(request)
@@ -1052,6 +1057,41 @@ async def api_admin_timeout_site(request: Request, body: TimeoutIn):
 async def api_admin_timeout_both(request: Request, body: TimeoutIn):
     return await api_admin_timeout_site(request, body)
 
+# ---------- Deposit / Withdraw ----------
+class TransferIn(BaseModel):
+    kind: str             # 'deposit' | 'withdraw'
+    discord_identity: Optional[str] = None
+    grow_id: Optional[str] = None
+    world: str
+    amount: Optional[str] = None
+
+@app.post("/api/transfer/create")
+async def api_transfer_create(request: Request, body: TransferIn):
+    s = None
+    try:
+        s = _require_session(request)
+    except:
+        s = None
+    kind = (body.kind or "").lower()
+    if kind not in ("deposit","withdraw"):
+        raise HTTPException(400, "Invalid kind")
+    if kind == "withdraw":
+        if not body.amount: raise HTTPException(400, "Amount required for withdraw")
+        try:
+            _ = q2(D(body.amount))
+        except: raise HTTPException(400, "Invalid amount")
+    grow_id = (body.grow_id or "").strip() or None
+    did = None
+    if s:
+        did = s["id"]
+    with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
+        cur.execute("""INSERT INTO transfer_requests(kind,user_id,discord_identity,grow_id,world,amount)
+                       VALUES (%s,%s,%s,%s,%s,%s) RETURNING id""",
+                    (kind, did, (body.discord_identity or None), grow_id, body.world.strip(), (q2(D(body.amount)) if body.amount else None)))
+        rid = int(cur.fetchone()[0])
+        con.commit()
+    return {"ok": True, "id": rid}
+
 # ---------- Discord Join ----------
 @app.post("/api/discord/join")
 async def api_discord_join(request: Request):
@@ -1059,207 +1099,133 @@ async def api_discord_join(request: Request):
     nick = get_profile_name(s["id"]) or s["username"]
     return await guild_add_member(s["id"], nickname=nick)
 
-# ---------- Deposit / Withdraw ----------
-class DepositIn(BaseModel):
-    discord_identity: Optional[str] = None
-    grow_id: str
-    world: str
-
-class WithdrawIn(BaseModel):
-    discord_identity: Optional[str] = None
-    amount: str
-    world: str
-    grow_id: Optional[str] = None  # optional info
-
-@with_conn
-def create_transfer(cur, kind: str, user_id: Optional[str], discord_identity: Optional[str],
-                    grow_id: Optional[str], world: str, amount: Optional[Decimal]):
-    cur.execute("""INSERT INTO transfer_requests(kind, user_id, discord_identity, grow_id, world, amount)
-                   VALUES(%s,%s,%s,%s,%s,%s) RETURNING id, created_at""",
-                (kind, user_id, discord_identity, grow_id, world, (q2(amount) if amount is not None else None)))
-    rid, ts = cur.fetchone()
-    return {"ok": True, "id": int(rid), "created_at": str(ts)}
-
-@app.post("/api/transfer/deposit")
-async def api_transfer_deposit(request: Request, body: DepositIn):
-    uid = None
-    try:
-        s = _require_session(request)
-        uid = s["id"]
-    except:
-        uid = None
-    if not body.grow_id or not body.world:
-        raise HTTPException(400, "grow_id and world are required")
-    return create_transfer("deposit", uid, (body.discord_identity or (s["username"] if uid else None)),
-                           body.grow_id.strip(), body.world.strip(), None)
-
-@app.post("/api/transfer/withdraw")
-async def api_transfer_withdraw(request: Request, body: WithdrawIn):
-    uid = None
-    try:
-        s = _require_session(request)
-        uid = s["id"]
-    except:
-        uid = None
-    amt = q2(D(body.amount or "0"))
-    if amt <= 0:
-        raise HTTPException(400, "Amount must be > 0")
-    if not body.world:
-        raise HTTPException(400, "World is required")
-    return create_transfer("withdraw", uid, (body.discord_identity or (s["username"] if uid else None)),
-                           (body.grow_id or None), body.world.strip(), amt)
-
 # ---------- HTML (UI/UX) ----------
 HTML_TEMPLATE = """
 <!doctype html><html lang="en"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
 <title>GROWCB</title>
 <style>
-:root{--bg:#0a0f1e;--bg2:#0c1428;--card:#111a31;--muted:#9eb3da;--text:#ecf2ff;--accent:#6aa6ff;--accent2:#22c1dc;--ok:#34d399;--warn:#f59e0b;--err:#ef4444;--border:#1f2b47;--chatW:340px;--input-bg:#0b1430;--input-br:#223457;--input-tx:#e6eeff;--input-ph:#9db4e4}
-*{box-sizing:border-box}html,body{height:100%}body{margin:0;color:var(--text);background:radial-gradient(1400px 600px at 20% -10%, #11204d 0%, transparent 60%),linear-gradient(180deg,#0a0f1e,#0a0f1e 60%, #0b1124);font-family:Inter,system-ui,Segoe UI,Roboto,Arial,Helvetica,sans-serif}
-a{color:inherit;text-decoration:none}.container{max-width:1120px;margin:0 auto;padding:16px}
+:root{
+  --bg:#0a0f1e;--bg2:#0c1428;--card:#111a31;--muted:#9eb3da;--text:#ecf2ff;
+  --accent:#6aa6ff;--accent2:#22c1dc;--ok:#34d399;--warn:#f59e0b;--err:#ef4444;--border:#1f2b47;
+  --chatW:360px;--input-bg:#0b1430;--input-br:#223457;--input-tx:#e6eeff;--input-ph:#9db4e4
+}
+*{box-sizing:border-box}html,body{height:100%}body{margin:0;color:var(--text);
+  background:radial-gradient(1400px 600px at 20% -10%, #11204d 0%, transparent 60%),linear-gradient(180deg,#0a0f1e,#0a0f1e 60%, #0b1124);
+  font-family:Inter,system-ui,Segoe UI,Roboto,Arial,Helvetica,sans-serif}
+a{color:inherit;text-decoration:none}.container{max-width:1180px;margin:0 auto;padding:16px}
 input,select,textarea{width:100%;appearance:none;background:var(--input-bg);color:var(--input-tx);border:1px solid var(--input-br);border-radius:12px;padding:10px 12px;outline:none}
 .field{display:flex;flex-direction:column;gap:6px}.row{display:grid;gap:10px}
-.row.cols-2{grid-template-columns:1fr 1fr}.row.cols-3{grid-template-columns:1fr 1fr 1fr}.row.cols-4{grid-template-columns:1.6fr 1fr 1fr auto}.row.cols-5{grid-template-columns:2fr 1fr 1fr auto auto}
+.row.cols-2{grid-template-columns:1fr 1fr}.row.cols-3{grid-template-columns:1fr 1fr 1fr}
 .card{background:linear-gradient(180deg,#0f1a33,#0b1326);border:1px solid var(--border);border-radius:16px;padding:16px}
-.header{position:sticky;top:0;z-index:70;backdrop-filter:blur(8px);background:rgba(10,15,30,.72);border-bottom:1px solid var(--border)}
-.header-inner{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px}
-.left{display:flex;align-items:center;gap:12px;flex:1;min-width:0}.brand{display:flex;align-items:center;gap:10px;font-weight:800;white-space:nowrap}
-.brand .logo{width:32px;height:32px;border-radius:10px;object-fit:contain;border:1px solid var(--border);background:linear-gradient(135deg,var(--accent),var(--accent2))}
-.tabs{display:flex;gap:4px;align-items:center;padding:4px;border-radius:14px;background:linear-gradient(180deg,#0f1a33,#0b1326);border:1px solid var(--border)}
-.tab{padding:8px 12px;border-radius:10px;cursor:pointer;font-weight:700;white-space:nowrap;color:#d8e6ff;opacity:.85;transition:all .15s ease;display:flex;align-items:center;gap:8px}
+.header{position:sticky;top:0;z-index:40;backdrop-filter:blur(8px);background:rgba(10,15,30,.78);border-bottom:1px solid var(--border)}
+.header-inner{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 12px}
+.left{display:flex;align-items:center;gap:14px;flex:1;min-width:0}.brand{display:flex;align-items:center;gap:12px;font-weight:900;white-space:nowrap}
+.brand .logo{width:48px;height:48px;border-radius:12px;object-fit:contain;border:1px solid var(--border);background:linear-gradient(135deg,var(--accent),var(--accent2))}
+.tabs{display:flex;gap:6px;align-items:center;padding:4px;border-radius:14px;background:linear-gradient(180deg,#0f1a33,#0b1326);border:1px solid var(--border)}
+.tab{padding:10px 14px;border-radius:10px;cursor:pointer;font-weight:700;white-space:nowrap;color:#d8e6ff;opacity:.85;transition:all .15s ease;display:flex;align-items:center;gap:8px}
 .tab:hover{opacity:1;transform:translateY(-1px)}.tab.active{background:linear-gradient(135deg,#3b82f6,#22c1dc);color:#051326;box-shadow:0 6px 16px rgba(59,130,246,.25);opacity:1}
-.right{display:flex;gap:8px;align-items:center;margin-left:12px}
-.chip{background:#0c1631;border:1px solid var(--border);color:#dce7ff;padding:6px 10px;border-radius:999px;font-size:12px;white-space:nowrap;cursor:pointer}
-.avatar{width:34px;height:34px;border-radius:50%;object-fit:cover;border:1px solid var(--border);cursor:pointer}
-.avatar-wrap{position:relative}.menu{position:absolute;right:0;top:40px;background:#0c1631;border:1px solid var(--border);border-radius:12px;padding:6px;display:none;min-width:180px;z-index:75}
+.right{display:flex;gap:10px;align-items:center;margin-left:12px}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:10px 14px;border-radius:14px;border:1px solid var(--border);
+     background:linear-gradient(180deg,#0e1833,#0b1326);cursor:pointer;font-weight:700;letter-spacing:.2px;transform:translateZ(0)}
+.btn:active{transform:translateY(1px)}.btn.primary{background:linear-gradient(135deg,#3b82f6,#22c1dc);border-color:transparent;color:#041018}
+.btn.soft{background:#132446;border-color:#203458}.btn.ghost{background:#162a52;border:1px solid var(--border);color:#eaf2ff}
+.chip{background:#0c1631;border:1px solid var(--border);color:#dce7ff;padding:6px 10px;border-radius:999px;font-size:12px;white-space:nowrap}
+.avatar{width:36px;height:36px;border-radius:50%;object-fit:cover;border:1px solid var(--border);cursor:pointer}
+.avatar-wrap{position:relative}.menu{position:absolute;right:0;top:42px;background:#0c1631;border:1px solid var(--border);border-radius:12px;padding:6px;display:none;min-width:180px;z-index:60}
 .menu.open{display:block}.menu .item{padding:8px 10px;border-radius:8px;cursor:pointer;font-size:14px}.menu .item:hover{background:#11234a}
-.btn{display:inline-flex;align-items:center;gap:8px;padding:10px 14px;border-radius:12px;border:1px solid var(--border);background:linear-gradient(180deg,#0e1833,#0b1326);cursor:pointer;font-weight:600}
-.btn.primary{background:linear-gradient(135deg,#3b82f6,#22c1dc);border-color:transparent}
-.btn.ghost{background:#162a52;border:1px solid var(--border);color:#eaf2ff}
-.btn.ok{background:linear-gradient(135deg,#22c55e,#16a34a);border-color:transparent}
 .big{font-size:22px;font-weight:900}.label{font-size:12px;color:var(--muted);letter-spacing:.2px;text-transform:uppercase}.muted{color:var(--muted)}
+.games-grid{display:grid;gap:14px;grid-template-columns:1fr}@media(min-width:700px){.games-grid{grid-template-columns:1fr 1fr}}@media(min-width:1020px){.games-grid{grid-template-columns:1fr 1fr 1fr}}
+/* Game cards: image only, sized to native aspect (no overlays) */
+.game-card{border:1px solid var(--border);border-radius:16px;overflow:hidden;cursor:pointer;background:#0b1326;padding:0}
+.game-card .banner{display:block;width:100%;height:auto;object-fit:contain}
 
-.games-grid{display:grid;gap:14px;grid-template-columns:1fr}
-@media(min-width:700px){.games-grid{grid-template-columns:1fr 1fr}}
-@media(min-width:1020px){.games-grid{grid-template-columns:1fr 1fr 1fr}}
-
-.game-card{position:relative;min-height:140px;display:flex;flex-direction:column;justify-content:flex-end;gap:4px;background:linear-gradient(180deg,#0f1a33,#0c152a);border:1px solid var(--border);border-radius:16px;padding:16px;cursor:pointer;overflow:hidden}
-.game-card .banner{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:.35}
-.game-card .title{font-size:20px;font-weight:800;position:relative}.game-card .muted{position:relative}
-
-/* crash */
+/* Crash area */
 .cr-graph-wrap{position:relative;height:240px;background:#0e1833;border:1px solid var(--border);border-radius:16px;overflow:hidden}
 canvas{display:block;width:100%;height:100%}
-.lb-controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
-.seg{display:flex;border:1px solid var(--border);border-radius:12px;overflow:hidden}
-.seg button{padding:8px 12px;background:#0c1631;color:#dce7ff;border:none;cursor:pointer}
-.seg button.active{background:linear-gradient(135deg,#3b82f6,#22c1dc);color:#051326;font-weight:800}
 table{width:100%;border-collapse:collapse}th,td{padding:10px;border-bottom:1px solid rgba(255,255,255,.06);text-align:left}
 tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%)}tr.anon td.name{color:#9db4e4;font-style:italic}
-.countdown{font-size:12px;color:var(--muted)}.hint{font-size:12px;color:var(--muted);margin-top:6px}
 .grid-2{display:grid;grid-template-columns:1fr;gap:16px}@media(min-width:900px){.grid-2{grid-template-columns:1.1fr .9fr}}
 .hero{display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap}
 .kpi{display:flex;gap:8px;flex-wrap:wrap}
 .kpi .pill{background:#0c1631;border:1px solid var(--border);border-radius:999px;padding:6px 10px;font-size:12px}
-.copy{display:flex;gap:8px}
-.copy input{flex:1}
+.copy{display:flex;gap:8px}.copy input{flex:1}
 .sep{height:1px;background:rgba(255,255,255,.06);margin:10px 0}
-.discord-cta{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
-.bad{color:#ffb4b4}.good{color:#b7ffcc}
 .card.soft{background:linear-gradient(180deg,#0f1836,#0c152b)}
-
-/* chat drawer + fab */
-.chat-drawer{position:fixed;right:0;top:64px;bottom:0;width:var(--chatW);max-width:92vw;transform:translateX(100%);transition:transform .2s ease-out;background:linear-gradient(180deg,#0f1a33,#0b1326);border-left:1px solid var(--border);display:flex;flex-direction:column;z-index:80}
-.chat-drawer.open{transform:translateX(0)}
-.chat-head{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border-bottom:1px solid var(--border)}
-.chat-body{flex:1;overflow:auto;padding:10px 12px}
-.chat-input{display:flex;gap:8px;padding:10px 12px;border-top:1px solid var(--border)}.chat-input input{flex:1}
+/* Chat drawer */
+.chat-drawer{position:fixed;right:0;top:64px;bottom:0;width:var(--chatW);max-width:92vw;transform:translateX(100%);transition:transform .2s ease-out;background:linear-gradient(180deg,#0f1a33,#0b1326);border-left:1px solid var(--border);display:flex;flex-direction:column;z-index:35}
+.chat-drawer.open{transform:translateX(0)}.chat-head{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border-bottom:1px solid var(--border)}
+.chat-body{flex:1;overflow:auto;padding:10px 12px}.chat-input{display:flex;gap:8px;padding:10px 12px;border-top:1px solid var(--border)}.chat-input input{flex:1}
 .msg{margin-bottom:12px;padding-bottom:8px;border-bottom:1px dashed rgba(255,255,255,.04);position:relative}
 .msghead{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.msghead .time{margin-left:auto;color:#9eb3da;font-size:12px}
 .badge{font-size:10px;padding:3px 7px;border-radius:999px;border:1px solid var(--border);letter-spacing:.2px}
 .badge.member{background:#0c1631;color:#cfe6ff}.badge.admin{background:linear-gradient(135deg,#f59e0b,#fb923c);color:#1a1206;border-color:rgba(0,0,0,.2);font-weight:900}.badge.owner{background:linear-gradient(135deg,#3b82f6,#22c1dc);color:#041018;border-color:transparent;font-weight:900}
 .level{font-size:10px;padding:3px 7px;border-radius:999px;background:#0b1f3a;color:#cfe6ff;border:1px solid var(--border)}
 .user-link{cursor:pointer;font-weight:800;padding:2px 6px;border-radius:8px;background:#0b1f3a;border:1px solid var(--border)}
-.fab{position:fixed;right:18px;bottom:18px;width:56px;height:56px;border-radius:50%;background:linear-gradient(135deg,#3b82f6,#22c1dc);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 14px 30px rgba(59,130,246,.35), 0 4px 10px rgba(0,0,0,.35);z-index:50}
-.fab.hide{display:none}
-.fab svg{width:26px;height:26px;fill:#041018}
 
-/* modal (Deposit/Withdraw + Profile) */
-.modal{position:fixed;inset:0;background:rgba(0,0,0,.45);display:none;align-items:center;justify-content:center;z-index:90}
+/* Floating Actions (header only now) */
+.header-actions{display:flex;gap:10px;align-items:center}
+.balance-pill{background:#0b1f3a;border:1px solid var(--border);border-radius:999px;padding:8px 12px;font-weight:800}
+
+/* Modal */
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;align-items:center;justify-content:center;z-index:50}
 .modal.open{display:flex}
-.modal .box{width:min(560px,92vw);background:linear-gradient(180deg,#0f1a33,#0b1326);border:1px solid var(--border);border-radius:16px;padding:14px}
-.modal .title{font-size:18px;font-weight:800;margin-bottom:8px}
-.modal .actions{display:flex;gap:8px;justify-content:flex-end;margin-top:12px}
-.note{font-size:12px;color:var(--muted)}
-.tabline{display:flex;gap:8px;margin-bottom:8px}
-.tabline .tabbtn{padding:8px 12px;border-radius:10px;border:1px solid var(--border);cursor:pointer;background:#0c1631}
-.tabline .tabbtn.active{background:linear-gradient(135deg,#3b82f6,#22c1dc);color:#051326;font-weight:800}
+.modal .box{width:min(520px,92vw);background:linear-gradient(180deg,#0f1a33,#0b1326);border:1px solid var(--border);border-radius:16px;padding:14px}
+.modal .tabs{margin-top:8px}
+.inline{display:flex;gap:8px;align-items:center}
+
+/* Toasts */
+#toasts{position:fixed;right:14px;bottom:14px;display:flex;flex-direction:column;gap:8px;z-index:60}
+.toast{background:#0c1631;border:1px solid var(--border);border-left:4px solid #3b82f6;color:#e6eeff;border-radius:10px;padding:10px 12px;min-width:240px;max-width:360px;box-shadow:0 10px 24px rgba(0,0,0,.35)}
+.toast.err{border-left-color:#ef4444}.toast.ok{border-left-color:#22c55e}
+
+/* Loader */
+#loader{position:fixed;inset:0;display:grid;place-items:center;background:#070c19;z-index:100}
+.spin{width:56px;height:56px;border-radius:50%;border:6px solid rgba(255,255,255,.12);border-top-color:#3b82f6;animation:sp 1s linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
 </style>
 </head>
 <body>
+  <div id="loader"><div class="spin"></div></div>
+
   <div class="header">
     <div class="header-inner container">
       <div class="left">
-        <a class="brand" href="#" id="homeLink">
+        <a class="brand" href="/" id="homeLink">
           <img class="logo" src="/img/GrowCBnobackground.png" alt="GROWCB" onerror="this.style.display='none'"/>
-          GROWCB
+          <span>GROWCB</span>
         </a>
         <div class="tabs">
-          <a class="tab active" id="tab-games">Games</a>
-          <a class="tab" id="tab-ref">Referral</a>
-          <a class="tab" id="tab-promo">Promo Codes</a>
-          <a class="tab" id="tab-lb">Leaderboard</a>
+          <a class="tab" data-path="/">Games</a>
+          <a class="tab" data-path="/referral">Referral</a>
+          <a class="tab" data-path="/promocodes">Promo Codes</a>
+          <a class="tab" data-path="/leaderboard">Leaderboard</a>
         </div>
       </div>
-      <div class="right" id="authArea"></div>
+      <div class="right header-actions" id="authArea"></div>
     </div>
   </div>
 
   <div class="container" style="padding-top:16px">
     <!-- Games -->
-    <div id="page-games">
+    <div id="page-games" data-route="/" style="display:none">
       <div class="card">
-        <div class="hero">
-          <div class="big">Welcome to GROWCB</div>
-          <div class="discord-cta">
-            <button class="btn ghost" id="btnJoinDiscord">Join Discord</button>
-            <button class="btn" id="btnDeposit">Deposit</button>
-            <button class="btn" id="btnWithdraw">Withdraw</button>
-            <a class="chip" id="btnInvite" href="__INVITE__" target="_blank" rel="noopener">Invite Link</a>
-          </div>
-        </div>
-        <div class="games-grid" style="margin-top:12px">
-          <div class="game-card" id="openCrash">
-            <img class="banner" src="/img/crash.png" alt="Crash" onerror="this.style.display='none'"/>
-            <div class="title">🚀 Crash</div><div class="muted">Shared rounds • 10s betting • Live cashout</div>
-          </div>
-          <div class="game-card" id="openMines">
-            <img class="banner" src="/img/mines.png" alt="Mines" onerror="this.style.display='none'"/>
-            <div class="title">💣 Mines</div><div class="muted">5×5 board • Choose mines • Cash out anytime</div>
-          </div>
-          <div class="game-card" id="openCoinflip">
-            <img class="banner" src="/img/coinflip.png" alt="Coinflip" onerror="this.style.display='none'"/>
-            <div class="title">🪙 Coinflip</div><div class="muted">Quick 50/50 — coming soon</div>
-          </div>
-          <div class="game-card" id="openBlackjack">
-            <img class="banner" src="/img/blackjack.png" alt="Blackjack" onerror="this.style.display='none'"/>
-            <div class="title">🃏 Blackjack</div><div class="muted">Beat the dealer — coming soon</div>
-          </div>
-          <div class="game-card" id="openPump">
-            <img class="banner" src="/img/pump.png" alt="Pump" onerror="this.style.display='none'"/>
-            <div class="title">📈 Pump</div><div class="muted">Ride the spike — coming soon</div>
-          </div>
+        <div class="games-grid" style="margin-top:6px">
+          <div class="game-card" data-path="/crash"><img class="banner" src="/img/crash.png" alt="Crash"/></div>
+          <div class="game-card" data-path="/mines"><img class="banner" src="/img/mines.png" alt="Mines"/></div>
+          <div class="game-card" data-path="/coinflip"><img class="banner" src="/img/coinflip.png" alt="Coinflip"/></div>
+          <div class="game-card" data-path="/blackjack"><img class="banner" src="/img/blackjack.png" alt="Blackjack"/></div>
+          <div class="game-card" data-path="/pump"><img class="banner" src="/img/pump.png" alt="Pump"/></div>
         </div>
       </div>
     </div>
 
     <!-- Crash -->
-    <div id="page-crash" style="display:none">
+    <div id="page-crash" data-route="/crash" style="display:none">
       <div class="card">
         <div class="hero">
           <div style="display:flex;align-items:baseline;gap:10px"><div class="big" id="crNow">0.00×</div><div class="muted" id="crHint">Loading…</div></div>
-          <button class="chip" id="backToGames">← Games</button>
+          <button class="btn soft" data-path="/">← Games</button>
         </div>
         <div class="cr-graph-wrap" style="margin-top:10px"><canvas id="crCanvas"></canvas></div>
         <div style="margin-top:12px"><div class="label" style="margin-bottom:4px">Previous Busts</div><div id="lastBusts" class="muted">Loading last rounds…</div></div>
@@ -1267,9 +1233,9 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
           <div class="field"><div class="label">Bet (DL)</div><input id="crBet" type="number" min="1" step="0.01" placeholder="min 1.00"/></div>
           <div class="field"><div class="label">Auto Cashout (×) — optional</div><input id="crCash" type="number" min="1.01" step="0.01" placeholder="e.g. 2.00"/></div>
         </div>
-        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px">
+        <div class="inline" style="margin-top:8px">
           <button class="btn primary" id="crPlace">Place Bet</button>
-          <button class="btn ok" id="crCashout" style="display:none">💸 Cash Out</button>
+          <button class="btn" id="crCashout" style="display:none">💸 Cash Out</button>
           <span id="crMsg" class="muted"></span>
         </div>
         <div class="card soft" style="margin-top:14px"><div class="label">Your recent rounds</div><div id="crLast" class="muted">—</div></div>
@@ -1277,25 +1243,23 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
     </div>
 
     <!-- Mines -->
-    <div id="page-mines" style="display:none">
+    <div id="page-mines" data-route="/mines" style="display:none">
       <div class="card">
-        <div class="hero"><div class="big">💣 Mines</div><button class="chip" id="backToGames2">← Games</button></div>
+        <div class="hero"><div class="big">💣 Mines</div><button class="btn soft" data-path="/">← Games</button></div>
         <div class="grid-2" style="margin-top:12px">
           <div>
             <div id="mSetup">
               <div class="field"><div class="label">Bet (DL)</div><input id="mBet" type="number" min="1" step="0.01" placeholder="min 1.00"/></div>
               <div class="field" style="margin-top:10px"><div class="label">Mines (1–24)</div><input id="mMines" type="number" min="1" max="24" step="1" value="3"/></div>
-              <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:12px">
+              <div class="inline" style="margin-top:12px">
                 <button class="btn primary" id="mStart">Start Game</button>
                 <span id="mMsg" class="muted"></span>
               </div>
             </div>
-
-            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px">
+            <div class="inline" style="margin-top:8px">
               <button class="btn ok" id="mCash" style="display:none">💸 Cash Out</button>
-              <span class="pill" id="mMult">Multiplier: 1.0000×</span><span class="pill" id="mPotential">Potential: —</span>
+              <span class="chip" id="mMult">Multiplier: 1.0000×</span><span class="chip" id="mPotential">Potential: —</span>
             </div>
-
             <div class="kpi" style="margin-top:8px"><span class="pill" id="mHash">Commit: —</span><span class="pill" id="mStatus">Status: —</span><span class="pill" id="mPicks">Picks: 0</span><span class="pill" id="mBombs">Mines: 3</span></div>
             <div class="card soft" style="margin-top:14px"><div class="label">Recent Mines Games</div><div id="mHist" class="muted">—</div></div>
           </div>
@@ -1308,16 +1272,15 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
       </div>
     </div>
 
+    <!-- Simple placeholders -->
+    <div id="page-coinflip" data-route="/coinflip" style="display:none"><div class="card"><div class="big">🪙 Coinflip</div><div class="muted" style="margin-top:8px">Coming soon.</div></div></div>
+    <div id="page-blackjack" data-route="/blackjack" style="display:none"><div class="card"><div class="big">🃏 Blackjack</div><div class="muted" style="margin-top:8px">Coming soon.</div></div></div>
+    <div id="page-pump" data-route="/pump" style="display:none"><div class="card"><div class="big">📈 Pump</div><div class="muted" style="margin-top:8px">Coming soon.</div></div></div>
+
     <!-- Referral -->
-    <div id="page-ref" style="display:none">
+    <div id="page-ref" data-route="/referral" style="display:none">
       <div class="card">
-        <div class="hero">
-          <div class="big">🙌 Referral Program</div>
-          <div class="discord-cta">
-            <button class="btn ghost" id="btnJoinDiscord2">Join Discord</button>
-            <a class="chip" id="btnInvite2" href="__INVITE__" target="_blank" rel="noopener">Invite Link</a>
-          </div>
-        </div>
+        <div class="big">🙌 Referral Program</div>
         <div class="sep"></div>
         <div class="grid-2">
           <div class="card soft">
@@ -1326,7 +1289,7 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
               <div class="field"><input id="refName" placeholder="choose-handle (3-20 chars)"/></div>
               <button class="btn primary" id="refSave">Save</button>
             </div>
-            <div class="hint" id="refMsg" style="margin-top:6px"></div>
+            <div class="muted" id="refMsg" style="margin-top:6px"></div>
             <div class="sep"></div>
             <div class="label">Share Link</div>
             <div class="copy" style="margin-top:6px">
@@ -1340,22 +1303,16 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
               <span class="pill">Clicks: <strong id="refClicks">0</strong></span>
               <span class="pill">Joins: <strong id="refJoins">0</strong></span>
             </div>
-            <div class="hint" style="margin-top:6px">Clicks count when someone opens your link. Joins count when they sign in.</div>
+            <div class="muted" style="margin-top:6px">Clicks count when someone opens your link. Joins count when they sign in.</div>
           </div>
         </div>
       </div>
     </div>
 
     <!-- Promo -->
-    <div id="page-promo" style="display:none">
+    <div id="page-promo" data-route="/promocodes" style="display:none">
       <div class="card">
-        <div class="hero">
-          <div class="big">🎁 Promo Codes</div>
-          <div class="discord-cta">
-            <button class="btn ghost" id="btnJoinDiscord3">Join Discord</button>
-            <a class="chip" id="btnInvite3" href="__INVITE__" target="_blank" rel="noopener">Invite Link</a>
-          </div>
-        </div>
+        <div class="big">🎁 Promo Codes</div>
         <div class="sep"></div>
         <div class="grid-2">
           <div class="card soft">
@@ -1364,7 +1321,7 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
               <div class="field"><input id="promoInput" placeholder="e.g. WELCOME10"/></div>
               <button class="btn primary" id="redeemBtn">Redeem</button>
             </div>
-            <div id="promoMsg" class="hint" style="margin-top:6px"></div>
+            <div id="promoMsg" class="muted" style="margin-top:6px"></div>
           </div>
           <div class="card soft">
             <div class="label">Your Redemptions</div>
@@ -1375,22 +1332,53 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
     </div>
 
     <!-- Leaderboard -->
-    <div id="page-lb" style="display:none">
+    <div id="page-lb" data-route="/leaderboard" style="display:none">
       <div class="card">
-        <div class="hero"><div class="big">🏆 Leaderboard — Top Wagered</div><div class="countdown" id="lbCountdown">—</div></div>
-        <div class="lb-controls" style="margin-top:10px">
-          <div class="seg" id="lbSeg"><button data-period="daily" class="active">Daily</button><button data-period="monthly">Monthly</button><button data-period="alltime">All-time</button></div>
-          <span class="hint">Anonymous players show as “Anonymous”. Amounts hidden for anonymous users.</span>
+        <div class="hero"><div class="big">🏆 Leaderboard — Top Wagered</div><div class="chip" id="lbCountdown">—</div></div>
+        <div class="inline" style="margin-top:10px">
+          <div class="tabs" id="lbSeg"><a class="tab active" data-period="daily">Daily</a><a class="tab" data-period="monthly">Monthly</a><a class="tab" data-period="alltime">All-time</a></div>
+          <span class="muted">Anonymous players show as “Anonymous”.</span>
         </div>
-        <div id="lbWrap" class="muted">Loading…</div>
+        <div id="lbWrap" class="muted" style="margin-top:8px">Loading…</div>
+      </div>
+    </div>
+
+    <!-- Settings / Profile -->
+    <div id="page-settings" data-route="/settings" style="display:none">
+      <div class="card">
+        <div class="label">Settings</div>
+        <div style="margin-top:8px">
+          <label style="display:flex;align-items:center;gap:10px">
+            <input type="checkbox" id="anonToggle" style="width:auto"/>
+            <span><strong>Anonymous Mode</strong> — hide your name & wager amounts from others.</span>
+          </label>
+          <div id="setMsg" class="muted" style="margin-top:8px"></div>
+          <div class="sep"></div>
+          <a class="btn ghost" href="/logout" style="margin-top:6px">Logout</a>
+        </div>
+      </div>
+    </div>
+
+    <div id="page-profile" data-route="/profile" style="display:none">
+      <div class="card">
+        <div class="label">Profile</div><div id="profileBox">Loading…</div>
+        <div id="ownerPanel" class="card soft" style="display:none;margin-top:12px">
+          <div class="label">Owner / Admin Panel</div>
+          <div class="row cols-3" style="margin-top:6px">
+            <div class="field"><div class="label">Discord ID or &lt;@mention&gt;</div><input id="tIdent" placeholder="ID or <@id>"/></div>
+            <div class="field"><div class="label">Amount (+/- DL)</div><input id="tAmt" type="text" placeholder="10 or -5.25"/></div>
+            <div style="align-self:end"><button class="btn primary" id="tApply">Apply</button></div>
+          </div>
+          <div id="tMsg" class="muted" style="margin-top:6px"></div>
+        </div>
       </div>
     </div>
   </div>
 
-  <!-- Floating chat -->
-  <button class="fab" id="fabChat" title="Open chat"><svg viewBox="0 0 24 24"><path d="M4 4h16v12H7l-3 3V4z"/></svg></button>
+  <!-- Chat Drawer -->
+  <button class="btn primary" style="position:fixed;right:16px;bottom:16px;z-index:34" id="fabChat" title="Open chat">Chat</button>
   <div class="chat-drawer" id="chatDrawer">
-    <div class="chat-head"><div>Global Chat <span id="chatNote" class="muted"></span></div><button class="chip" id="chatClose">Close</button></div>
+    <div class="chat-head"><div>Global Chat <span id="chatNote" class="muted"></span></div><button class="btn soft" id="chatClose">Close</button></div>
     <div class="chat-body" id="chatBody"></div>
     <div class="chat-input"><input id="chatText" placeholder="Say something…"/><button class="btn primary" id="chatSend">Send</button></div>
   </div>
@@ -1398,222 +1386,185 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
   <!-- Deposit/Withdraw Modal -->
   <div class="modal" id="dwModal">
     <div class="box">
-      <div class="title" id="dwTitle">Deposit / Withdraw</div>
-      <div class="tabline">
-        <button class="tabbtn active" id="tabDep">Deposit</button>
-        <button class="tabbtn" id="tabWit">Withdraw</button>
+      <div class="inline" style="justify-content:space-between">
+        <div class="big">Deposit / Withdraw</div>
+        <button class="btn soft" id="dwClose">Close</button>
       </div>
-      <div id="dwBody">
-        <div class="field"><div class="label">Discord Account</div>
-          <div id="dwAccWrap"></div>
-          <div class="note">If you change Discord, enter username#1234 or a numeric Discord ID.</div>
+      <div class="tabs" style="margin-top:8px"><a class="tab active" id="tabDep">Deposit</a><a class="tab" id="tabWit">Withdraw</a></div>
+      <div id="depPane" style="margin-top:10px">
+        <div class="muted">If not logged in with Discord, provide your Discord Username or ID. Provide your GrowID — if incorrect, your transfer may not work.</div>
+        <div class="row cols-2" style="margin-top:10px">
+          <div class="field"><div class="label">Discord (optional if logged in)</div><input id="depDiscord" placeholder="username#1234 or 123456789012345678"/></div>
+          <div class="field"><div class="label">GrowID</div><input id="depGrowID" placeholder="Your GrowID"/></div>
         </div>
-        <div class="row cols-2" style="margin-top:8px" id="growWrap">
-          <div class="field"><div class="label">GrowID</div><input id="growId" placeholder="Your Growtopia ID"/></div>
-          <div class="field"><div class="label">World</div><input id="dwWorld" placeholder="WORLDNAME"/></div>
-        </div>
-        <div class="row cols-2" style="margin-top:8px;display:none" id="amountWrap">
-          <div class="field"><div class="label">Amount (DL)</div><input id="dwAmount" type="number" step="0.01" min="0.01" placeholder="e.g. 5"/></div>
-          <div></div>
-        </div>
-        <div class="note" style="margin-top:8px">⚠️ If your GrowID is incorrect, delivery may fail.</div>
+        <div class="field" style="margin-top:10px"><div class="label">World</div><input id="depWorld" placeholder="WORLDNAME"/></div>
+        <button class="btn primary" id="depSubmit" style="margin-top:10px">Submit Deposit Request</button>
       </div>
-      <div class="actions">
-        <button class="btn ghost" id="dwCancel">Cancel</button>
-        <button class="btn primary" id="dwSubmit">Submit</button>
+      <div id="witPane" style="display:none;margin-top:10px">
+        <div class="row cols-2">
+          <div class="field"><div class="label">Amount (DL)</div><input id="witAmt" type="number" min="1" step="0.01" placeholder="10.00"/></div>
+          <div class="field"><div class="label">World</div><input id="witWorld" placeholder="WORLDNAME"/></div>
+        </div>
+        <button class="btn primary" id="witSubmit" style="margin-top:10px">Submit Withdraw Request</button>
       </div>
-      <div id="dwMsg" class="hint" style="margin-top:6px"></div>
     </div>
   </div>
 
-  <!-- Profile modal -->
-  <div class="modal" id="pModal">
-    <div class="box">
-      <div class="title">Player</div>
-      <div id="pBody">Loading…</div>
-      <div class="actions"><button class="btn ghost" id="pClose">Close</button></div>
-    </div>
-  </div>
+  <!-- Toasts -->
+  <div id="toasts"></div>
 
 <script>
 const qs = id => document.getElementById(id);
+const $$ = sel => Array.from(document.querySelectorAll(sel));
 const j = async (url, init) => {
   const r = await fetch(url, init);
   if(!r.ok){
-    let t = await r.text().catch(()=> '');
-    try{ const js = JSON.parse(t); throw new Error(js.detail || js.message || t || r.statusText); }
-    catch{ throw new Error(t || r.statusText); }
+    const t = await r.text().catch(()=> '');
+    try { const js = JSON.parse(t); throw new Error(js.detail || js.message || t || r.statusText); }
+    catch { throw new Error(t || r.statusText); }
   }
-  const ct = (r.headers.get('content-type') || '').toLowerCase();
-  if (ct.includes('application/json')) return r.json();
-  return r.text();
+  const ct = (r.headers.get('content-type')||'').toLowerCase();
+  return ct.includes('application/json') ? r.json() : r.text();
 };
-const GEM = "💎"; const fmtDL = (n)=> `${GEM} ${(Number(n)||0).toFixed(2)} DL`;
+const GEM = "💎"; const fmtDL = n => `${GEM} ${(Number(n)||0).toFixed(2)} DL`;
 
-// -------- router --------
-const pages = ['page-games','page-crash','page-mines','page-coinflip','page-blackjack','page-pump','page-ref','page-promo','page-lb'];
-function showOnly(id){
-  for(const p of pages){ const el = qs(p); if(el) el.style.display = (p===id) ? '' : 'none'; }
-  const map = {'page-games':'tab-games','page-ref':'tab-ref','page-promo':'tab-promo','page-lb':'tab-lb'};
-  for(const t of ['tab-games','tab-ref','tab-promo','tab-lb']){
-    const el = qs(t); if(el) el.classList.toggle('active', map[id]===t);
-  }
+/* Toasts */
+function toast(msg, type='info', ms=3800){
+  const box = document.createElement('div');
+  box.className = 'toast' + (type==='err' ? ' err' : type==='ok' ? ' ok' : '');
+  box.textContent = msg;
+  qs('toasts').appendChild(box);
+  setTimeout(()=>{ box.style.opacity='0'; setTimeout(()=> box.remove(), 300); }, ms);
 }
 
-// -------- header/auth --------
+/* Router */
+const routes = {
+  "/": "page-games",
+  "/crash": "page-crash",
+  "/mines": "page-mines",
+  "/coinflip": "page-coinflip",
+  "/blackjack": "page-blackjack",
+  "/pump": "page-pump",
+  "/referral": "page-ref",
+  "/promocodes": "page-promo",
+  "/leaderboard": "page-lb",
+  "/profile": "page-profile",
+  "/settings": "page-settings"
+};
+function showRoute(path){
+  for(const id of Object.values(routes)){ const el = qs(id); if(el) el.style.display = 'none'; }
+  const page = routes[path] || "page-games";
+  qs(page).style.display = '';
+  // Tabs active
+  $$('.tabs a.tab').forEach(a => {
+    const p = a.getAttribute('data-path');
+    if(!p) return;
+    a.classList.toggle('active', p===path || (path==='/' && p==='/'));
+  });
+}
+function nav(path){
+  if(location.pathname !== path){
+    history.pushState({}, '', path);
+  }
+  showRoute(path);
+  // page-specific boots
+  if(path==='/crash'){ openCrash(); }
+  if(path==='/mines'){ refreshMines(); }
+  if(path==='/leaderboard'){ refreshLeaderboard(); }
+  if(path==='/profile'){ renderProfile(); }
+  if(path==='/promocodes'){ renderPromo(); }
+  if(path==='/referral'){ loadReferral(); }
+}
+window.addEventListener('popstate', ()=> showRoute(location.pathname));
+
+// link wiring
+document.addEventListener('click', (e)=>{
+  const t = e.target.closest('[data-path]');
+  if(t){ e.preventDefault(); nav(t.getAttribute('data-path')); }
+});
+
+/* Header / Auth */
 async function renderHeader(){
   try{
     const me = await j('/api/me');
-    const bal = await j('/api/balance').catch(()=>({balance:0}));
+    const bal = await j('/api/balance');
     qs('authArea').innerHTML = `
-      <button class="btn primary" id="btnJoinSmall">${me.in_guild ? 'In Discord' : 'Join Discord'}</button>
-      <span class="chip">Balance: <strong>${fmtDL(bal.balance)}</strong></span>
-      <button class="btn" id="btnDepositHdr">Deposit</button>
-      <button class="btn" id="btnWithdrawHdr">Withdraw</button>
+      <button class="btn" id="btnDW">Deposit / Withdraw</button>
+      <button class="btn primary" id="btnJoin">${me.in_guild ? 'In Discord' : 'Join Discord'}</button>
+      <span class="balance-pill">Balance: <strong>${fmtDL(bal.balance)}</strong></span>
       <div class="avatar-wrap">
         <img class="avatar" id="avatarBtn" src="${me.avatar_url||''}" title="${me.username||'user'}"/>
         <div id="userMenu" class="menu">
-          <div class="item" id="menuProfile">Profile</div>
-          <div class="item" id="menuSettings">Settings</div>
+          <div class="item" data-path="/profile">Profile</div>
+          <div class="item" data-path="/settings">Settings</div>
           <a class="item" href="/logout">Logout</a>
         </div>
       </div>
     `;
-    qs('btnJoinSmall').onclick = joinDiscord;
+    qs('btnJoin').onclick = joinDiscord;
+    qs('btnDW').onclick = ()=> openDW();
     const menu = qs('userMenu'); const av = qs('avatarBtn');
     av.onclick = (e)=>{ e.stopPropagation(); menu.classList.toggle('open'); };
     document.body.addEventListener('click', ()=> menu.classList.remove('open'));
-    qs('menuProfile').onclick = ()=>{ menu.classList.remove('open'); showOnly('page-profile'); renderProfile(); };
-    qs('menuSettings').onclick = ()=>{ menu.classList.remove('open'); showOnly('page-settings'); loadSettings(); };
-    for(const id of ['btnDeposit','btnWithdraw','btnDepositHdr','btnWithdrawHdr']){
-      const el = qs(id);
-      if(!el) continue;
-      if(id.includes('Deposit')) el.onclick = ()=> openDW('deposit');
-      else el.onclick = ()=> openDW('withdraw');
-    }
   }catch(_){
-    qs('authArea').innerHTML = `<a class="btn primary" href="/login">Login with Discord</a>`;
+    qs('authArea').innerHTML = `
+      <button class="btn" id="btnDW">Deposit / Withdraw</button>
+      <a class="btn primary" href="/login">Login with Discord</a>`;
+    qs('btnDW').onclick = ()=> openDW();
   }
 }
-
-// -------- Discord join --------
 async function joinDiscord(){
+  try{ await j('/api/discord/join', { method:'POST' }); toast('Joined Discord!', 'ok'); renderHeader(); }
+  catch(e){ toast(e.message || 'Could not join. Try relogin.', 'err'); }
+}
+
+/* Deposit / Withdraw Modal */
+function openDW(){ qs('dwModal').classList.add('open'); }
+function closeDW(){ qs('dwModal').classList.remove('open'); }
+qs('dwClose').onclick = closeDW;
+qs('tabDep').onclick = ()=>{ qs('tabDep').classList.add('active'); qs('tabWit').classList.remove('active'); qs('depPane').style.display=''; qs('witPane').style.display='none'; };
+qs('tabWit').onclick = ()=>{ qs('tabWit').classList.add('active'); qs('tabDep').classList.remove('active'); qs('depPane').style.display='none'; qs('witPane').style.display=''; };
+qs('depSubmit').onclick = async ()=>{
   try{
-    await j('/api/discord/join', { method:'POST' });
-    alert('Joined the Discord server!');
-    renderHeader();
-  }catch(e){ alert(e.message || 'Could not join. Try relogin.'); }
-}
-for(const id of ['btnJoinDiscord','btnJoinDiscord2','btnJoinDiscord3']){
-  const el = qs(id); if(el) el.onclick = joinDiscord;
-}
-for(const id of ['btnInvite','btnInvite2','btnInvite3']){
-  const a = qs(id); if(a && a.getAttribute('href') === '__INVITE__'){ a.style.display='none'; }
-}
-
-// -------- Tabs / nav --------
-qs('homeLink').onclick = (e)=>{ e.preventDefault(); showOnly('page-games'); };
-qs('tab-games').onclick = ()=> showOnly('page-games');
-qs('tab-ref').onclick = ()=> { showOnly('page-ref'); loadReferral(); };
-qs('tab-promo').onclick = ()=> { showOnly('page-promo'); renderPromo(); };
-qs('tab-lb').onclick = ()=> { showOnly('page-lb'); refreshLeaderboard(); };
-
-// -------- Deposit / Withdraw modal --------
-const dw = {
-  modal: qs('dwModal'), title: qs('dwTitle'), tabDep: qs('tabDep'), tabWit: qs('tabWit'),
-  accWrap: qs('dwAccWrap'), grow: qs('growId'), world: qs('dwWorld'), amountWrap: qs('amountWrap'),
-  amount: qs('dwAmount'), msg: qs('dwMsg'), submit: qs('dwSubmit'), cancel: qs('dwCancel')
+    const data = { kind:'deposit', discord_identity: qs('depDiscord').value.trim() || null, grow_id: qs('depGrowID').value.trim() || null, world: qs('depWorld').value.trim() };
+    if(!data.world) throw new Error('World is required');
+    await j('/api/transfer/create', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(data) });
+    toast('Deposit request submitted. Check #tickets.', 'ok');
+    closeDW();
+  }catch(e){ toast(e.message, 'err'); }
 };
-let dwKind = 'deposit', dwLogged = null, dwUser = null, dwUseCustomAcc = false;
-
-function setDWKind(kind){
-  dwKind = kind;
-  dw.tabDep.classList.toggle('active', kind==='deposit');
-  dw.tabWit.classList.toggle('active', kind==='withdraw');
-  dw.amountWrap.style.display = (kind==='withdraw') ? '' : 'none';
-  dw.title.textContent = kind==='withdraw' ? 'Withdraw' : 'Deposit';
-  dw.msg.textContent='';
-}
-async function openDW(kind){
-  setDWKind(kind);
+qs('witSubmit').onclick = async ()=>{
   try{
-    const me = await j('/api/me').catch(()=>({}));
-    dwLogged = !!me?.id;
-    dwUser = me || null;
-  }catch{ dwLogged=false; dwUser=null; }
-  renderAccEditor();
-  dw.grow.value = '';
-  dw.world.value = '';
-  dw.amount.value = '';
-  dw.modal.classList.add('open');
-}
-function renderAccEditor(){
-  dw.accWrap.innerHTML = '';
-  if(dwLogged && !dwUseCustomAcc){
-    const d = document.createElement('div');
-    d.innerHTML = `
-      <div class="row cols-2">
-        <div class="field"><input id="accFixed" readonly value="${dwUser.username||''}"/></div>
-        <button class="btn ghost" id="accChange">Change Discord</button>
-      </div>`;
-    dw.accWrap.appendChild(d);
-    d.querySelector('#accChange').onclick = ()=>{ dwUseCustomAcc = true; renderAccEditor(); };
-  }else{
-    const d = document.createElement('div');
-    d.innerHTML = `
-      <div class="row cols-2">
-        <div class="field"><input id="accCustom" placeholder="username#1234 or Discord ID"/></div>
-        <button class="btn ghost" id="accUseLogin">${dwLogged?'Use logged-in':''}</button>
-      </div>`;
-    dw.accWrap.appendChild(d);
-    const btn = d.querySelector('#accUseLogin');
-    if(btn) btn.onclick = ()=>{ dwUseCustomAcc = false; renderAccEditor(); };
-  }
-}
-dw.tabDep.onclick = ()=> setDWKind('deposit');
-dw.tabWit.onclick = ()=> setDWKind('withdraw');
-dw.cancel.onclick = ()=> dw.modal.classList.remove('open');
-dw.submit.onclick = async ()=>{
-  dw.msg.textContent = '';
-  const discord_identity = (dwLogged && !dwUseCustomAcc) ? (dwUser?.username||'') : (document.getElementById('accCustom')?.value || '');
-  const grow_id = dw.grow.value.trim();
-  const world = dw.world.value.trim();
-  try{
-    if(dwKind==='deposit'){
-      if(!grow_id || !world) throw new Error('GrowID and World are required');
-      const r = await j('/api/transfer/deposit', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({discord_identity, grow_id, world})});
-      dw.msg.textContent = 'Deposit request submitted. Ticket #' + r.id;
-    }else{
-      const amount = parseFloat(dw.amount.value||'0');
-      if(!(amount>0)) throw new Error('Enter a valid amount');
-      if(!world) throw new Error('World is required');
-      const r = await j('/api/transfer/withdraw', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({discord_identity, amount, world, grow_id})});
-      dw.msg.textContent = 'Withdraw request submitted. Ticket #' + r.id;
-    }
-  }catch(e){ dw.msg.textContent = e.message||String(e); }
+    const data = { kind:'withdraw', amount: qs('witAmt').value.trim(), world: qs('witWorld').value.trim() };
+    if(!data.world) throw new Error('World is required');
+    if(!data.amount) throw new Error('Amount required');
+    await j('/api/transfer/create', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(data) });
+    toast('Withdraw request submitted. Staff will DM you.', 'ok');
+    closeDW();
+  }catch(e){ toast(e.message, 'err'); }
 };
 
-// -------- Referral --------
+/* Referral */
 async function loadReferral(){
   try{
     const st = await j('/api/referral/state');
-    if(st && st.name){ qs('refName').value = st.name; qs('refLink').value = location.origin + '/r/' + st.name; }
+    if(st && st.name){ qs('refName').value = st.name; qs('refLink').value = `${location.origin}/referral/` + st.name; }
     qs('refClicks').textContent = st.clicks||0; qs('refJoins').textContent = st.joined||0;
-  }catch(_){}
+  }catch(err){ toast(err.message, 'err'); }
 }
-qs('refSave')?.addEventListener('click', async()=>{
+qs('refSave').onclick = async()=>{
   const name = qs('refName').value.trim();
-  qs('refMsg').textContent = '';
   try{
     await j('/api/referral/set', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ name })});
-    qs('refMsg').textContent = 'Saved.'; qs('refLink').value = location.origin + '/r/' + name.toLowerCase();
-  }catch(e){ qs('refMsg').textContent = e.message; }
-});
-qs('copyRef')?.addEventListener('click', ()=>{
-  const inp = qs('refLink'); inp.select(); inp.setSelectionRange(0, 99999); document.execCommand('copy');
-});
+    qs('refLink').value = `${location.origin}/referral/` + name.toLowerCase();
+    toast('Referral saved.', 'ok');
+  }catch(e){ toast(e.message, 'err'); }
+};
+qs('copyRef').onclick = ()=>{
+  const inp = qs('refLink'); inp.select(); inp.setSelectionRange(0, 99999); document.execCommand('copy'); toast('Copied!', 'ok');
+};
 
-// -------- Promo --------
+/* Promo */
 async function renderPromo(){
   try{
     const my = await j('/api/promo/my');
@@ -1621,65 +1572,62 @@ async function renderPromo(){
       ? '<table><thead><tr><th>Code</th><th>Redeemed</th></tr></thead><tbody>' +
         my.rows.map(r=>`<tr><td>${r.code}</td><td>${new Date(r.redeemed_at).toLocaleString()}</td></tr>`).join('') +
         '</tbody></table>' : '—';
-  }catch(_){ qs('myCodes').textContent = '—'; }
+  }catch(e){ toast(e.message, 'err'); }
 }
-qs('redeemBtn')?.addEventListener('click', async ()=>{
+qs('redeemBtn').onclick = async ()=>{
   const code = qs('promoInput').value.trim();
-  qs('promoMsg').textContent = '';
   try{
     const r = await j('/api/promo/redeem', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ code }) });
-    qs('promoMsg').textContent = 'Redeemed! New balance: ' + fmtDL(r.new_balance);
+    toast('Redeemed! New balance: '+fmtDL(r.new_balance), 'ok');
     renderHeader(); renderPromo();
-  }catch(e){ qs('promoMsg').textContent = e.message; }
-});
+  }catch(e){ toast(e.message, 'err'); }
+};
 
-// -------- Profile / Admin (client) --------
+/* Profile */
 async function renderProfile(){
   try{
     const p = await j('/api/profile');
     const role = p.role || 'member';
     const isOwner = (role==='owner') || (String(p.id||'') === String('__OWNER_ID__'));
-    const profileBox = document.getElementById('profileBox');
-    if(!profileBox) return;
-    profileBox.innerHTML = `
+    qs('profileBox').innerHTML = `
       <div class="games-grid" style="grid-template-columns:1fr 1fr 1fr">
         <div class="card soft"><div class="label">Level</div><div class="big">Lv ${p.level}</div><div class="muted">${p.xp} XP • ${p.progress_pct}% to next</div></div>
         <div class="card soft"><div class="label">Balance</div><div class="big">${fmtDL(p.balance)}</div></div>
         <div class="card soft"><div class="label">Role</div><div class="big" style="text-transform:uppercase">${role}</div></div>
       </div>
     `;
-    const ownerPanel = document.getElementById('ownerPanel');
-    if(ownerPanel) ownerPanel.style.display = isOwner ? '' : 'none';
-  }catch(_){ const profileBox = document.getElementById('profileBox'); if(profileBox) profileBox.textContent='—'; }
+    qs('ownerPanel').style.display = isOwner ? '' : 'none';
+    if(isOwner){
+      qs('tApply').onclick = async ()=>{
+        try{
+          const r = await j('/api/admin/adjust',{ method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({ identifier: qs('tIdent').value.trim(), amount: qs('tAmt').value.trim(), reason: 'manual' })});
+          toast('OK. New balance: ' + fmtDL(r.new_balance), 'ok');
+          renderHeader();
+        }catch(e){ toast(e.message, 'err'); }
+      };
+    }
+  }catch(e){ toast(e.message, 'err'); }
 }
 
-// -------- Settings --------
+/* Settings */
 async function loadSettings(){
-  const t = document.getElementById('anonToggle'); const m = document.getElementById('setMsg');
-  if(!t) return;
-  m.textContent='';
-  try{ const r = await j('/api/settings/get'); t.checked = !!(r && r.is_anon); }catch(_){}
+  try{ const r = await j('/api/settings/get'); qs('anonToggle').checked = !!(r && r.is_anon); }
+  catch(_){}
 }
-document.getElementById('anonToggle')?.addEventListener('change', async (e)=>{
-  const m = document.getElementById('setMsg'); m.textContent='';
+qs('anonToggle')?.addEventListener('change', async (e)=>{
   try{
     const r = await j('/api/settings/set_anon', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ is_anon: !!e.target.checked }) });
-    m.textContent = r && r.ok ? 'Saved.' : 'Updated.';
-  }catch(err){ m.textContent = err.message; }
+    toast('Saved.', 'ok');
+  }catch(err){ toast(err.message, 'err'); }
 });
 
-// -------- Leaderboard --------
+/* Leaderboard */
 let lbPeriod = 'daily';
-function nextUtcMidnight(){
-  const now = new Date();
-  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()+1, 0,0,0,0));
-}
-function endOfUtcMonth(){
-  const now = new Date();
-  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth()+1, 1, 0,0,0,0));
-}
+function nextUtcMidnight(){ const now = new Date(); return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()+1,0,0,0,0)); }
+function endOfUtcMonth(){ const now = new Date(); return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth()+1,1,0,0,0,0)); }
 async function refreshLeaderboard(){
-  const wrap = qs('lbWrap'); if(!wrap) return; wrap.textContent = 'Loading…';
+  const wrap = qs('lbWrap'); wrap.textContent = 'Loading…';
   const res = await j('/api/leaderboard?period='+lbPeriod+'&limit=50');
   const rows = res.rows||[];
   const me = await j('/api/me').catch(()=>null);
@@ -1697,17 +1645,16 @@ async function refreshLeaderboard(){
       </tbody>
     </table>` : '—';
   wrap.innerHTML = html;
-
   const tgt = lbPeriod==='daily' ? nextUtcMidnight() : lbPeriod==='monthly' ? endOfUtcMonth() : null;
-  qs('lbCountdown').textContent = tgt ? `Resets: ${tgt.toUTCString()}` : 'All-time';
+  qs('lbCountdown').textContent = tgt ? 'Resets soon…' : 'All-time';
   const seg = qs('lbSeg');
-  Array.from(seg.querySelectorAll('button')).forEach(b=>{
+  seg.querySelectorAll('a.tab').forEach(b=>{
     b.classList.toggle('active', b.dataset.period===lbPeriod);
     b.onclick = ()=>{ lbPeriod = b.dataset.period; refreshLeaderboard(); };
   });
 }
 
-// -------- Crash UI --------
+/* Crash UI */
 const crCanvas = ()=> qs('crCanvas');
 let crPollTimer=null, crBust=null, crPhase='betting';
 function drawCrash(mult){
@@ -1727,18 +1674,13 @@ function drawCrash(mult){
 async function pollCrash(){
   try{
     const st = await j('/api/crash/state');
-    crPhase = st.phase;
-    crBust = st.bust;
+    crPhase = st.phase; crBust = st.bust;
     qs('lastBusts').textContent = (st.last_busts||[]).map(v=> (Number(v)||0).toFixed(2)+'×').join(' • ') || '—';
-    const cashBtn = qs('crCashout');
-    const you = st.your_bet;
-    if(cashBtn) cashBtn.style.display = (you && crPhase==='running' && !you.cashed_out) ? '' : 'none';
-
+    const cashBtn = qs('crCashout'); const you = st.your_bet;
+    cashBtn.style.display = (you && crPhase==='running' && !you.cashed_out) ? '' : 'none';
     if(crPhase==='running' && st.current_multiplier){
       const m = Number(st.current_multiplier)||1.0;
-      qs('crNow').textContent = m.toFixed(2)+'×';
-      qs('crHint').textContent = 'In flight…';
-      drawCrash(m);
+      qs('crNow').textContent = m.toFixed(2)+'×'; qs('crHint').textContent = 'In flight…'; drawCrash(m);
     }else if(crPhase==='betting'){
       qs('crNow').textContent = '0.00×';
       const ends = st.betting_ends_at? new Date(st.betting_ends_at): null;
@@ -1749,40 +1691,31 @@ async function pollCrash(){
       drawCrash(1);
     }else if(crPhase==='ended'){
       qs('crNow').textContent = (Number(crBust)||0).toFixed(2)+'×';
-      qs('crHint').textContent = 'Round ended';
-      drawCrash(Number(crBust)||1);
+      qs('crHint').textContent = 'Round ended'; drawCrash(Number(crBust)||1);
     }
-  }catch(e){
-    const h = qs('crHint'); if(h) h.textContent = e.message || 'Error';
-  }finally{
-    crPollTimer = setTimeout(pollCrash, 900);
-  }
+  }catch(e){ toast(e.message, 'err'); }
+  finally{ crPollTimer = setTimeout(pollCrash, 900); }
 }
-qs('crPlace')?.addEventListener('click', async ()=>{
+qs('crPlace').onclick = async ()=>{
   const bet = qs('crBet').value || '0';
   const cash = qs('crCash').value || null;
-  const msg = qs('crMsg'); if(msg) msg.textContent='';
   try{
     await j('/api/crash/place', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ bet, cashout: cash? Number(cash): null })});
-    if(msg) msg.textContent = 'Bet placed.';
-  }catch(e){ if(msg) msg.textContent = e.message; }
-});
-qs('crCashout')?.addEventListener('click', async ()=>{
-  const msg = qs('crMsg'); if(msg) msg.textContent='';
-  try{
-    await j('/api/crash/cashout', { method:'POST' });
-    if(msg) msg.textContent = 'Cashed out!';
-  }catch(e){ if(msg) msg.textContent = e.message; }
-});
+    toast('Bet placed.', 'ok');
+  }catch(e){ toast(e.message, 'err'); }
+};
+qs('crCashout').onclick = async ()=>{
+  try{ await j('/api/crash/cashout', { method:'POST' }); toast('Cashed out!', 'ok'); }
+  catch(e){ toast(e.message, 'err'); }
+};
 function openCrash(){
-  showOnly('page-crash');
   if(crPollTimer) clearTimeout(crPollTimer);
   pollCrash();
 }
 
-// -------- Mines UI --------
+/* Mines */
 function buildMinesGrid(){
-  const grid = qs('mGrid'); if(!grid) return; grid.innerHTML='';
+  const grid = qs('mGrid'); grid.innerHTML='';
   for(let i=0;i<25;i++){
     const b = document.createElement('button');
     b.textContent = '?';
@@ -1794,51 +1727,37 @@ function buildMinesGrid(){
   }
 }
 async function pickCell(i){
-  try{
-    await j('/api/mines/pick?index='+i, { method:'POST' });
-    await refreshMines();
-  }catch(e){ alert(e.message); }
+  try{ await j('/api/mines/pick?index='+i, { method:'POST' }); await refreshMines(); }
+  catch(e){ toast(e.message, 'err'); }
 }
 async function startMines(){
   const bet = qs('mBet').value || '0';
   const mines = parseInt(qs('mMines').value||'3',10);
-  const m = qs('mMsg'); if(m) m.textContent='';
-  try{
-    await j('/api/mines/start', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ bet, mines })});
-    await refreshMines();
-  }catch(e){ if(m) m.textContent = e.message; }
+  try{ await j('/api/mines/start', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ bet, mines })}); await refreshMines(); }
+  catch(e){ toast(e.message, 'err'); }
 }
 async function cashoutMines(){
-  try{
-    await j('/api/mines/cashout', { method:'POST' });
-    await refreshMines();
-  }catch(e){ alert(e.message); }
+  try{ await j('/api/mines/cashout', { method:'POST' }); await refreshMines(); }
+  catch(e){ toast(e.message, 'err'); }
 }
 async function refreshMines(){
   try{
     const st = await j('/api/mines/state');
-    const grid = qs('mGrid');
-    const status = st?.status || 'idle';
+    const grid = qs('mGrid'); const status = st?.status || 'idle';
     qs('mStatus').textContent = 'Status: ' + status;
     qs('mPicks').textContent = 'Picks: ' + (st?.picks||0);
     qs('mBombs').textContent = 'Mines: ' + (st?.mines|| (qs('mMines').value||3));
     qs('mHash').textContent = 'Commit: ' + (st?.commit_hash || '—');
     qs('mMult').textContent = 'Multiplier: ' + (st?.multiplier ? (Number(st.multiplier)||1).toFixed(4)+'×' : '1.0000×');
     qs('mPotential').textContent = 'Potential: ' + (st?.potential_win ? fmtDL(st.potential_win) : '—');
-
-    const playing = status==='active';
-    qs('mCash').style.display = playing ? '' : 'none';
-    qs('mSetup').style.display = playing ? 'none' : '';
-
-    if(grid && grid.children.length!==25) buildMinesGrid();
-
-    if(st?.reveals && Array.isArray(st.reveals) && grid){
+    const playing = status==='active'; qs('mCash').style.display = playing ? '' : 'none'; qs('mSetup').style.display = playing ? 'none' : '';
+    if(grid.children.length!==25) buildMinesGrid();
+    if(st?.reveals && Array.isArray(st.reveals)){
       st.reveals.forEach((cell, idx)=>{
-        const b = grid.children[idx];
-        if(!b) return;
-        if(cell === 'u'){ b.textContent = '?'; b.disabled = false; b.style.background='#0f1a33'; }
-        else if(cell === 'g'){ b.textContent = '✅'; b.disabled = true; b.style.background='#163a2a'; }
-        else if(cell === 'b'){ b.textContent = '💣'; b.disabled = true; b.style.background='#3a1620'; }
+        const b = grid.children[idx]; if(!b) return;
+        if(cell === 'u'){ b.textContent='?'; b.disabled=false; b.style.background='#0f1a33'; }
+        else if(cell==='g'){ b.textContent='✅'; b.disabled=true; b.style.background='#163a2a'; }
+        else if(cell==='b'){ b.textContent='💣'; b.disabled=true; b.style.background='#3a1620'; }
       });
     }
     const h = await j('/api/mines/history');
@@ -1846,46 +1765,20 @@ async function refreshMines(){
       ? '<table><thead><tr><th>Time</th><th>Bet</th><th>Mines</th><th>Win</th><th>Status</th></tr></thead><tbody>' +
         h.rows.map(r=>`<tr><td>${new Date(r.started_at).toLocaleString()}</td><td>${fmtDL(r.bet)}</td><td>${r.mines}</td><td>${fmtDL(r.win)}</td><td>${r.status}</td></tr>`).join('') +
         '</tbody></table>' : '—';
-  }catch(_){}
+  }catch(e){ /* silent */ }
 }
-qs('mStart')?.addEventListener('click', startMines);
-qs('mCash')?.addEventListener('click', cashoutMines);
+qs('mStart').onclick = startMines;
+qs('mCash').onclick = cashoutMines;
 
-// -------- Chat UI --------
+/* Chat UI */
 let chatOpen = false, chatTimer=null, lastChatId=0;
 function toggleChat(open){
   chatOpen = open;
   qs('chatDrawer').classList.toggle('open', open);
-  qs('fabChat').classList.toggle('hide', open);
   if(open){ pollChat(); } else { if(chatTimer) clearTimeout(chatTimer); }
 }
 qs('fabChat').onclick = ()=> toggleChat(true);
 qs('chatClose').onclick = ()=> toggleChat(false);
-
-const chatBody = qs('chatBody');
-if(chatBody){
-  chatBody.addEventListener('click', async (e)=>{
-    const target = e.target.closest('.user-link');
-    if(!target) return;
-    const uid = target.dataset.uid;
-    if(!uid) return;
-    try{
-      const p = await j('/api/profile/public?user_id=' + encodeURIComponent(uid));
-      const body = document.getElementById('pBody');
-      body.innerHTML = `
-        <div class="games-grid" style="grid-template-columns:1fr 1fr">
-          <div class="card soft"><div class="label">Name</div><div class="big">${p.name}</div><div class="muted">${p.role.toUpperCase()}</div></div>
-          <div class="card soft"><div class="label">Balance</div><div class="big">${fmtDL(p.balance)}</div><div class="muted">Lv ${p.level} • XP ${p.xp}</div></div>
-        </div>
-        <div class="kpi" style="margin-top:8px">
-          <span class="pill">Crash games: ${p.crash_games}</span>
-          <span class="pill">Mines games: ${p.mines_games}</span>
-        </div>`;
-      document.getElementById('pModal').classList.add('open');
-    }catch(e){ alert(e.message); }
-  });
-}
-qs('pClose').onclick = ()=> document.getElementById('pModal').classList.remove('open');
 
 async function pollChat(){
   try{
@@ -1910,147 +1803,202 @@ async function pollChat(){
       qs('chatBody').scrollTop = qs('chatBody').scrollHeight;
     }
   }catch(_){}
-  finally{
-    chatTimer = setTimeout(pollChat, 1200);
-  }
+  finally{ chatTimer = setTimeout(pollChat, 1200); }
 }
-function escapeHtml(s){
-  return String(s||'').replace(/[&<>\"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-}
-qs('chatSend').onclick = async ()=>{
-  const t = qs('chatText').value.trim();
-  if(!t) return;
+function escapeHtml(s){ return String(s||'').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+qs('chatBody').addEventListener('click', async (e)=>{
+  const u = e.target.closest('.user-link'); if(!u) return;
   try{
-    await j('/api/chat/send', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ text: t })});
-    qs('chatText').value = '';
-  }catch(e){ alert(e.message); }
+    const p = await j('/api/profile/public?user_id='+encodeURIComponent(u.dataset.uid));
+    toast(`${p.name} — Lv ${p.level} • ${fmtDL(p.balance)}`, 'info', 5200);
+  }catch(_){}
+});
+qs('chatSend').onclick = async ()=>{
+  const t = qs('chatText').value.trim(); if(!t) return;
+  try{ await j('/api/chat/send', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ text: t })}); qs('chatText').value=''; }
+  catch(e){ toast(e.message, 'err'); }
 };
 
-// -------- Games nav --------
-qs('openCrash').onclick = openCrash;
-qs('backToGames').onclick = ()=>{ showOnly('page-games'); if(crPollTimer) clearTimeout(crPollTimer); };
-qs('openMines').onclick = ()=>{ showOnly('page-mines'); refreshMines(); };
-qs('backToGames2').onclick = ()=> showOnly('page-games');
-qs('openCoinflip').onclick = ()=> showOnly('page-coinflip');
-qs('openBlackjack').onclick = ()=> showOnly('page-blackjack');
-qs('openPump').onclick = ()=> showOnly('page-pump');
-
-// -------- Boot --------
+/* Boot */
 (async function boot(){
-  showOnly('page-games');
-  renderHeader();
-  refreshLeaderboard();
   buildMinesGrid();
+  await renderHeader();
+  // attach referral cookie (if present)
+  const m = document.cookie.match(/(?:^|; )refname=([^;]+)/); if(m){ try{ await j('/api/referral/attach?refname='+decodeURIComponent(m[1])); }catch(_){ } }
+  // route by path
+  const path = routes[location.pathname] ? location.pathname : '/';
+  showRoute(path);
+  if(path==='/crash') openCrash();
+  if(path==='/leaderboard') refreshLeaderboard();
+  if(path==='/mines') refreshMines();
+  // wire top tabs
+  $$('.tabs a.tab').forEach(a => a.onclick = (e)=>{ e.preventDefault(); const p=a.getAttribute('data-path'); if(p) nav(p); });
+  // games grid links
+  $$('.game-card').forEach(c => c.onclick = ()=> nav(c.getAttribute('data-path')));
+  // hide loader
+  qs('loader').style.display='none';
 })();
 </script>
 </body>
 </html>
 """
 
-# ---------- Root page ----------
+# ---------- SPA routes for pretty URLs ----------
 @app.get("/", response_class=HTMLResponse)
-async def index():
-    html = HTML_TEMPLATE.replace("__INVITE__", DISCORD_INVITE or "__INVITE__") \
-                        .replace("__OWNER_ID__", str(OWNER_ID))
+async def index_root():
+    html = HTML_TEMPLATE.replace("__OWNER_ID__", str(OWNER_ID))
     return HTMLResponse(html)
 
-# ---------- Discord bot commands (embeds) ----------
-def _embed(title: str, desc: Optional[str] = None, color: int = 0x3b82f6):
-    e = discord.Embed(title=title, description=(desc or ""), color=color)
-    e.set_footer(text="GROWCB")
-    return e
+@app.get("/crash", response_class=HTMLResponse)
+async def spa_crash(): return await index_root()
 
-def _mention_or_id_to_uid(arg: Optional[str]) -> Optional[str]:
-    if not arg: return None
-    m = re.search(r"\d{5,}", str(arg))
-    return m.group(0) if m else None
+@app.get("/mines", response_class=HTMLResponse)
+async def spa_mines(): return await index_root()
+
+@app.get("/coinflip", response_class=HTMLResponse)
+async def spa_cf(): return await index_root()
+
+@app.get("/blackjack", response_class=HTMLResponse)
+async def spa_bj(): return await index_root()
+
+@app.get("/pump", response_class=HTMLResponse)
+async def spa_pu(): return await index_root()
+
+@app.get("/leaderboard", response_class=HTMLResponse)
+async def spa_lb(): return await index_root()
+
+@app.get("/promocodes", response_class=HTMLResponse)
+async def spa_pc(): return await index_root()
+
+@app.get("/profile", response_class=HTMLResponse)
+async def spa_profile(): return await index_root()
+
+@app.get("/settings", response_class=HTMLResponse)
+async def spa_settings(): return await index_root()
+
+@app.get("/referral", response_class=HTMLResponse)
+async def spa_referral(): return await index_root()
+
+# ---------- Discord Bot Commands ----------
+def _parse_target_id(text: Optional[str]) -> Optional[int]:
+    if not text: return None
+    m = re.search(r"(\d{5,})", text) or re.search(r"<@!?(\d+)>", text)
+    if m:
+        try: return int(m.group(1))
+        except: return None
+    return None
+
+def is_owner_or_webhook():
+    async def predicate(ctx: commands.Context):
+        if getattr(ctx.message, "webhook_id", None):
+            return True
+        return int(getattr(ctx.author, "id", 0)) == int(OWNER_ID)
+    return commands.check(predicate)
 
 @bot.event
 async def on_ready():
-    print(f"Bot ready as {bot.user}.")
+    print(f"Bot ready as {bot.user} ({bot.user.id})")
+
+def _embed(title: str, desc: str = "", color: int = 0x3b82f6):
+    e = discord.Embed(title=title, description=desc, color=color)
+    e.set_footer(text=f"{SITE_BASE}/")
+    return e
 
 @bot.command(name="help")
-async def cmd_help(ctx: commands.Context):
-    e = _embed("Commands", f"Prefix: `{PREFIX}`")
-    e.add_field(name="balance", value=f"`{PREFIX}bal` — your balance\n`{PREFIX}bal @user|id` — user's balance", inline=False)
-    e.add_field(name="level", value=f"`{PREFIX}level` — your level\n`{PREFIX}level @user|id` — user's level", inline=False)
-    e.add_field(name="leaderboard", value=f"`{PREFIX}leaderboard` — daily / monthly / all-time top (with reset times)", inline=False)
-    e.add_field(name="owner", value=f"`{PREFIX}addbal @user|id amount` — add DL\n`{PREFIX}removebal @user|id amount` — remove DL", inline=False)
-    await ctx.reply(embed=e)
+async def help_cmd(ctx: commands.Context):
+    e = _embed("GROWCB — Help", color=0x22c1dc)
+    e.add_field(name=".bal [@user|id]", value="Show your balance or another user’s balance.", inline=False)
+    e.add_field(name=".level [@user|id]", value="Show your level, XP, and progress.", inline=False)
+    e.add_field(name=".leaderboard", value="Show top wagered. Use buttons to switch Daily / Monthly / All-time.", inline=False)
+    e.add_field(name=".addbal (owner/webhook)", value="`.addbal <@user|id> <amount>` — add DL.", inline=False)
+    e.add_field(name=".removebal (owner/webhook)", value="`.removebal <@user|id> <amount>` — remove DL.", inline=False)
+    await ctx.send(embed=e)
 
 @bot.command(name="bal")
-async def cmd_bal(ctx: commands.Context, user: Optional[str] = None):
-    uid = _mention_or_id_to_uid(user) if user else str(ctx.author.id)
-    try:
-        bal = get_balance(uid)
-        e = _embed("Balance", f"<@{uid}> has **{GEM} {bal:.2f} DL**")
-        await ctx.reply(embed=e)
-    except Exception as ex:
-        await ctx.reply(f"Error: {ex}")
+async def bal_cmd(ctx: commands.Context, target: Optional[str] = None):
+    uid = int(ctx.author.id) if not target else (_parse_target_id(target) or int(ctx.author.id))
+    bal = float(get_balance(str(uid)))
+    name = getattr(ctx.author, "display_name", "you") if uid==ctx.author.id else (target or str(uid))
+    e = _embed("Balance", color=0x6aa6ff)
+    e.add_field(name="User", value=f"<@{uid}>", inline=True)
+    e.add_field(name="Balance", value=f"{GEM} {bal:.2f} DL", inline=True)
+    await ctx.send(embed=e)
 
 @bot.command(name="level")
-async def cmd_level(ctx: commands.Context, user: Optional[str] = None):
-    uid = _mention_or_id_to_uid(user) if user else str(ctx.author.id)
-    try:
-        p = profile_info(uid)
-        e = _embed("Level", f"<@{uid}> • **Lv {p['level']}** ({p['xp']} XP, {p['progress_pct']}% to next)")
-        await ctx.reply(embed=e)
-    except Exception as ex:
-        await ctx.reply(f"Error: {ex}")
+async def level_cmd(ctx: commands.Context, target: Optional[str] = None):
+    uid = int(ctx.author.id) if not target else (_parse_target_id(target) or int(ctx.author.id))
+    p = profile_info(str(uid))
+    # Make it pretty: progress bar
+    pct = max(0, min(100, int(p["progress_pct"])))
+    bars = int(pct/5)
+    bar = "█"*bars + "░"*(20-bars)
+    e = _embed("Level & XP", color=0x22c55e)
+    e.add_field(name="User", value=f"<@{uid}>", inline=True)
+    e.add_field(name="Level", value=f"Lv {p['level']}", inline=True)
+    e.add_field(name="XP", value=f"{p['xp']} ({pct}% to next)", inline=True)
+    e.add_field(name="Progress", value=f"`{bar}`", inline=False)
+    await ctx.send(embed=e)
 
-@bot.command(name="leaderboard")
-async def cmd_leaderboard(ctx: commands.Context):
-    try:
-        rows_d = get_leaderboard_rows_db("daily", 5)
-        rows_m = get_leaderboard_rows_db("monthly", 5)
-        rows_a = get_leaderboard_rows_db("alltime", 5)
-        def fmt(rows):
-            if not rows: return "—"
-            out = []
-            for i,r in enumerate(rows,1):
+class LBView(discord.ui.View):
+    def __init__(self): super().__init__(timeout=60)
+    async def _send(self, interaction: discord.Interaction, period: str):
+        rows = get_leaderboard_rows_db(period, 10)
+        title = "Leaderboard — " + (period.capitalize() if period!="alltime" else "All-time")
+        e = _embed(title, color=0x3b82f6)
+        if not rows:
+            e.description = "No data."
+        else:
+            lines = []
+            for i, r in enumerate(rows, 1):
                 name = "Anonymous" if r["is_anon"] else r["display_name"]
                 amt = "—" if r["is_anon"] else f"{GEM} {float(r['total_wagered']):.2f} DL"
-                out.append(f"`{i:>2}.` **{name}** — {amt}")
-            return "\n".join(out)
-        # resets
-        now = now_utc()
-        daily_reset = _start_of_utc_day(now) + datetime.timedelta(days=1)
-        monthly_reset = _start_of_utc_month(now) + datetime.timedelta(days=32)
-        monthly_reset = monthly_reset.replace(day=1)
-        e = _embed("Leaderboard")
-        e.add_field(name=f"Daily (resets {daily_reset.strftime('%Y-%m-%d %H:%M UTC')})", value=fmt(rows_d), inline=False)
-        e.add_field(name=f"Monthly (resets {monthly_reset.strftime('%Y-%m-%d %H:%M UTC')})", value=fmt(rows_m), inline=False)
-        e.add_field(name="All-time", value=fmt(rows_a), inline=False)
-        await ctx.reply(embed=e)
-    except Exception as ex:
-        await ctx.reply(f"Error: {ex}")
+                lines.append(f"**{i}.** {name} — {amt}")
+            e.description = "\n".join(lines)
+        await interaction.response.edit_message(embed=e, view=self)
+    @discord.ui.button(label="Daily", style=discord.ButtonStyle.primary)
+    async def daily(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._send(interaction, "daily")
+    @discord.ui.button(label="Monthly", style=discord.ButtonStyle.secondary)
+    async def monthly(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._send(interaction, "monthly")
+    @discord.ui.button(label="All-time", style=discord.ButtonStyle.secondary)
+    async def alltime(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._send(interaction, "alltime")
 
-def _owner_only(ctx: commands.Context) -> bool:
-    return str(ctx.author.id) == str(OWNER_ID)
+@bot.command(name="leaderboard")
+async def leaderboard_cmd(ctx: commands.Context):
+    rows = get_leaderboard_rows_db("daily", 10)
+    e = _embed("Leaderboard — Daily", color=0x3b82f6)
+    if not rows:
+        e.description = "No data."
+    else:
+        lines = []
+        for i, r in enumerate(rows, 1):
+            name = "Anonymous" if r["is_anon"] else r["display_name"]
+            amt = "—" if r["is_anon"] else f"{GEM} {float(r['total_wagered']):.2f} DL"
+            lines.append(f"**{i}.** {name} — {amt}")
+        e.description = "\n".join(lines)
+    await ctx.send(embed=e, view=LBView())
 
 @bot.command(name="addbal")
-async def cmd_addbal(ctx: commands.Context, target: str, amount: str):
-    if not _owner_only(ctx):
-        return await ctx.reply("Only owner can use this.")
-    uid = _mention_or_id_to_uid(target)
-    if not uid: return await ctx.reply("Give a mention or user ID.")
-    try:
-        newbal = adjust_balance(str(ctx.author.id), uid, D(amount), "bot:add")
-        await ctx.reply(embed=_embed("Balance Updated", f"Added **{GEM} {q2(D(amount)):.2f} DL** to <@{uid}>.\nNew balance: **{GEM} {newbal:.2f} DL**"))
-    except Exception as ex:
-        await ctx.reply(f"Error: {ex}")
+@is_owner_or_webhook()
+async def addbal_cmd(ctx: commands.Context, target: str, amount: str):
+    uid = _id_from_identifier(target)
+    newbal = adjust_balance(str(OWNER_ID), uid, D(amount), "bot:addbal")
+    e = _embed("Balance Added", color=0x22c55e)
+    e.add_field(name="User", value=f"<@{uid}>", inline=True)
+    e.add_field(name="New Balance", value=f"{GEM} {float(newbal):.2f} DL", inline=True)
+    await ctx.send(embed=e)
 
 @bot.command(name="removebal")
-async def cmd_removebal(ctx: commands.Context, target: str, amount: str):
-    if not _owner_only(ctx):
-        return await ctx.reply("Only owner can use this.")
-    uid = _mention_or_id_to_uid(target)
-    if not uid: return await ctx.reply("Give a mention or user ID.")
-    try:
-        newbal = adjust_balance(str(ctx.author.id), uid, -D(amount), "bot:remove")
-        await ctx.reply(embed=_embed("Balance Updated", f"Removed **{GEM} {q2(D(amount)):.2f} DL** from <@{uid}>.\nNew balance: **{GEM} {newbal:.2f} DL**"))
-    except Exception as ex:
-        await ctx.reply(f"Error: {ex}")
+@is_owner_or_webhook()
+async def removebal_cmd(ctx: commands.Context, target: str, amount: str):
+    uid = _id_from_identifier(target)
+    newbal = adjust_balance(str(OWNER_ID), uid, D("-"+str(amount).lstrip("+")), "bot:removebal")
+    e = _embed("Balance Removed", color=0xef4444)
+    e.add_field(name="User", value=f"<@{uid}>", inline=True)
+    e.add_field(name="New Balance", value=f"{GEM} {float(newbal):.2f} DL", inline=True)
+    await ctx.send(embed=e)
 
 # ---------- Run local ----------
 if __name__ == "__main__":

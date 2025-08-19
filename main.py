@@ -1,14 +1,14 @@
 # app/main.py — single-file site that does everything (backend + UI)
 # - Polished header tabs
-# - “Join Discord” only in the header (not inside Games/Promo/Referral pages)
-# - Chat FAB slides out of the way when chat opens
-# - No demo accounts: if not logged in, UI shows Login CTA and actions require auth
-# - Logout is in Settings (removed from avatar menu)
-# - Clicking names in chat opens a public profile modal (no DL/balance shown)
+# - “Join Discord” only in the header
+# - Chat FAB moves with the chat drawer
+# - No demo accounts (requires login for actions)
+# - Logout only in Settings
+# - Clicking names in chat opens a public profile modal (no balance shown)
 
 import os, json, asyncio, re, random, string, datetime, base64
 from urllib.parse import urlencode
-from typing import Optional, Tuple, Dict, List
+from typing import Optional, Dict, List
 from decimal import Decimal, ROUND_DOWN, getcontext
 from contextlib import asynccontextmanager
 
@@ -20,8 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from itsdangerous import URLSafeSerializer, BadSignature
 from pydantic import BaseModel
 
-# ---------- Import games from separate files ----------
-# (ensure crash.py and mines.py are in the same folder)
+# ---------- Import games (ensure crash.py & mines.py are next to this file) ----------
 from crash import (
     ensure_betting_round, place_bet, load_round, begin_running,
     finish_round, create_next_betting, last_busts, your_bet,
@@ -33,7 +32,6 @@ from mines import (
 
 # ---------- Config ----------
 getcontext().prec = 28
-
 CLIENT_ID = os.getenv("DISCORD_CLIENT_ID", "")
 CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET") or os.getenv("CLIENT_SECRET", "")
 OAUTH_REDIRECT = os.getenv("OAUTH_REDIRECT", "")
@@ -44,25 +42,18 @@ OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
-DISCORD_INVITE = os.getenv("DISCORD_INVITE", "")  # optional vanity invite
-
-GEM = "💎"
-MIN_BET = Decimal("1.00")
-MAX_BET = Decimal("1000000.00")
-BETTING_SECONDS = 10
+DISCORD_INVITE = os.getenv("DISCORD_INVITE", "")
 
 TWO = Decimal("0.01")
-def D(x) -> Decimal:
-    return x if isinstance(x, Decimal) else Decimal(str(x))
-def q2(x: Decimal) -> Decimal:
-    return D(x).quantize(TWO, rounding=ROUND_DOWN)
+def D(x) -> Decimal: return x if isinstance(x, Decimal) else Decimal(str(x))
+def q2(x: Decimal) -> Decimal: return D(x).quantize(TWO, rounding=ROUND_DOWN)
 
 UTC = datetime.timezone.utc
 def now_utc() -> datetime.datetime: return datetime.datetime.now(UTC)
 def iso(dt: Optional[datetime.datetime]) -> Optional[str]:
     return None if dt is None else dt.astimezone(UTC).isoformat()
 
-# ---------- App / Lifespan / Static ----------
+# ---------- App / Lifespan ----------
 def _get_static_dir():
     base = os.path.dirname(os.path.abspath(__file__))
     static_dir = os.path.join(base, "static")
@@ -79,11 +70,10 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=_get_static_dir()), name="static")
 
-# Serve images next to main.py (fallback /static). If missing, return tiny transparent PNG.
+# ---------- Image Fallback ----------
 _TRANSPARENT_PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
 )
-
 @app.get("/img/{filename}")
 async def serve_img(filename: str):
     base = os.path.dirname(os.path.abspath(__file__))
@@ -106,7 +96,7 @@ def _require_session(request: Request) -> dict:
     except BadSignature:
         raise HTTPException(401, "Invalid session")
 
-# ---------- DB helpers ----------
+# ---------- DB ----------
 def with_conn(fn):
     def wrapper(*args, **kwargs):
         if not DATABASE_URL: raise RuntimeError("DATABASE_URL not set")
@@ -119,27 +109,21 @@ def with_conn(fn):
 
 @with_conn
 def init_db(cur):
-    # balances
     cur.execute("""CREATE TABLE IF NOT EXISTS balances (
         user_id TEXT PRIMARY KEY, balance NUMERIC(18,2) NOT NULL DEFAULT 0)""")
-    # profiles
     cur.execute("""CREATE TABLE IF NOT EXISTS profiles (
         user_id TEXT PRIMARY KEY, display_name TEXT NOT NULL, name_lower TEXT NOT NULL UNIQUE,
         xp INTEGER NOT NULL DEFAULT 0, role TEXT NOT NULL DEFAULT 'member', is_anon BOOLEAN NOT NULL DEFAULT FALSE,
         referred_by TEXT, created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP)""")
-    # balances log
     cur.execute("""CREATE TABLE IF NOT EXISTS balance_log (
         id BIGSERIAL PRIMARY KEY, actor_id TEXT NOT NULL, target_id TEXT NOT NULL,
         amount NUMERIC(18,2) NOT NULL, reason TEXT, created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP)""")
-    # OAuth tokens
     cur.execute("""CREATE TABLE IF NOT EXISTS oauth_tokens (
         user_id TEXT PRIMARY KEY, access_token TEXT NOT NULL, refresh_token TEXT, expires_at TIMESTAMPTZ)""")
-    # referrals
     cur.execute("""CREATE TABLE IF NOT EXISTS ref_names (
         user_id TEXT PRIMARY KEY, name_lower TEXT UNIQUE NOT NULL, created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS ref_visits (
         id BIGSERIAL PRIMARY KEY, referrer_id TEXT NOT NULL, joined_user_id TEXT, created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP)""")
-    # promos
     cur.execute("""CREATE TABLE IF NOT EXISTS promo_codes (
         code TEXT PRIMARY KEY, amount NUMERIC(18,2) NOT NULL, max_uses INTEGER NOT NULL DEFAULT 1,
         uses INTEGER NOT NULL DEFAULT 0, expires_at TIMESTAMPTZ, created_by TEXT,
@@ -147,7 +131,6 @@ def init_db(cur):
     cur.execute("""CREATE TABLE IF NOT EXISTS promo_redemptions (
         user_id TEXT NOT NULL, code TEXT NOT NULL, redeemed_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY(user_id, code))""")
-    # crash
     cur.execute("""CREATE TABLE IF NOT EXISTS crash_rounds (
         id BIGSERIAL PRIMARY KEY, status TEXT NOT NULL, bust NUMERIC(10,2),
         betting_opens_at TIMESTAMPTZ NOT NULL, betting_ends_at TIMESTAMPTZ NOT NULL,
@@ -161,21 +144,19 @@ def init_db(cur):
         id BIGSERIAL PRIMARY KEY, user_id TEXT NOT NULL, bet NUMERIC(18,2) NOT NULL,
         cashout NUMERIC(8,2) NOT NULL, bust NUMERIC(10,2) NOT NULL, win NUMERIC(18,2) NOT NULL,
         xp_gain INTEGER NOT NULL, created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP)""")
-    # chat
     cur.execute("""CREATE TABLE IF NOT EXISTS chat_messages (
         id BIGSERIAL PRIMARY KEY, user_id TEXT NOT NULL, username TEXT NOT NULL, text TEXT NOT NULL,
         created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP, private_to TEXT)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS chat_timeouts (
         user_id TEXT PRIMARY KEY, until TIMESTAMPTZ NOT NULL, reason TEXT, created_by TEXT,
         created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP)""")
-    # mines
     cur.execute("""CREATE TABLE IF NOT EXISTS mines_games (
         id BIGSERIAL PRIMARY KEY, user_id TEXT NOT NULL, bet NUMERIC(18,2) NOT NULL, mines INTEGER NOT NULL,
         board TEXT NOT NULL, picks BIGINT NOT NULL DEFAULT 0, started_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
         ended_at TIMESTAMPTZ, status TEXT NOT NULL DEFAULT 'active', seed TEXT NOT NULL, commit_hash TEXT NOT NULL,
         win NUMERIC(18,2) NOT NULL DEFAULT 0)""")
 
-# ---- balances / profiles helpers ----
+# ---------- Profile/Balance helpers ----------
 @with_conn
 def get_balance(cur, user_id: str) -> Decimal:
     cur.execute("SELECT balance FROM balances WHERE user_id=%s", (user_id,))
@@ -269,7 +250,6 @@ def profile_info(cur, user_id: str):
 
 @with_conn
 def public_profile(cur, user_id: str) -> Optional[dict]:
-    # NOTE: do NOT expose balance here (per requirement)
     cur.execute("SELECT display_name, xp, role, created_at, is_anon FROM profiles WHERE user_id=%s", (user_id,))
     r = cur.fetchone()
     if not r: return None
@@ -291,47 +271,11 @@ def set_role(cur, target_id: str, role: str):
     cur.execute("UPDATE profiles SET role=%s WHERE user_id=%s", (role, target_id))
     return {"ok": True, "role": role}
 
-# ---- promos ----
-class PromoError(Exception): ...
-class PromoAlreadyRedeemed(PromoError): ...
-class PromoInvalid(PromoError): ...
-class PromoExpired(PromoError): ...
-class PromoExhausted(PromoError): ...
-
 @with_conn
-def redeem_promo(cur, user_id: str, code: str) -> Decimal:
-    code = (code or "").strip().upper()
-    cur.execute("SELECT code, amount, max_uses, uses, expires_at FROM promo_codes WHERE code=%s", (code,))
-    row = cur.fetchone()
-    if not row: raise PromoInvalid("Invalid code")
-    _, amount, max_uses, uses, expires_at = row
-    if expires_at is not None:
-        cur.execute("SELECT NOW() > %s", (expires_at,))
-        if cur.fetchone()[0]: raise PromoExpired("Code expired")
-    if uses >= max_uses: raise PromoExhausted("Code maxed out")
-    cur.execute("SELECT 1 FROM promo_redemptions WHERE user_id=%s AND code=%s", (user_id, code))
-    if cur.fetchone(): raise PromoAlreadyRedeemed("You already redeemed this code")
-    cur.execute("INSERT INTO balances(user_id,balance) VALUES (%s,0) ON CONFLICT(user_id) DO NOTHING", (user_id,))
-    cur.execute("UPDATE balances SET balance=balance+%s WHERE user_id=%s", (amount, user_id))
-    cur.execute("UPDATE promo_codes SET uses=uses+1 WHERE code=%s", (code,))
-    cur.execute("INSERT INTO promo_redemptions(user_id,code) VALUES (%s,%s)", (user_id, code))
-    cur.execute("INSERT INTO balance_log(actor_id,target_id,amount,reason) VALUES (%s,%s,%s,%s)",
-                ("promo", user_id, amount, f"promo:{code}"))
-    cur.execute("SELECT balance FROM balances WHERE user_id=%s", (user_id,))
-    return q2(cur.fetchone()[0])
-
-def _rand_code(n=8): return ''.join(random.choices(string.ascii_uppercase+string.digits, k=n))
-
-@with_conn
-def create_promo(cur, actor_id: str, code: Optional[str], amount, max_uses: int = 1, expires_at: Optional[str] = None):
-    amt = q2(D(amount))
-    code = (code.strip().upper() if code else _rand_code())
-    cur.execute("""
-        INSERT INTO promo_codes(code,amount,max_uses,expires_at,created_by)
-        VALUES (%s,%s,%s,%s,%s)
-        ON CONFLICT (code) DO UPDATE SET amount=EXCLUDED.amount, max_uses=EXCLUDED.max_uses, expires_at=EXCLUDED.expires_at
-    """, (code, amt, max_uses, expires_at, actor_id))
-    return {"ok": True, "code": code}
+def get_role(cur, user_id: str) -> str:
+    cur.execute("SELECT role FROM profiles WHERE user_id=%s", (user_id,))
+    r = cur.fetchone()
+    return r[0] if r else "member"
 
 # ---------- Leaderboard ----------
 def _start_of_utc_day(dt: datetime.datetime) -> datetime.datetime:
@@ -346,13 +290,11 @@ def get_leaderboard_rows_db(cur, period: str, limit: int = 50):
     params = []
     where_crash = ""
     where_mines = "WHERE status<>'active'"
-
     if period in ("daily","monthly"):
         start = _start_of_utc_day(now) if period=="daily" else _start_of_utc_month(now)
         where_crash = "WHERE created_at >= %s"
         where_mines += " AND started_at >= %s"
         params.extend([start, start])
-
     sql = f"""
         WITH wagers AS (
           SELECT user_id, COALESCE(SUM(bet),0)::numeric(18,2) AS total
@@ -374,11 +316,11 @@ def get_leaderboard_rows_db(cur, period: str, limit: int = 50):
     params.append(limit)
     cur.execute(sql, tuple(params))
     rows = cur.fetchall()
-    out = []
-    for uid, name, is_anon, total in rows:
-        out.append({"user_id": str(uid), "display_name": name, "is_anon": bool(is_anon),
-                    "total_wagered": float(q2(D(total)))})
-    return out
+    return [
+        {"user_id": str(uid), "display_name": name, "is_anon": bool(is_anon),
+         "total_wagered": float(q2(D(total)))}
+        for uid, name, is_anon, total in rows
+    ]
 
 # ---------- Migrations ----------
 @with_conn
@@ -388,7 +330,7 @@ def apply_migrations(cur):
     cur.execute("CREATE INDEX IF NOT EXISTS ix_mines_games_started_at ON mines_games(started_at)")
     cur.execute("ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS private_to TEXT")
 
-# ---------- OAuth token store & Discord join ----------
+# ---------- OAuth tokens & Discord join ----------
 @with_conn
 def save_tokens(cur, user_id: str, access_token: str, refresh_token: Optional[str], expires_in: Optional[int]):
     expires_at = now_utc() + datetime.timedelta(seconds=int(expires_in or 0)) if expires_in else None
@@ -484,7 +426,7 @@ async def logout():
     resp = RedirectResponse("/")
     _clear_session(resp); return resp
 
-# ---------- Me / Profile / Public ----------
+# ---------- Me / Profile ----------
 @app.get("/api/me")
 async def api_me(request: Request):
     s = _require_session(request)
@@ -513,14 +455,11 @@ async def api_profile(request: Request):
 async def api_public(user_id: str):
     info = public_profile(user_id)
     if not info: raise HTTPException(404, "Not found")
-    # ensure no balance is leaked
     info.pop("balance", None)
     return info
 
 # ---------- Settings ----------
-class AnonIn(BaseModel):
-    is_anon: bool
-
+class AnonIn(BaseModel): is_anon: bool
 @app.get("/api/settings/get")
 async def api_settings_get(request: Request):
     s = _require_session(request)
@@ -532,14 +471,8 @@ async def api_settings_set_anon(request: Request, body: AnonIn):
     s = _require_session(request)
     return set_profile_is_anon(s["id"], bool(body.is_anon))
 
-# ---------- Leaderboard ----------
-@app.get("/api/leaderboard")
-async def api_leaderboard(period: str = Query("daily"), limit: int = Query(50, ge=1, le=200)):
-    return {"rows": get_leaderboard_rows_db(period, limit)}
-
 # ---------- Referral ----------
 class RefIn(BaseModel): name: str
-
 @with_conn
 def get_ref_state(cur, user_id: str):
     cur.execute("SELECT name_lower FROM ref_names WHERE user_id=%s", (user_id,))
@@ -552,7 +485,7 @@ def get_ref_state(cur, user_id: str):
 
 @with_conn
 def set_ref_name(cur, user_id: str, name: str):
-    if not NAME_RE.match(name): raise ValueError("3–20 chars: letters, numbers, _ or -")
+    if not NAME_RE.match(name): raise ValueError("3–20 chars: a-zA-Z0-9_-")
     lower = name.lower()
     cur.execute("SELECT user_id FROM ref_names WHERE name_lower=%s AND user_id<>%s", (lower, user_id))
     if cur.fetchone(): raise ValueError("Name is already taken")
@@ -638,69 +571,147 @@ async def api_admin_promo_create(request: Request, body: PromoCreateIn):
     if role not in ("admin","owner"): raise HTTPException(403, "No permission")
     return create_promo(s["id"], body.code, body.amount, body.max_uses, body.expires_at)
 
+# ---------- Promo helpers ----------
+class PromoInvalid(Exception): pass
+class PromoExpired(Exception): pass
+class PromoExhausted(Exception): pass
+class PromoAlreadyRedeemed(Exception): pass
+
+@with_conn
+def redeem_promo(cur, user_id: str, code: str) -> Decimal:
+    code = (code or "").strip().lower()
+    cur.execute("SELECT code, amount, max_uses, uses, expires_at FROM promo_codes WHERE code=%s", (code,))
+    r = cur.fetchone()
+    if not r: raise PromoInvalid("Invalid code")
+    _, amount, max_uses, uses, expires_at = r
+    if expires_at and now_utc() > expires_at: raise PromoExpired("Code expired")
+    if uses >= max_uses: raise PromoExhausted("Code fully used")
+    cur.execute("SELECT 1 FROM promo_redemptions WHERE user_id=%s AND code=%s", (user_id, code))
+    if cur.fetchone(): raise PromoAlreadyRedeemed("You already redeemed this code")
+    cur.execute("UPDATE promo_codes SET uses=uses+1 WHERE code=%s", (code,))
+    cur.execute("INSERT INTO promo_redemptions(user_id,code) VALUES(%s,%s)", (user_id, code))
+    newbal = adjust_balance(user_id, user_id, amount, f"promo:{code}")
+    return newbal
 
 # ---------- Chat ----------
-class ChatIn(BaseModel):
-    text: str
+class ChatIn(BaseModel): text: str
 
-@app.get("/api/chat/list")
-async def api_chat_list(limit: int = Query(50, ge=1, le=200)):
-    with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
-        cur.execute("""SELECT id,user_id,username,text,created_at FROM chat_messages
-                       ORDER BY id DESC LIMIT %s""", (limit,))
+@with_conn
+def chat_insert(cur, user_id: str, username: str, text: str, private_to: Optional[str] = None):
+    text = (text or "").strip()
+    if not text: raise ValueError("Message is empty")
+    if len(text) > 300: raise ValueError("Message too long")
+    cur.execute("INSERT INTO chat_messages(user_id,username,text,private_to) VALUES (%s,%s,%s,%s) RETURNING id,created_at",
+                (user_id, username, text, private_to))
+    row = cur.fetchone()
+    return {"id": int(row[0]), "created_at": str(row[1])}
+
+@with_conn
+def chat_fetch(cur, since_id: int, limit: int):
+    if since_id <= 0:
+        cur.execute("""SELECT id,user_id,username,text,created_at,private_to
+                       FROM chat_messages ORDER BY id DESC LIMIT %s""", (limit,))
+        rows = list(reversed(cur.fetchall()))
+    else:
+        cur.execute("""SELECT id,user_id,username,text,created_at,private_to
+                       FROM chat_messages WHERE id>%s ORDER BY id ASC LIMIT %s""", (since_id, limit))
         rows = cur.fetchall()
-    return {"messages": [
-        {"id": r[0], "user_id": r[1], "username": r[2],
-         "text": r[3], "created_at": str(r[4])}
-        for r in reversed(rows)
-    ]}
+    out = []
+    # enrich with levels/roles
+    uids = list({str(r[1]) for r in rows})
+    levels: Dict[str,int] = {}; roles: Dict[str,str] = {}
+    if uids:
+        cur.execute("SELECT user_id, xp, role FROM profiles WHERE user_id = ANY(%s)", (uids,))
+        for uid, xp, role in cur.fetchall():
+            levels[str(uid)] = 1 + int(xp)//100
+            roles[str(uid)] = role or "member"
+    for mid, uid, uname, txt, ts, priv in rows:
+        uid = str(uid)
+        out.append({"id": int(mid), "user_id": uid, "username": uname,
+                    "level": int(levels.get(uid,1)), "role": roles.get(uid,"member"),
+                    "text": txt, "created_at": str(ts), "private_to": priv})
+    return out
+
+@app.get("/api/chat/fetch")
+async def api_chat_fetch(since: int = 0, limit: int = 30):
+    return {"rows": chat_fetch(since, limit)}
 
 @app.post("/api/chat/send")
 async def api_chat_send(request: Request, body: ChatIn):
     s = _require_session(request)
-    text = (body.text or "").strip()
-    if not text: raise HTTPException(400, "Empty")
-    if len(text) > 200: raise HTTPException(400, "Too long")
-    with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
-        cur.execute("""INSERT INTO chat_messages(user_id,username,text)
-                       VALUES (%s,%s,%s) RETURNING id,created_at""",
-                    (s["id"], s["username"], text))
-        mid, created = cur.fetchone()
-        con.commit()
-    return {"ok": True, "id": mid, "created_at": str(created)}
+    return chat_insert(s["id"], s["username"], body.text, None)
 
 # ---------- Games: Crash ----------
-@app.get("/api/crash/state")
-async def api_crash_state():
-    return load_round()
+class CrashBetIn(BaseModel):
+    bet: str
+    cashout: Optional[float] = None
 
-@app.post("/api/crash/bet")
-async def api_crash_bet(request: Request, bet: float = Query(...), cashout: float = Query(2.0)):
+@app.get("/api/crash/state")
+async def api_crash_state(request: Request):
+    try:
+        s = _require_session(request); uid = s["id"]
+    except:
+        uid = None
+    rid, info = ensure_betting_round()
+    now = now_utc()
+    if info["status"]=="betting" and now>=info["betting_ends_at"]:
+        begin_running(rid); info = load_round()
+    if info and info["status"]=="running" and info["expected_end_at"] and now>=info["expected_end_at"]:
+        finish_round(rid)
+        create_next_betting()
+        info = load_round()
+
+    out = {
+        "phase": info["status"],
+        "bust": info["bust"],
+        "betting_opens_at": iso(info["betting_opens_at"]),
+        "betting_ends_at": iso(info["betting_ends_at"]),
+        "started_at": iso(info["started_at"]),
+        "expected_end_at": iso(info["expected_end_at"]),
+        "last_busts": last_busts()
+    }
+    if info["status"] == "running":
+        out["current_multiplier"] = current_multiplier(
+            info["started_at"], info["expected_end_at"], info["bust"], now
+        )
+    if uid:
+        y = your_bet(rid, uid)
+        if y:
+            out["your_bet"] = y
+    return out
+
+@app.post("/api/crash/place")
+async def api_crash_place(request: Request, body: CrashBetIn):
     s = _require_session(request)
-    return place_bet(s["id"], D(bet), float(cashout))
+    bet = q2(D(body.bet or "0"))
+    cashout = float(body.cashout or 2.0)
+    return place_bet(s["id"], bet, max(1.01, cashout))
 
 @app.post("/api/crash/cashout")
 async def api_crash_cashout(request: Request):
     s = _require_session(request)
+    cur = load_round()
+    if not cur or cur["status"] != "running":
+        raise HTTPException(400, "No running round")
     return cashout_now(s["id"])
 
 @app.get("/api/crash/history")
 async def api_crash_history(request: Request):
     s = _require_session(request)
-    return {"rows": your_history(s["id"])}
+    return {"rows": your_history(s["id"], 10)}
 
-@app.get("/api/crash/last_busts")
-async def api_crash_last_busts():
-    return {"rows": last_busts()}
+# ---------- Mines endpoints ----------
+class MinesStartIn(BaseModel):
+    bet: str
+    mines: int
 
-# ---------- Games: Mines ----------
 @app.post("/api/mines/start")
-async def api_mines_start(request: Request, bet: float = Query(...), mines: int = Query(3)):
+async def api_mines_start(request: Request, body: MinesStartIn):
     s = _require_session(request)
-    return mines_start(s["id"], D(bet), mines)
+    return mines_start(s["id"], q2(D(body.bet or "0")), int(body.mines))
 
 @app.post("/api/mines/pick")
-async def api_mines_pick(request: Request, cell: int = Query(...)):
+async def api_mines_pick(request: Request, cell: int = Query(..., ge=0, le=24)):
     s = _require_session(request)
     return mines_pick(s["id"], cell)
 
@@ -712,17 +723,17 @@ async def api_mines_cashout(request: Request):
 @app.get("/api/mines/state")
 async def api_mines_state(request: Request):
     s = _require_session(request)
-    return mines_state(s["id"])
+    return mines_state(s["id"]) or {}
 
 @app.get("/api/mines/history")
 async def api_mines_history(request: Request):
     s = _require_session(request)
-    return {"rows": mines_history(s["id"])}
+    return {"rows": mines_history(s["id"], 15)}
 
 # ---------- Root HTML ----------
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
-    # serve SPA shell (app.js will handle tabs etc.)
+    # serve SPA shell (inline UI handled by HTML_TEMPLATE below if you’re using that approach)
     html = """
     <!DOCTYPE html><html>
     <head>
@@ -740,3 +751,20 @@ async def index(request: Request):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=True)
+
+@with_conn
+def create_promo(cur, creator_id: str, code: Optional[str], amount: str, max_uses: int, expires_at: Optional[str]):
+    if not code:
+        code = ''.join(random.choice(string.ascii_lowercase+string.digits) for _ in range(8))
+    code = code.lower()
+    amt = q2(D(amount))
+    exp_dt = None
+    if expires_at:
+        try: exp_dt = datetime.datetime.fromisoformat(expires_at).astimezone(UTC)
+        except Exception: raise ValueError("Invalid expires_at format")
+    cur.execute("""INSERT INTO promo_codes(code,amount,max_uses,expires_at,created_by)
+                   VALUES(%s,%s,%s,%s,%s)""",
+                (code, amt, max_uses, exp_dt, creator_id))
+    return {"ok": True, "code": code, "amount": float(amt), "max_uses": max_uses,
+            "expires_at": (exp_dt.isoformat() if exp_dt else None)}
+

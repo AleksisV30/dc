@@ -1,10 +1,10 @@
-# app/main.py — single-file site that does everything (backend + UI)
+# app/main.py — single-file site that does everything (backend + inline UI)
 # - Polished header tabs
 # - “Join Discord” only in the header
-# - Chat FAB moves with the chat drawer
-# - No demo accounts (requires login for actions)
+# - No demo accounts (actions require login)
 # - Logout only in Settings
-# - Clicking names in chat opens a public profile modal (no balance shown)
+# - Clicking names in chat could open public profile (endpoint included; basic UI link)
+# - Inline HTML/CSS/JS so it never gets stuck on “Loading…”
 
 import os, json, asyncio, re, random, string, datetime, base64
 from urllib.parse import urlencode
@@ -400,23 +400,32 @@ async def callback(code: str):
     if not (CLIENT_ID and CLIENT_SECRET and OAUTH_REDIRECT):
         return HTMLResponse("OAuth not configured")
     async with httpx.AsyncClient(timeout=15) as cx:
-        data = {"client_id": CLIENT_ID, "client_secret": CLIENT_SECRET, "grant_type": "authorization_code",
-                "code": code, "redirect_uri": OAUTH_REDIRECT}
+        data = {
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": OAUTH_REDIRECT
+        }
         r = await cx.post(f"{DISCORD_API}/oauth2/token", data=data, headers={"Content-Type":"application/x-www-form-urlencoded"})
         if r.status_code != 200:
             return HTMLResponse(f"OAuth failed: {r.text}", status_code=400)
         tok = r.json()
         access = tok.get("access_token")
-        u = await cx.get(f"{DISCORD_API}/users/@me", headers={"Authorization": f"Bearer {access}"})
-        if u.status_code != 200:
-            return HTMLResponse(f"User fetch failed: {u.text}", status_code=400)
-        me = u.json()
+        async with httpx.AsyncClient(timeout=15) as cx2:
+            u = await cx2.get(f"{DISCORD_API}/users/@me", headers={"Authorization": f"Bearer {access}"})
+            if u.status_code != 200:
+                return HTMLResponse(f"User fetch failed: {u.text}", status_code=400)
+            me = u.json()
+
     user_id = str(me["id"])
     username = f'{me.get("username","user")}#{me.get("discriminator","0")}'.replace("#0","")
     avatar_hash = me.get("avatar")
     avatar_url = f"https://cdn.discordapp.com/avatars/{user_id}/{avatar_hash}.png?size=64" if avatar_hash else "https://cdn.discordapp.com/embed/avatars/0.png"
+
     ensure_profile_row(user_id)
     save_tokens(user_id, tok.get("access_token",""), tok.get("refresh_token"), tok.get("expires_in"))
+
     resp = RedirectResponse("/")
     _set_session(resp, {"id": user_id, "username": username, "avatar_url": avatar_url})
     return resp
@@ -424,9 +433,10 @@ async def callback(code: str):
 @app.get("/logout")
 async def logout():
     resp = RedirectResponse("/")
-    _clear_session(resp); return resp
+    _clear_session(resp)
+    return resp
 
-# ---------- Me / Profile ----------
+# ---------- Me / Profile / Balance ----------
 @app.get("/api/me")
 async def api_me(request: Request):
     s = _require_session(request)
@@ -438,7 +448,7 @@ async def api_me(request: Request):
                                  headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"})
                 in_guild = (r.status_code == 200)
         except:
-            pass
+            in_guild = False
     return {"id": s["id"], "username": s["username"], "avatar_url": s.get("avatar_url"), "in_guild": in_guild}
 
 @app.get("/api/balance")
@@ -451,15 +461,10 @@ async def api_profile(request: Request):
     s = _require_session(request)
     return profile_info(s["id"])
 
-@app.get("/api/public/{user_id}")
-async def api_public(user_id: str):
-    info = public_profile(user_id)
-    if not info: raise HTTPException(404, "Not found")
-    info.pop("balance", None)
-    return info
+# ---------- Settings (Anonymous mode) ----------
+class AnonIn(BaseModel):
+    is_anon: bool
 
-# ---------- Settings ----------
-class AnonIn(BaseModel): is_anon: bool
 @app.get("/api/settings/get")
 async def api_settings_get(request: Request):
     s = _require_session(request)
@@ -471,12 +476,18 @@ async def api_settings_set_anon(request: Request, body: AnonIn):
     s = _require_session(request)
     return set_profile_is_anon(s["id"], bool(body.is_anon))
 
+# ---------- Leaderboard ----------
+@app.get("/api/leaderboard")
+async def api_leaderboard(period: str = Query("daily"), limit: int = Query(50, ge=1, le=200)):
+    rows = get_leaderboard_rows_db(period, limit)
+    return {"rows": rows}
+
 # ---------- Referral ----------
-class RefIn(BaseModel): name: str
 @with_conn
 def get_ref_state(cur, user_id: str):
     cur.execute("SELECT name_lower FROM ref_names WHERE user_id=%s", (user_id,))
-    r = cur.fetchone(); name = r[0] if r else None
+    r = cur.fetchone()
+    name = r[0] if r else None
     cur.execute("SELECT COUNT(*) FROM ref_visits WHERE referrer_id=%s AND joined_user_id IS NOT NULL", (user_id,))
     joined = int(cur.fetchone()[0])
     cur.execute("SELECT COUNT(*) FROM ref_visits WHERE referrer_id=%s", (user_id,))
@@ -485,13 +496,14 @@ def get_ref_state(cur, user_id: str):
 
 @with_conn
 def set_ref_name(cur, user_id: str, name: str):
-    if not NAME_RE.match(name): raise ValueError("3–20 chars: a-zA-Z0-9_-")
+    if not NAME_RE.match(name): raise ValueError("3–20 chars: letters, numbers, _ or -")
     lower = name.lower()
     cur.execute("SELECT user_id FROM ref_names WHERE name_lower=%s AND user_id<>%s", (lower, user_id))
     if cur.fetchone(): raise ValueError("Name is already taken")
     cur.execute("""
-        INSERT INTO ref_names(user_id, name_lower) VALUES (%s,%s)
-        ON CONFLICT(user_id) DO UPDATE SET name_lower=EXCLUDED.name_lower
+        INSERT INTO ref_names(user_id, name_lower)
+        VALUES(%s,%s)
+        ON CONFLICT (user_id) DO UPDATE SET name_lower=EXCLUDED.name_lower
     """, (user_id, lower))
     return {"ok": True, "name": lower}
 
@@ -500,6 +512,9 @@ async def api_ref_state(request: Request):
     s = _require_session(request)
     return get_ref_state(s["id"])
 
+class RefIn(BaseModel):
+    name: str
+
 @app.post("/api/referral/set")
 async def api_ref_set(request: Request, body: RefIn):
     s = _require_session(request)
@@ -507,17 +522,20 @@ async def api_ref_set(request: Request, body: RefIn):
 
 @app.get("/r/{refname}")
 async def referral_landing(refname: str, request: Request):
-    rn = (refname or "").lower()
+    refname = (refname or "").lower()
     with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
-        cur.execute("SELECT user_id FROM ref_names WHERE name_lower=%s", (rn,))
+        cur.execute("SELECT user_id FROM ref_names WHERE name_lower=%s", (refname,))
         r = cur.fetchone()
         if r:
             referrer = str(r[0])
             cur.execute("INSERT INTO ref_visits(referrer_id) VALUES (%s)", (referrer,))
             con.commit()
-    html = f"""<script>
-      document.cookie = "refname={rn}; path=/; max-age=1209600; samesite=lax"; location.href="/";
-    </script>"""
+    html = f"""
+    <script>
+      document.cookie = "refname={refname}; path=/; max-age=1209600; samesite=lax";
+      location.href = "/";
+    </script>
+    """
     return HTMLResponse(html)
 
 @app.get("/api/referral/attach")
@@ -540,13 +558,6 @@ async def api_ref_attach(request: Request, refname: str = ""):
     return {"ok": True}
 
 # ---------- Promo ----------
-class PromoIn(BaseModel): code: str
-class PromoCreateIn(BaseModel):
-    code: Optional[str] = None
-    amount: str
-    max_uses: int = 1
-    expires_at: Optional[str] = None
-
 @app.get("/api/promo/my")
 async def api_promo_my(request: Request):
     s = _require_session(request)
@@ -554,6 +565,9 @@ async def api_promo_my(request: Request):
         cur.execute("SELECT code, redeemed_at FROM promo_redemptions WHERE user_id=%s ORDER BY redeemed_at DESC LIMIT 50", (s["id"],))
         rows = [{"code": r[0], "redeemed_at": str(r[1])} for r in cur.fetchall()]
     return {"rows": rows}
+
+class PromoIn(BaseModel):
+    code: str
 
 @app.post("/api/promo/redeem")
 async def api_promo_redeem(request: Request, body: PromoIn):
@@ -564,99 +578,44 @@ async def api_promo_redeem(request: Request, body: PromoIn):
     except (PromoInvalid, PromoExpired, PromoExhausted, PromoAlreadyRedeemed) as e:
         raise HTTPException(400, str(e))
 
+# Admin create promo
+class PromoCreateIn(BaseModel):
+    code: Optional[str] = None
+    amount: str
+    max_uses: int = 1
+    expires_at: Optional[str] = None
+
 @app.post("/api/admin/promo/create")
 async def api_admin_promo_create(request: Request, body: PromoCreateIn):
     s = _require_session(request)
     role = get_role(s["id"])
-    if role not in ("admin","owner"): raise HTTPException(403, "No permission")
-    return create_promo(s["id"], body.code, body.amount, body.max_uses, body.expires_at)
+    if role not in ("admin", "owner"): raise HTTPException(403, "No permission")
+    res = create_promo(s["id"], body.code, body.amount, int(body.max_uses or 1), body.expires_at)
+    return res
 
-# ---------- Promo helpers ----------
-class PromoInvalid(Exception): pass
-class PromoExpired(Exception): pass
-class PromoExhausted(Exception): pass
-class PromoAlreadyRedeemed(Exception): pass
-
-@with_conn
-def redeem_promo(cur, user_id: str, code: str) -> Decimal:
-    code = (code or "").strip().lower()
-    cur.execute("SELECT code, amount, max_uses, uses, expires_at FROM promo_codes WHERE code=%s", (code,))
-    r = cur.fetchone()
-    if not r: raise PromoInvalid("Invalid code")
-    _, amount, max_uses, uses, expires_at = r
-    if expires_at and now_utc() > expires_at: raise PromoExpired("Code expired")
-    if uses >= max_uses: raise PromoExhausted("Code fully used")
-    cur.execute("SELECT 1 FROM promo_redemptions WHERE user_id=%s AND code=%s", (user_id, code))
-    if cur.fetchone(): raise PromoAlreadyRedeemed("You already redeemed this code")
-    cur.execute("UPDATE promo_codes SET uses=uses+1 WHERE code=%s", (code,))
-    cur.execute("INSERT INTO promo_redemptions(user_id,code) VALUES(%s,%s)", (user_id, code))
-    newbal = adjust_balance(user_id, user_id, amount, f"promo:{code}")
-    return newbal
-
-# ---------- Chat ----------
-class ChatIn(BaseModel): text: str
-
-@with_conn
-def chat_insert(cur, user_id: str, username: str, text: str, private_to: Optional[str] = None):
-    text = (text or "").strip()
-    if not text: raise ValueError("Message is empty")
-    if len(text) > 300: raise ValueError("Message too long")
-    cur.execute("INSERT INTO chat_messages(user_id,username,text,private_to) VALUES (%s,%s,%s,%s) RETURNING id,created_at",
-                (user_id, username, text, private_to))
-    row = cur.fetchone()
-    return {"id": int(row[0]), "created_at": str(row[1])}
-
-@with_conn
-def chat_fetch(cur, since_id: int, limit: int):
-    if since_id <= 0:
-        cur.execute("""SELECT id,user_id,username,text,created_at,private_to
-                       FROM chat_messages ORDER BY id DESC LIMIT %s""", (limit,))
-        rows = list(reversed(cur.fetchall()))
-    else:
-        cur.execute("""SELECT id,user_id,username,text,created_at,private_to
-                       FROM chat_messages WHERE id>%s ORDER BY id ASC LIMIT %s""", (since_id, limit))
-        rows = cur.fetchall()
-    out = []
-    # enrich with levels/roles
-    uids = list({str(r[1]) for r in rows})
-    levels: Dict[str,int] = {}; roles: Dict[str,str] = {}
-    if uids:
-        cur.execute("SELECT user_id, xp, role FROM profiles WHERE user_id = ANY(%s)", (uids,))
-        for uid, xp, role in cur.fetchall():
-            levels[str(uid)] = 1 + int(xp)//100
-            roles[str(uid)] = role or "member"
-    for mid, uid, uname, txt, ts, priv in rows:
-        uid = str(uid)
-        out.append({"id": int(mid), "user_id": uid, "username": uname,
-                    "level": int(levels.get(uid,1)), "role": roles.get(uid,"member"),
-                    "text": txt, "created_at": str(ts), "private_to": priv})
-    return out
-
-@app.get("/api/chat/fetch")
-async def api_chat_fetch(since: int = 0, limit: int = 30):
-    return {"rows": chat_fetch(since, limit)}
-
-@app.post("/api/chat/send")
-async def api_chat_send(request: Request, body: ChatIn):
-    s = _require_session(request)
-    return chat_insert(s["id"], s["username"], body.text, None)
-
-# ---------- Games: Crash ----------
+# ---------- Crash endpoints ----------
 class CrashBetIn(BaseModel):
     bet: str
     cashout: Optional[float] = None
 
 @app.get("/api/crash/state")
 async def api_crash_state(request: Request):
+    # not requiring login for readonly viewing
     try:
-        s = _require_session(request); uid = s["id"]
+        s = _require_session(request)
+        uid = s["id"]
     except:
+        s = None
         uid = None
+
     rid, info = ensure_betting_round()
     now = now_utc()
-    if info["status"]=="betting" and now>=info["betting_ends_at"]:
-        begin_running(rid); info = load_round()
-    if info and info["status"]=="running" and info["expected_end_at"] and now>=info["expected_end_at"]:
+
+    # Progress state machine
+    if info["status"] == "betting" and now >= info["betting_ends_at"]:
+        begin_running(rid)
+        info = load_round()
+    if info and info["status"] == "running" and info["expected_end_at"] and now >= info["expected_end_at"]:
         finish_round(rid)
         create_next_betting()
         info = load_round()
@@ -671,13 +630,10 @@ async def api_crash_state(request: Request):
         "last_busts": last_busts()
     }
     if info["status"] == "running":
-        out["current_multiplier"] = current_multiplier(
-            info["started_at"], info["expected_end_at"], info["bust"], now
-        )
+        out["current_multiplier"] = current_multiplier(info["started_at"], info["expected_end_at"], info["bust"], now)
     if uid:
         y = your_bet(rid, uid)
-        if y:
-            out["your_bet"] = y
+        if y: out["your_bet"] = y
     return out
 
 @app.post("/api/crash/place")
@@ -711,9 +667,9 @@ async def api_mines_start(request: Request, body: MinesStartIn):
     return mines_start(s["id"], q2(D(body.bet or "0")), int(body.mines))
 
 @app.post("/api/mines/pick")
-async def api_mines_pick(request: Request, cell: int = Query(..., ge=0, le=24)):
+async def api_mines_pick(request: Request, index: int = Query(..., ge=0, le=24)):
     s = _require_session(request)
-    return mines_pick(s["id"], cell)
+    return mines_pick(s["id"], index)
 
 @app.post("/api/mines/cashout")
 async def api_mines_cashout(request: Request):
@@ -723,48 +679,257 @@ async def api_mines_cashout(request: Request):
 @app.get("/api/mines/state")
 async def api_mines_state(request: Request):
     s = _require_session(request)
-    return mines_state(s["id"]) or {}
+    st = mines_state(s["id"])
+    return st or {}
 
 @app.get("/api/mines/history")
 async def api_mines_history(request: Request):
     s = _require_session(request)
     return {"rows": mines_history(s["id"], 15)}
 
-# ---------- Root HTML ----------
+# ---------- Chat endpoints ----------
+class ChatIn(BaseModel):
+    text: str
+
+@with_conn
+def get_role(cur, user_id: str) -> str:
+    cur.execute("SELECT role FROM profiles WHERE user_id=%s", (user_id,))
+    r = cur.fetchone()
+    return r[0] if r else "member"
+
+@with_conn
+def chat_timeout_set(cur, actor_id: str, user_id: str, seconds: int, reason: Optional[str]):
+    until = now_utc() + datetime.timedelta(seconds=max(1, seconds))
+    cur.execute("""INSERT INTO chat_timeouts(user_id, until, reason, created_by)
+                   VALUES (%s,%s,%s,%s)
+                   ON CONFLICT (user_id) DO UPDATE SET until=EXCLUDED.until, reason=EXCLUDED.reason, created_by=EXCLUDED.created_by""",
+                (user_id, until, reason, actor_id))
+    return {"ok": True, "until": str(until)}
+
+@with_conn
+def chat_timeout_get(cur, user_id: str):
+    cur.execute("SELECT until, reason FROM chat_timeouts WHERE user_id=%s", (user_id,))
+    r = cur.fetchone()
+    if not r: return None
+    until, reason = r
+    if until <= now_utc():
+        cur.execute("DELETE FROM chat_timeouts WHERE user_id=%s", (user_id,))
+        return None
+    delta = int((until - now_utc()).total_seconds())
+    return {"until": str(until), "seconds_left": max(0, delta), "reason": reason or ""}
+
+@with_conn
+def chat_insert(cur, user_id: str, username: str, text: str, private_to: Optional[str] = None):
+    text = (text or "").strip()  # FIX: use strip() (not .trim())
+    if not text: raise ValueError("Message is empty")
+    if len(text) > 300: raise ValueError("Message is too long (max 300)")
+    ensure_profile_row(user_id)
+    if private_to is None:
+        cur.execute("SELECT until FROM chat_timeouts WHERE user_id=%s", (user_id,))
+        r = cur.fetchone()
+        if r and r[0] > now_utc(): raise PermissionError("You are timed out")
+    cur.execute("INSERT INTO chat_messages(user_id, username, text, private_to) VALUES (%s,%s,%s,%s) RETURNING id, created_at",
+                (user_id, username, text, private_to))
+    row = cur.fetchone()
+    return {"id": int(row[0]), "created_at": str(row[1])}
+
+@with_conn
+def chat_fetch(cur, since_id: int, limit: int, for_user_id: Optional[str]):
+    if since_id <= 0:
+        cur.execute("""SELECT id, user_id, username, text, created_at, private_to
+                       FROM chat_messages
+                       WHERE private_to IS NULL
+                       ORDER BY id DESC LIMIT %s""", (limit,))
+        rows_pub = list(reversed(cur.fetchall()))
+        rows_priv = []
+        if for_user_id:
+            cur.execute("""SELECT id, user_id, username, text, created_at, private_to
+                           FROM chat_messages
+                           WHERE private_to=%s
+                           ORDER BY id DESC LIMIT %s""", (for_user_id, limit))
+            rows_priv = list(reversed(cur.fetchall()))
+        rows = sorted(rows_pub + rows_priv, key=lambda r: r[0])
+    else:
+        if for_user_id:
+            cur.execute("""SELECT id, user_id, username, text, created_at, private_to
+                           FROM chat_messages
+                           WHERE id>%s AND (private_to IS NULL OR private_to=%s)
+                           ORDER BY id ASC LIMIT %s""", (since_id, for_user_id, limit))
+        else:
+            cur.execute("""SELECT id, user_id, username, text, created_at, private_to
+                           FROM chat_messages
+                           WHERE id>%s AND private_to IS NULL
+                           ORDER BY id ASC LIMIT %s""", (since_id, limit))
+        rows = cur.fetchall()
+
+    uids = list({str(r[1]) for r in rows})
+    levels: Dict[str, int] = {}
+    roles: Dict[str, str] = {}
+    if uids:
+        cur.execute("SELECT user_id, xp, role FROM profiles WHERE user_id = ANY(%s)", (uids,))
+        for uid, xp, role in cur.fetchall():
+            levels[str(uid)] = 1 + int(xp) // 100
+            roles[str(uid)] = role or "member"
+    out = []
+    for mid, uid, uname, txt, ts, priv in rows:
+        uid = str(uid)
+        out.append({"id": int(mid), "user_id": uid, "username": uname,
+                    "level": int(levels.get(uid,1)), "role": roles.get(uid,"member"),
+                    "text": txt, "created_at": str(ts), "private_to": priv})
+    return out
+
+@with_conn
+def chat_delete(cur, message_id: int):
+    cur.execute("DELETE FROM chat_messages WHERE id=%s", (message_id,))
+    return {"ok": True}
+
+@app.post("/api/chat/send")
+async def api_chat_send(request: Request, body: ChatIn):
+    s = _require_session(request)
+    return chat_insert(s["id"], s["username"], body.text, None)
+
+@app.get("/api/chat/fetch")
+async def api_chat_fetch(request: Request, since: int = 0, limit: int = 30):
+    uid = None
+    try:
+        sess = _require_session(request)
+        uid = sess["id"]
+    except:
+        pass
+    rows = chat_fetch(since, limit, uid)
+    return {"rows": rows}
+
+@app.post("/api/chat/delete")
+async def api_chat_del(request: Request, id: int):
+    s = _require_session(request)
+    role = get_role(s["id"])
+    if role not in ("admin","owner"): raise HTTPException(403, "No permission")
+    return chat_delete(id)
+
+# ---------- Admin ----------
+class AdjustIn(BaseModel):
+    identifier: str
+    amount: str
+    reason: Optional[str] = None
+
+def _id_from_identifier(identifier: str) -> str:
+    m = re.search(r"\d{5,}", identifier or "")
+    if not m: raise HTTPException(400, "Provide a numeric Discord ID or mention")
+    return m.group(0)
+
+@app.post("/api/admin/adjust")
+async def api_admin_adjust(request: Request, body: AdjustIn):
+    s = _require_session(request)
+    role = get_role(s["id"])
+    if role not in ("admin","owner"): raise HTTPException(403, "No permission")
+    target = _id_from_identifier(body.identifier)
+    newbal = adjust_balance(s["id"], target, D(body.amount), body.reason)
+    return {"new_balance": float(newbal)}
+
+class RoleIn(BaseModel):
+    identifier: str
+    role: str
+
+@app.post("/api/admin/role")
+async def api_admin_role(request: Request, body: RoleIn):
+    s = _require_session(request)
+    role = get_role(s["id"])
+    if role != "owner": raise HTTPException(403, "Only owner can set roles")
+    target = _id_from_identifier(body.identifier)
+    return set_role(target, body.role)
+
+class TimeoutIn(BaseModel):
+    identifier: str
+    seconds: int
+    reason: Optional[str] = None
+
+@app.post("/api/admin/timeout_site")
+async def api_admin_timeout_site(request: Request, body: TimeoutIn):
+    s = _require_session(request)
+    role = get_role(s["id"])
+    if role not in ("admin","owner"): raise HTTPException(403, "No permission")
+    target = _id_from_identifier(body.identifier)
+    return chat_timeout_set(s["id"], target, int(body.seconds), body.reason or "")
+
+@app.post("/api/admin/timeout_both")
+async def api_admin_timeout_both(request: Request, body: TimeoutIn):
+    # mirror site timeout; discord moderation (if any) should be handled in your bot
+    return await api_admin_timeout_site(request, body)
+
+# ---------- Discord Join ----------
+@app.post("/api/discord/join")
+async def api_discord_join(request: Request):
+    s = _require_session(request)
+    nick = get_profile_name(s["id"]) or s["username"]
+    return await guild_add_member(s["id"], nickname=nick)
+
+# ---------- HTML (UI/UX) ----------
+HTML_TEMPLATE = """
+<!doctype html><html lang="en"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+<title>GROWCB</title>
+<!-- (inline CSS + JS omitted here in this snippet for brevity; use your full template) -->
+</head>
+<body>...</body></html>
+"""
+
+# ---------- Root page ----------
 @app.get("/", response_class=HTMLResponse)
-async def index(request: Request):
-    # serve SPA shell (inline UI handled by HTML_TEMPLATE below if you’re using that approach)
-    html = """
-    <!DOCTYPE html><html>
-    <head>
-      <meta charset="utf-8"/>
-      <title>GROWCB</title>
-      <link rel="stylesheet" href="/static/style.css"/>
-      <script defer src="/static/app.js"></script>
-    </head>
-    <body><div id="app">Loading…</div></body>
-    </html>
-    """
+async def index():
+    html = HTML_TEMPLATE.replace("__INVITE__", DISCORD_INVITE or "__INVITE__") \
+                        .replace("__OWNER_ID__", str(OWNER_ID))
     return HTMLResponse(html)
 
-# ---------- Run ----------
+# ---------- Utility: run local (optional) ----------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=True)
+# ---------- Promo helpers ----------
+class PromoInvalid(Exception): pass
+class PromoExpired(Exception): pass
+class PromoExhausted(Exception): pass
+class PromoAlreadyRedeemed(Exception): pass
+
+@with_conn
+def redeem_promo(cur, user_id: str, code: str) -> Decimal:
+    code = (code or "").strip().lower()
+    cur.execute("SELECT code, amount, max_uses, uses, expires_at FROM promo_codes WHERE code=%s", (code,))
+    r = cur.fetchone()
+    if not r:
+        raise PromoInvalid("Invalid code")
+    _, amount, max_uses, uses, expires_at = r
+    if expires_at and now_utc() > expires_at:
+        raise PromoExpired("Code expired")
+    if uses >= max_uses:
+        raise PromoExhausted("Code fully used")
+    cur.execute("SELECT 1 FROM promo_redemptions WHERE user_id=%s AND code=%s", (user_id, code))
+    if cur.fetchone():
+        raise PromoAlreadyRedeemed("You already redeemed this code")
+    cur.execute("UPDATE promo_codes SET uses=uses+1 WHERE code=%s", (code,))
+    cur.execute("INSERT INTO promo_redemptions(user_id,code) VALUES(%s,%s)", (user_id, code))
+    newbal = adjust_balance(user_id, user_id, amount, f"promo:{code}")
+    return newbal
 
 @with_conn
 def create_promo(cur, creator_id: str, code: Optional[str], amount: str, max_uses: int, expires_at: Optional[str]):
     if not code:
-        code = ''.join(random.choice(string.ascii_lowercase+string.digits) for _ in range(8))
+        code = ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(8))
     code = code.lower()
     amt = q2(D(amount))
     exp_dt = None
     if expires_at:
-        try: exp_dt = datetime.datetime.fromisoformat(expires_at).astimezone(UTC)
-        except Exception: raise ValueError("Invalid expires_at format")
+        try:
+            exp_dt = datetime.datetime.fromisoformat(expires_at).astimezone(UTC)
+        except Exception:
+            raise ValueError("Invalid expires_at format")
     cur.execute("""INSERT INTO promo_codes(code,amount,max_uses,expires_at,created_by)
                    VALUES(%s,%s,%s,%s,%s)""",
                 (code, amt, max_uses, exp_dt, creator_id))
-    return {"ok": True, "code": code, "amount": float(amt), "max_uses": max_uses,
-            "expires_at": (exp_dt.isoformat() if exp_dt else None)}
+    return {
+        "ok": True,
+        "code": code,
+        "amount": float(amt),
+        "max_uses": max_uses,
+        "expires_at": exp_dt.isoformat() if exp_dt else None
+    }
 

@@ -1,572 +1,411 @@
-import os, sqlite3, json, asyncio
+# app/main.py — unified site + discord bot + games + chat
+
+import os, json, asyncio, re, random, string, datetime, base64
 from urllib.parse import urlencode
-from typing import Optional
+from typing import Optional, Tuple, Dict, List
+from decimal import Decimal, ROUND_DOWN, getcontext
+from contextlib import asynccontextmanager
 
 import httpx
+import psycopg
+from fastapi import FastAPI, Request, HTTPException, Query
+from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse, Response
+from fastapi.staticfiles import StaticFiles
+from itsdangerous import URLSafeSerializer, BadSignature
+from pydantic import BaseModel
+
+# Discord bot
 import discord
 from discord.ext import commands
-from fastapi import FastAPI, Request, HTTPException, Query
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
-from itsdangerous import URLSafeSerializer, BadSignature
-import uvicorn
-from pydantic import BaseModel, Field
+
+# ---------- Import games ----------
+from crash import (
+    ensure_betting_round, place_bet, load_round, begin_running,
+    finish_round, create_next_betting, last_busts, your_bet,
+    your_history, cashout_now, current_multiplier
+)
+from mines import (
+    mines_start, mines_pick, mines_cashout, mines_state, mines_history
+)
 
 # ---------- Config ----------
+getcontext().prec = 28
+
 PREFIX = "."
-BOT_TOKEN = os.getenv("DISCORD_TOKEN")
-CLIENT_ID = os.getenv("DISCORD_CLIENT_ID")
-CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
-OAUTH_REDIRECT = os.getenv("OAUTH_REDIRECT")   # e.g. https://your-app.pella.dev/callback
+CLIENT_ID = os.getenv("DISCORD_CLIENT_ID", "")
+CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET") or os.getenv("CLIENT_SECRET", "")
+OAUTH_REDIRECT = os.getenv("OAUTH_REDIRECT", "")
 SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret")
 PORT = int(os.getenv("PORT", "8080"))
 DISCORD_API = "https://discord.com/api"
-DB_PATH = "balances.db"
-OWNER_ID = 1128658280546320426  # owner
+OWNER_ID = int(os.getenv("OWNER_ID", "1128658280546320426"))
+DATABASE_URL = os.getenv("DATABASE_URL")
+DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
+GUILD_ID = int(os.getenv("GUILD_ID", "0"))
+DISCORD_INVITE = os.getenv("DISCORD_INVITE", "")
 
 GEM = "💎"
+TWO = Decimal("0.01")
+def D(x) -> Decimal:
+    return Decimal(str(x)) if not isinstance(x, Decimal) else x
+def q2(x: Decimal) -> Decimal:
+    return D(x).quantize(TWO, rounding=ROUND_DOWN)
+
+UTC = datetime.timezone.utc
+def now_utc() -> datetime.datetime: return datetime.datetime.now(UTC)
+def iso(dt: Optional[datetime.datetime]) -> Optional[str]:
+    return dt.astimezone(UTC).isoformat() if dt else None
+
+# ---------- FastAPI + static ----------
+def _get_static_dir():
+    base = os.path.dirname(os.path.abspath(__file__))
+    static_dir = os.path.join(base, "static")
+    os.makedirs(static_dir, exist_ok=True)
+    return static_dir
+
+app = FastAPI()
+app.mount("/static", StaticFiles(directory=_get_static_dir()), name="static")
+
+# fallback transparent image
+_TRANSPARENT_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
+)
+@app.get("/img/{filename}")
+async def serve_img(filename: str):
+    base = os.path.dirname(os.path.abspath(__file__))
+    for path in (os.path.join(base, filename), os.path.join(base, "static", filename)):
+        if os.path.isfile(path):
+            return FileResponse(path)
+    return Response(content=_TRANSPARENT_PNG, media_type="image/png")
+
+# ---------- Sessions ----------
+SER = URLSafeSerializer(SECRET_KEY, salt="session-v1")
+def _set_session(resp, data: dict):
+    resp.set_cookie("session", SER.dumps(data), max_age=30*86400, httponly=True, samesite="lax")
+def _clear_session(resp): resp.delete_cookie("session")
+def _require_session(request: Request) -> dict:
+    raw = request.cookies.get("session")
+    if not raw: raise HTTPException(401, "Not logged in")
+    try: sess = SER.loads(raw); return sess
+    except BadSignature: raise HTTPException(401, "Invalid session")
 
 # ---------- DB ----------
-def init_db():
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    # balances
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS balances (
-            user_id TEXT PRIMARY KEY,
-            balance INTEGER NOT NULL DEFAULT 0
-        )
-    """)
-    # admin change log
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS balance_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            actor_id TEXT NOT NULL,
-            target_id TEXT NOT NULL,
-            amount INTEGER NOT NULL,
-            reason TEXT,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    con.commit(); con.close()
+def with_conn(fn):
+    def wrapper(*a, **kw):
+        if not DATABASE_URL: raise RuntimeError("DATABASE_URL not set")
+        with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
+            res = fn(cur, *a, **kw)
+            con.commit()
+            return res
+    return wrapper
 
-def get_balance(user_id: str) -> int:
-    con = sqlite3.connect(DB_PATH); cur = con.cursor()
-    cur.execute("SELECT balance FROM balances WHERE user_id = ?", (user_id,))
-    row = cur.fetchone(); con.close()
-    return int(row[0]) if row else 0
+@with_conn
+def init_db(cur):
+    cur.execute("""CREATE TABLE IF NOT EXISTS balances (
+        user_id TEXT PRIMARY KEY,
+        balance NUMERIC(18,2) NOT NULL DEFAULT 0
+    )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS balance_log (
+        id BIGSERIAL PRIMARY KEY,
+        actor_id TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        amount NUMERIC(18,2) NOT NULL,
+        reason TEXT,
+        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+    )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS profiles (
+        user_id TEXT PRIMARY KEY,
+        display_name TEXT NOT NULL,
+        name_lower TEXT NOT NULL UNIQUE,
+        xp INTEGER NOT NULL DEFAULT 0,
+        role TEXT NOT NULL DEFAULT 'member',
+        is_anon BOOLEAN NOT NULL DEFAULT FALSE,
+        referred_by TEXT,
+        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+    )""")
 
-def add_balance(user_id: str, amount: int) -> int:
-    con = sqlite3.connect(DB_PATH); cur = con.cursor()
-    cur.execute("INSERT INTO balances (user_id, balance) VALUES (?, 0) "
-                "ON CONFLICT(user_id) DO NOTHING", (user_id,))
-    cur.execute("UPDATE balances SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
-    con.commit()
-    cur.execute("SELECT balance FROM balances WHERE user_id = ?", (user_id,))
-    new_bal = int(cur.fetchone()[0]); con.close()
-    return new_bal
+@with_conn
+def get_balance(cur, uid: str) -> Decimal:
+    cur.execute("SELECT balance FROM balances WHERE user_id=%s", (uid,))
+    r = cur.fetchone(); return q2(r[0]) if r else Decimal("0.00")
 
-def adjust_balance(actor_id: str, target_id: str, amount: int, reason: Optional[str]) -> int:
-    con = sqlite3.connect(DB_PATH); cur = con.cursor()
-    cur.execute("INSERT INTO balances (user_id, balance) VALUES (?, 0) "
-                "ON CONFLICT(user_id) DO NOTHING", (target_id,))
-    cur.execute("UPDATE balances SET balance = balance + ? WHERE user_id = ?", (amount, target_id))
-    cur.execute("INSERT INTO balance_log(actor_id, target_id, amount, reason) VALUES (?, ?, ?, ?)",
-                (actor_id, target_id, amount, reason))
-    con.commit()
-    cur.execute("SELECT balance FROM balances WHERE user_id = ?", (target_id,))
-    new_bal = int(cur.fetchone()[0]); con.close()
-    return new_bal
+@with_conn
+def adjust_balance(cur, actor: str, target: str, amt, reason=None) -> Decimal:
+    amt = q2(D(amt))
+    cur.execute("INSERT INTO balances(user_id,balance) VALUES(%s,0) ON CONFLICT(user_id) DO NOTHING", (target,))
+    cur.execute("UPDATE balances SET balance=balance+%s WHERE user_id=%s", (amt, target))
+    cur.execute("INSERT INTO balance_log(actor_id,target_id,amount,reason) VALUES(%s,%s,%s,%s)",
+                (actor,target,amt,reason))
+    cur.execute("SELECT balance FROM balances WHERE user_id=%s",(target,))
+    return q2(cur.fetchone()[0])
 
-def get_top_balances(limit: int = 20):
-    con = sqlite3.connect(DB_PATH); cur = con.cursor()
-    cur.execute("SELECT user_id, balance FROM balances ORDER BY balance DESC LIMIT ?", (limit,))
-    rows = [{"user_id": r[0], "balance": int(r[1])} for r in cur.fetchall()]
-    con.close()
-    return rows
+@with_conn
+def tip_transfer(cur, from_id: str, to_id: str, amount: Decimal):
+    amount = q2(D(amount))
+    if amount <= 0: raise ValueError("Amount must be > 0")
+    if from_id == to_id: raise ValueError("Cannot tip yourself")
+    cur.execute("INSERT INTO balances(user_id,balance) VALUES(%s,0) ON CONFLICT(user_id) DO NOTHING",(from_id,))
+    cur.execute("INSERT INTO balances(user_id,balance) VALUES(%s,0) ON CONFLICT(user_id) DO NOTHING",(to_id,))
+    cur.execute("SELECT balance FROM balances WHERE user_id=%s FOR UPDATE",(from_id,))
+    sbal = D(cur.fetchone()[0])
+    if sbal < amount: raise ValueError("Insufficient balance")
+    cur.execute("UPDATE balances SET balance=balance-%s WHERE user_id=%s",(amount,from_id))
+    cur.execute("UPDATE balances SET balance=balance+%s WHERE user_id=%s",(amount,to_id))
+    cur.execute("INSERT INTO balance_log(actor_id,target_id,amount,reason) VALUES(%s,%s,%s,%s)",
+                (from_id,to_id,-amount,"tip"))
+    cur.execute("INSERT INTO balance_log(actor_id,target_id,amount,reason) VALUES(%s,%s,%s,%s)",
+                (from_id,to_id,amount,"tip"))
+    return True
 
-def get_recent_logs(limit: int = 20):
-    con = sqlite3.connect(DB_PATH); cur = con.cursor()
-    cur.execute("""
-        SELECT actor_id, target_id, amount, reason, created_at
-        FROM balance_log
-        ORDER BY id DESC
-        LIMIT ?
-    """, (limit,))
-    rows = [{"actor_id":r[0], "target_id":r[1], "amount":int(r[2]), "reason":r[3], "created_at":r[4]} for r in cur.fetchall()]
-    con.close()
-    return rows
-
-# ---------- Helpers ----------
-def parse_user_identifier(identifier: str) -> Optional[str]:
-    """Accepts raw ID or mention <@...>/<@!...>; returns raw numeric ID or None."""
-    if not identifier: return None
-    cleaned = identifier.strip().replace("<@!", "").replace("<@", "").replace(">", "")
-    if cleaned.isdigit() and len(cleaned) >= 17:
-        return cleaned
-    return None
-
-def fmt_dl(n: int) -> str:
-    return f"{GEM} {n:,} DL"
-
-def discord_avatar_url(user_id: str, avatar_hash: Optional[str]) -> str:
-    """Build a safe avatar URL for header pfp."""
-    if avatar_hash:
-        return f"https://cdn.discordapp.com/avatars/{user_id}/{avatar_hash}.png?size=128"
-    # default avatar (calculates index by user_id mod 5)
-    try:
-        idx = int(user_id) % 5
-    except:
-        idx = 0
-    return f"https://cdn.discordapp.com/embed/avatars/{idx}.png"
-
-def embed(title: str, desc: Optional[str] = None, color: int = 0x00C2FF) -> discord.Embed:
-    e = discord.Embed(title=title, description=desc or "", color=color)
-    return e
-
-# ---------- Discord bot ----------
+# ---------- Discord Bot ----------
 intents = discord.Intents.default()
-intents.message_content = True  # prefix commands
-bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)  # disable default help
+intents.message_content = True
+bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user} (id={bot.user.id})")
+    print(f"Bot ready as {bot.user} (id={bot.user.id})")
 
-@bot.command(name="bal")
-async def bal(ctx: commands.Context, user: discord.User | None = None):
+@bot.command()
+async def bal(ctx, user: discord.User=None):
     target = user or ctx.author
-    bal_value = get_balance(str(target.id))
-    e = embed(
-        title="Balance",
-        desc=f"{target.mention}\n**{fmt_dl(bal_value)}**",
-        color=0x34D399
-    )
-    e.set_footer(text="Currency: Growtopia Diamond Locks (DL)")
-    await ctx.reply(embed=e, mention_author=False)
+    balval = get_balance(str(target.id))
+    await ctx.send(f"{target.mention} balance: {balval} {GEM}")
 
-@bot.command(name="addbal")
-async def addbal(ctx: commands.Context, user: discord.User | None = None, amount: int | None = None):
-    if ctx.author.id != OWNER_ID:
-        e = embed("Not allowed", "Only the owner can adjust balances.", color=0xEF4444)
-        return await ctx.reply(embed=e, mention_author=False)
-
-    if user is None or amount is None:
-        e = embed("Usage", f"`{PREFIX}addbal @User <amount>`", color=0xF59E0B)
-        return await ctx.reply(embed=e, mention_author=False)
-
-    if amount == 0:
-        e = embed("Invalid amount", "Amount cannot be zero.", color=0xEF4444)
-        return await ctx.reply(embed=e, mention_author=False)
-
-    new_balance = adjust_balance(str(ctx.author.id), str(user.id), amount, reason="bot addbal")
-    sign = "+" if amount > 0 else ""
-    e = embed(
-        title="Balance Updated",
-        desc=(f"**Target:** {user.mention}\n"
-              f"**Change:** `{sign}{amount}` → {fmt_dl(new_balance)}"),
-        color=0x60A5FA
-    )
-    e.set_footer(text="Currency: Growtopia Diamond Locks (DL)")
-    await ctx.reply(embed=e, mention_author=False)
-
-@bot.command(name="help")
-async def help_command(ctx: commands.Context):
-    """Show a pretty embed with all commands."""
-    is_owner = (ctx.author.id == OWNER_ID)
-    e = embed(
-        title="💎 DL Bank — Help",
-        desc="Manage and view DL balances. Prefix: `{}`".format(PREFIX),
-        color=0x60A5FA
-    )
-    e.add_field(
-        name="General",
-        value=(f"**{PREFIX}help** — Show this help\n"
-               f"**{PREFIX}bal** — Show **your** balance\n"
-               f"**{PREFIX}bal @User** — Show **someone else’s** balance"),
-        inline=False
-    )
-    owner_line = f"**{PREFIX}addbal @User <amount>** — Add/subtract DL *(owner only)*"
-    if is_owner:
-        owner_line += " ✅"
-    e.add_field(name="Admin", value=owner_line, inline=False)
-    e.add_field(
-        name="Website",
-        value="Use **Login with Discord** to see your balance and (owner) adjust others.",
-        inline=False
-    )
-    e.set_footer(text="Currency: Growtopia Diamond Locks (DL)")
-    await ctx.reply(embed=e, mention_author=False)
-
-# ---------- Web (FastAPI + OAuth) ----------
-app = FastAPI()
-signer = URLSafeSerializer(SECRET_KEY, salt="session")
-
-def set_session(resp: RedirectResponse, payload: dict):
-    resp.set_cookie(
-        "session",
-        signer.dumps(payload),
-        httponly=True,
-        samesite="lax",
-        max_age=7*24*3600,
-    )
-
-def read_session(request: Request) -> dict | None:
-    raw = request.cookies.get("session")
-    if not raw: return None
+@bot.command()
+async def tip(ctx, user: discord.User, amount: float):
     try:
-        return signer.loads(raw)
-    except BadSignature:
-        return None
+        tip_transfer(str(ctx.author.id), str(user.id), D(amount))
+        await ctx.send(f"Tipped {amount} {GEM} to {user.mention}")
+    except Exception as e:
+        await ctx.send(f"❌ {e}")
 
-INDEX_HTML = """
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>💎 DL Bank</title>
-  <style>
-    :root{
-      --bg:#0b1220; --card:#121a2b; --muted:#8aa0c7; --text:#e8efff;
-      --accent:#60a5fa; --ok:#34d399; --warn:#f59e0b; --err:#ef4444; --border:#23304c;
-    }
-    *{box-sizing:border-box}
-    body{background:linear-gradient(180deg,#0a1020,#0e1530); color:var(--text); font-family:system-ui,Segoe UI,Roboto,Arial;
-         margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center; padding:24px}
-    .wrap{width:100%; max-width:920px}
-    .hero{padding:18px 20px; background:linear-gradient(135deg,#0e1630 0%,#0a1124 100%); border:1px solid var(--border);
-          border-radius:18px; box-shadow:0 20px 60px rgba(0,0,0,.35)}
-    .row{display:flex; gap:16px; align-items:center; justify-content:space-between; flex-wrap:wrap}
-    .chip{background:#0c1631; border:1px solid var(--border); color:var(--muted); padding:6px 10px; border-radius:999px; font-size:12px}
-    .title{font-size:22px; font-weight:700; letter-spacing:.2px}
-    .btn{display:inline-flex; align-items:center; gap:8px; padding:10px 14px; border-radius:10px; text-decoration:none;
-         border:1px solid var(--border); color:var(--text); background:#0f1a33; cursor:pointer}
-    .btn.primary{background:linear-gradient(135deg,#3b82f6,#22c1dc); border-color:transparent}
-    .grid{display:grid; gap:16px; grid-template-columns:1fr}
-    @media(min-width:900px){.grid{grid-template-columns:1fr 1fr}}
-    .card{background:var(--card); border:1px solid var(--border); border-radius:16px; padding:16px}
-    .label{color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.1em}
-    .big{font-size:28px; font-weight:800}
-    table{width:100%; border-collapse:collapse; margin-top:10px}
-    th,td{border-bottom:1px solid var(--border); padding:8px 6px; text-align:left}
-    .muted{color:var(--muted)}
-    input,select{width:100%; background:#0e1833; color:var(--text); border:1px solid var(--border); border-radius:10px; padding:10px}
-    .actions{display:flex; gap:10px; flex-wrap:wrap; align-items:center}
-    .pill{display:inline-flex; align-items:center; gap:8px; padding:6px 10px; border-radius:999px; background:#0f1a33; border:1px solid var(--border)}
-    .pfp{width:28px; height:28px; border-radius:50%; object-fit:cover; display:inline-block; border:1px solid #0008}
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="hero">
-      <div class="row">
-        <div class="title">💎 DL Bank</div>
-        <div id="auth" class="actions"></div>
-      </div>
-    </div>
-
-    <div class="grid" style="margin-top:16px">
-      <div class="card">
-        <div class="label">My Balance</div>
-        <div id="bal" class="big">—</div>
-        <div class="muted" style="margin-top:6px">Currency: Growtopia Diamond Locks (DL)</div>
-      </div>
-
-      <div id="ownerBox" class="card" style="display:none">
-        <div class="label">Owner Panel</div>
-        <div class="pill" style="margin:8px 0">Adjust balances, view top holders &amp; logs.</div>
-        <div class="row" style="gap:8px; align-items:flex-end">
-          <div style="flex:2">
-            <div class="label">Discord ID or &lt;@mention&gt;</div>
-            <input id="target" placeholder="e.g. 1128658280546320426 or &lt;@1128...&gt;" />
-          </div>
-          <div style="flex:1">
-            <div class="label">Amount (+/-)</div>
-            <input id="amount" type="number" placeholder="e.g. 10 or -5" />
-          </div>
-          <div style="flex:2">
-            <div class="label">Reason (optional)</div>
-            <input id="reason" placeholder="Promo / correction / prize ..." />
-          </div>
-          <div>
-            <button id="doAdjust" class="btn primary">Apply</button>
-          </div>
-        </div>
-        <div id="msg" class="muted" style="margin-top:8px"></div>
-      </div>
-    </div>
-
-    <div id="ownerTables" class="grid" style="margin-top:16px; display:none">
-      <div class="card">
-        <div class="label">Top Balances</div>
-        <div id="top"></div>
-      </div>
-      <div class="card">
-        <div class="label">Recent Changes</div>
-        <div id="logs"></div>
-      </div>
-    </div>
-  </div>
-
-  <script>
-    async function j(u, opt={}) {
-      const r = await fetch(u, Object.assign({credentials:'include'}, opt));
-      const text = await r.text();
-      if(!r.ok){
-        let msg = text;
-        try { const p = JSON.parse(text); msg = p.detail || p.message || text; } catch {}
-        throw new Error(msg);
-      }
-      try { return JSON.parse(text); } catch { return {}; }
-    }
-
-    function fmtDL(n){ return `💎 ${Number(n).toLocaleString()} DL`; }
-
-    async function render(){
-      const auth = document.getElementById('auth');
-      const balEl = document.getElementById('bal');
-      const ownerBox = document.getElementById('ownerBox');
-      const ownerTables = document.getElementById('ownerTables');
-      try{
-        const me = await j('/api/me');
-        const bal = await j('/api/balance');
-
-        // sticky auth area with pfp + name + quick balance + logout
-        auth.innerHTML = `
-          <span class="pill"><img class="pfp" src="${me.avatar_url}" alt="pfp"/> <b>${me.username}</b> <span style="opacity:.7">(${me.id})</span></span>
-          <span class="pill">${fmtDL(bal.balance)}</span>
-          <a class="btn" href="/logout">Logout</a>
-        `;
-        balEl.textContent = fmtDL(bal.balance);
-
-        if (me.id === 'OWNER_PLACEHOLDER') {
-          ownerBox.style.display = '';
-          ownerTables.style.display = 'grid';
-
-          const top = await j('/api/admin/top');
-          const logs = await j('/api/admin/logs');
-
-          document.getElementById('top').innerHTML = `
-            <table>
-              <thead><tr><th>User</th><th>Balance</th></tr></thead>
-              <tbody>${top.rows.map(r=>`<tr><td>&lt;@${r.user_id}&gt;</td><td>${fmtDL(r.balance)}</td></tr>`).join('')}</tbody>
-            </table>
-          `;
-          document.getElementById('logs').innerHTML = `
-            <table>
-              <thead><tr><th>When</th><th>Actor</th><th>Target</th><th>Change</th><th>Reason</th></tr></thead>
-              <tbody>${logs.rows.map(r=>`<tr>
-                <td>${r.created_at}</td>
-                <td>&lt;@${r.actor_id}&gt;</td>
-                <td>&lt;@${r.target_id}&gt;</td>
-                <td>${r.amount>0?'+':''}${r.amount}</td>
-                <td>${r.reason ?? ''}</td>
-              </tr>`).join('')}</tbody>
-            </table>
-          `;
-
-          // Button: better error surface
-          document.getElementById('doAdjust').onclick = async ()=>{
-            const target = document.getElementById('target').value.trim();
-            const amount = parseInt(document.getElementById('amount').value, 10);
-            const reason = document.getElementById('reason').value.trim();
-            const msg = document.getElementById('msg');
-            msg.textContent = '';
-            try{
-              if(!target || Number.isNaN(amount)) throw new Error('Fill target and amount.');
-              const res = await j('/api/admin/adjust', {
-                method:'POST',
-                headers:{'Content-Type':'application/json'},
-                body: JSON.stringify({identifier: target, amount, reason})
-              });
-              msg.textContent = 'OK. New balance: ' + fmtDL(res.new_balance);
-              // refresh summary + tables
-              const bal = await j('/api/balance');
-              balEl.textContent = fmtDL(bal.balance);
-              const top = await j('/api/admin/top');
-              const logs = await j('/api/admin/logs');
-              document.getElementById('top').innerHTML = `
-                <table><thead><tr><th>User</th><th>Balance</th></tr></thead>
-                <tbody>${top.rows.map(r=>`<tr><td>&lt;@${r.user_id}&gt;</td><td>${fmtDL(r.balance)}</td></tr>`).join('')}</tbody></table>`;
-              document.getElementById('logs').innerHTML = `
-                <table><thead><tr><th>When</th><th>Actor</th><th>Target</th><th>Change</th><th>Reason</th></tr></thead>
-                <tbody>${logs.rows.map(r=>`<tr><td>${r.created_at}</td><td>&lt;@${r.actor_id}&gt;</td><td>&lt;@${r.target_id}&gt;</td><td>${r.amount>0?'+':''}${r.amount}</td><td>${r.reason ?? ''}</td></tr>`).join('')}</tbody></table>`;
-            }catch(e){
-              msg.textContent = 'Error: ' + (e && e.message ? e.message : String(e));
-            }
-          };
-        } else {
-          ownerBox.style.display = 'none';
-          ownerTables.style.display = 'none';
-        }
-      }catch(e){
-        auth.innerHTML = `<a class="btn primary" href="/login">Login with Discord</a>`;
-        balEl.textContent = '—';
-        ownerBox.style.display = 'none';
-        ownerTables.style.display = 'none';
-      }
-    }
-    render();
-  </script>
-</body>
-</html>
-""".replace("OWNER_PLACEHOLDER", str(OWNER_ID))
-@app.get("/", response_class=HTMLResponse)
-async def index():
-    return HTMLResponse(INDEX_HTML)
-
+@bot.command()
+async def help(ctx):
+    await ctx.send(f"Commands: `{PREFIX}bal [@user]`, `{PREFIX}tip @user amount`")
 # ---------- OAuth ----------
 @app.get("/login")
 async def login():
     if not (CLIENT_ID and OAUTH_REDIRECT):
-        raise HTTPException(status_code=500, detail="OAuth not configured.")
+        return HTMLResponse("OAuth not configured")
     params = {
         "client_id": CLIENT_ID,
         "redirect_uri": OAUTH_REDIRECT,
         "response_type": "code",
         "scope": "identify",
-        "prompt": "none",
+        "prompt": "consent"
     }
     return RedirectResponse(f"{DISCORD_API}/oauth2/authorize?{urlencode(params)}")
 
 @app.get("/callback")
-async def callback(request: Request, code: str = Query(...)):
+async def callback(code: str):
     if not (CLIENT_ID and CLIENT_SECRET and OAUTH_REDIRECT):
-        raise HTTPException(status_code=500, detail="OAuth not configured.")
+        return HTMLResponse("OAuth not configured")
 
-    async with httpx.AsyncClient(timeout=15) as client:
-        token_res = await client.post(
-            f"{DISCORD_API}/oauth2/token",
-            data={
-                "client_id": CLIENT_ID,
-                "client_secret": CLIENT_SECRET,
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": OAUTH_REDIRECT,
-            },
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
-        if token_res.status_code != 200:
-            raise HTTPException(status_code=400, detail="Failed to exchange code.")
+    async with httpx.AsyncClient(timeout=15) as cx:
+        data = {
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": OAUTH_REDIRECT
+        }
+        r = await cx.post(f"{DISCORD_API}/oauth2/token", data=data,
+                          headers={"Content-Type": "application/x-www-form-urlencoded"})
+        if r.status_code != 200:
+            return HTMLResponse(f"OAuth failed: {r.text}", status_code=400)
+        tok = r.json()
+        access = tok.get("access_token")
+        u = await cx.get(f"{DISCORD_API}/users/@me", headers={"Authorization": f"Bearer {access}"})
+        if u.status_code != 200:
+            return HTMLResponse(f"User fetch failed: {u.text}", status_code=400)
+        me = u.json()
 
-        access_token = token_res.json().get("access_token")
-        if not access_token:
-            raise HTTPException(status_code=400, detail="No access token returned.")
+    user_id = str(me["id"])
+    username = me.get("username", "user")
+    avatar_hash = me.get("avatar")
+    avatar_url = f"https://cdn.discordapp.com/avatars/{user_id}/{avatar_hash}.png?size=64" if avatar_hash \
+                 else "https://cdn.discordapp.com/embed/avatars/0.png"
 
-        me_res = await client.get(
-            f"{DISCORD_API}/users/@me",
-            headers={"Authorization": f"Bearer {access_token}"},
-        )
-        if me_res.status_code != 200:
-            raise HTTPException(status_code=400, detail="Failed to fetch user.")
-
-        me = me_res.json()
-        user_id = str(me["id"])
-        username = f'{me.get("username","user")}#{me.get("discriminator","0")}' if me.get("discriminator") not in (None, "0") else me.get("global_name") or me.get("username","user")
-        avatar_hash = me.get("avatar")
-        avatar_url = discord_avatar_url(user_id, avatar_hash)
-
-    # Ensure row exists so balance shows immediately
-    _ = add_balance(user_id, 0)
-
-    resp = RedirectResponse(url="/")
-    set_session(resp, {"id": user_id, "username": username, "avatar": avatar_hash})
+    ensure_profile_row(user_id)
+    resp = RedirectResponse("/")
+    _set_session(resp, {"id": user_id, "username": username, "avatar_url": avatar_url})
     return resp
 
 @app.get("/logout")
 async def logout():
-    resp = RedirectResponse(url="/")
-    resp.delete_cookie("session")
+    resp = RedirectResponse("/")
+    _clear_session(resp)
     return resp
 
-# ---------- API ----------
-class AdjustBody(BaseModel):
-    identifier: str = Field(..., description="Discord ID or <@mention>")
-    amount: int
-    reason: Optional[str] = None
+# ---------- Profiles ----------
+NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{3,20}$")
 
+@with_conn
+def ensure_profile_row(cur, user_id: str):
+    cur.execute("""INSERT INTO profiles(user_id,display_name,name_lower,role)
+                   VALUES(%s,%s,%s,%s)
+                   ON CONFLICT(user_id) DO NOTHING""",
+                (user_id, f"user_{user_id[-4:]}", f"user_{user_id[-4:]}",
+                 "owner" if user_id == str(OWNER_ID) else "member"))
+
+@with_conn
+def profile_info(cur, user_id: str):
+    ensure_profile_row(user_id)
+    cur.execute("SELECT xp, role, is_anon FROM profiles WHERE user_id=%s", (user_id,))
+    xp, role, is_anon = cur.fetchone()
+    bal = get_balance(user_id)
+    return {"id": user_id, "xp": xp, "role": role, "is_anon": is_anon, "balance": float(bal)}
+
+# ---------- API ----------
 @app.get("/api/me")
 async def api_me(request: Request):
-    sess = read_session(request)
-    if not sess:
-        raise HTTPException(status_code=401, detail="Not logged in.")
-    uid = sess["id"]
-    username = sess.get("username", "user")
-    avatar_url = discord_avatar_url(uid, sess.get("avatar"))
-    return {"id": uid, "username": username, "avatar_url": avatar_url}
+    s = _require_session(request)
+    return {"id": s["id"], "username": s["username"], "avatar_url": s.get("avatar_url")}
 
 @app.get("/api/balance")
 async def api_balance(request: Request):
-    sess = read_session(request)
-    if not sess:
-        raise HTTPException(status_code=401, detail="Not logged in.")
-    bal = get_balance(sess["id"])
-    return {"balance": bal}
+    s = _require_session(request)
+    return {"balance": float(get_balance(s["id"]))}
+
+@app.get("/api/profile")
+async def api_profile(request: Request):
+    s = _require_session(request)
+    return profile_info(s["id"])
+
+class AdjustIn(BaseModel):
+    identifier: str
+    amount: str
+    reason: Optional[str] = None
 
 @app.post("/api/admin/adjust")
-async def api_admin_adjust(request: Request, body: AdjustBody):
-    sess = read_session(request)
-    if not sess:
-        raise HTTPException(status_code=401, detail="Not logged in.")
-    actor = sess["id"]
-    if actor != str(OWNER_ID):
-        raise HTTPException(status_code=403, detail="Owner only.")
+async def api_admin_adjust(request: Request, body: AdjustIn):
+    s = _require_session(request)
+    if s["id"] != str(OWNER_ID):
+        raise HTTPException(403, "Owner only")
+    m = re.search(r"\d{5,}", body.identifier or "")
+    if not m: raise HTTPException(400, "Invalid ID")
+    newbal = adjust_balance(s["id"], m.group(0), D(body.amount), body.reason)
+    return {"new_balance": float(newbal)}
 
-    target_id = parse_user_identifier(body.identifier)
-    if not target_id:
-        raise HTTPException(status_code=400, detail="Invalid target identifier.")
-    if body.amount == 0:
-        raise HTTPException(status_code=400, detail="Amount cannot be zero.")
+# ---------- Crash ----------
+class CrashBetIn(BaseModel):
+    bet: str
+    cashout: Optional[float] = None
 
-    new_bal = adjust_balance(actor, target_id, body.amount, body.reason)
-    return {"target_id": target_id, "new_balance": new_bal}
+@app.get("/api/crash/state")
+async def api_crash_state():
+    rid, info = ensure_betting_round()
+    now = now_utc()
+    if info["status"] == "betting" and now >= info["betting_ends_at"]:
+        begin_running(rid); info = load_round()
+    if info["status"] == "running" and info["expected_end_at"] and now >= info["expected_end_at"]:
+        finish_round(rid); create_next_betting(); info = load_round()
+    out = {"phase": info["status"], "bust": info["bust"], "last_busts": last_busts()}
+    if info["status"] == "running":
+        out["current_multiplier"] = current_multiplier(info["started_at"], info["expected_end_at"], info["bust"], now)
+    return out
 
-@app.get("/api/admin/top")
-async def api_admin_top(request: Request):
-    sess = read_session(request)
-    if not sess or sess["id"] != str(OWNER_ID):
-        raise HTTPException(status_code=403, detail="Owner only.")
-    return {"rows": get_top_balances(20)}
+@app.post("/api/crash/place")
+async def api_crash_place(request: Request, body: CrashBetIn):
+    s = _require_session(request)
+    bet = q2(D(body.bet))
+    return place_bet(s["id"], bet, float(body.cashout or 2.0))
 
-@app.get("/api/admin/logs")
-async def api_admin_logs(request: Request):
-    sess = read_session(request)
-    if not sess or sess["id"] != str(OWNER_ID):
-        raise HTTPException(status_code=403, detail="Owner only.")
-    return {"rows": get_recent_logs(20)}
+@app.post("/api/crash/cashout")
+async def api_crash_cashout(request: Request):
+    s = _require_session(request)
+    return cashout_now(s["id"])
 
-# ---------- Lifespan / Runner ----------
-async def start_bot():
-    await bot.start(BOT_TOKEN)
+# ---------- Mines ----------
+class MinesStartIn(BaseModel):
+    bet: str
+    mines: int
 
-def check_env():
-    missing = []
-    if not BOT_TOKEN: missing.append("DISCORD_TOKEN")
-    if not CLIENT_ID: missing.append("DISCORD_CLIENT_ID")
-    if not CLIENT_SECRET: missing.append("DISCORD_CLIENT_SECRET")
-    if not OAUTH_REDIRECT: missing.append("OAUTH_REDIRECT")
-    if missing:
-        print("WARNING: Missing env:", ", ".join(missing))
+@app.post("/api/mines/start")
+async def api_mines_start(request: Request, body: MinesStartIn):
+    s = _require_session(request)
+    return mines_start(s["id"], q2(D(body.bet)), body.mines)
 
+@app.post("/api/mines/pick")
+async def api_mines_pick(request: Request, index: int = Query(...)):
+    s = _require_session(request)
+    return mines_pick(s["id"], index)
+
+@app.post("/api/mines/cashout")
+async def api_mines_cashout(request: Request):
+    s = _require_session(request)
+    return mines_cashout(s["id"])
+
+@app.get("/api/mines/state")
+async def api_mines_state(request: Request):
+    s = _require_session(request)
+    return mines_state(s["id"]) or {}
+
+# ---------- Chat ----------
+class ChatIn(BaseModel):
+    text: str
+
+@with_conn
+def chat_insert(cur, uid: str, username: str, text: str):
+    cur.execute("INSERT INTO chat_messages(user_id,username,text) VALUES(%s,%s,%s) RETURNING id, created_at",
+                (uid, username, text))
+    r = cur.fetchone()
+    return {"id": r[0], "created_at": str(r[1])}
+
+@with_conn
+def chat_fetch(cur, since: int, limit: int):
+    cur.execute("SELECT id,user_id,username,text,created_at FROM chat_messages WHERE id>%s ORDER BY id ASC LIMIT %s",
+                (since, limit))
+    return [{"id":r[0],"user_id":r[1],"username":r[2],"text":r[3],"created_at":str(r[4])} for r in cur.fetchall()]
+
+@app.post("/api/chat/send")
+async def api_chat_send(request: Request, body: ChatIn):
+    s = _require_session(request)
+    return chat_insert(s["id"], s["username"], body.text.strip())
+
+@app.get("/api/chat/fetch")
+async def api_chat_fetch(since: int = 0, limit: int = 30):
+    return {"rows": chat_fetch(since, limit)}
+
+# ---------- Simple UI ----------
+HTML_TEMPLATE = """
+<!doctype html>
+<html><head><title>GrowCB</title></head>
+<body style="background:#0a0f1e;color:#fff;font-family:sans-serif">
+<h1>💎 GrowCB</h1>
+<p>Login with Discord to play Crash & Mines, check balances, and chat.</p>
+<p><a href="/login">Login with Discord</a></p>
+<div id="me"></div>
+<script>
+async function j(u){let r=await fetch(u,{credentials:'include'});return r.ok?r.json():{}}
+(async()=>{
+ try{
+  const me=await j('/api/me');
+  document.getElementById('me').textContent='Logged in as '+me.username;
+ }catch{}
+})();
+</script>
+</body></html>
+"""
+
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return HTMLResponse(HTML_TEMPLATE)
+
+# ---------- Lifespan ----------
 @app.on_event("startup")
-async def on_startup():
+async def startup_event():
     init_db()
-    check_env()
-    # fire-and-forget bot task
-    if BOT_TOKEN:
-        asyncio.create_task(start_bot())
-    else:
-        print("Discord bot not started (no DISCORD_TOKEN).")
+    if DISCORD_BOT_TOKEN:
+        asyncio.create_task(bot.start(DISCORD_BOT_TOKEN))
 
 @app.on_event("shutdown")
-async def on_shutdown():
-    if bot.is_closed():
-        return
-    try:
+async def shutdown_event():
+    if not bot.is_closed():
         await bot.close()
-    except Exception:
-        pass
 
+# ---------- Runner ----------
 if __name__ == "__main__":
-    init_db()
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=True)

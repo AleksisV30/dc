@@ -15,7 +15,6 @@ from itsdangerous import URLSafeSerializer, BadSignature
 from pydantic import BaseModel
 
 # ---------- Import games from separate files ----------
-# (ensure crash.py and mines.py are in the same folder)
 from crash import (
     ensure_betting_round, place_bet, load_round, begin_running,
     finish_round, create_next_betting, last_busts, your_bet,
@@ -39,7 +38,7 @@ OWNER_ID = int(os.getenv("OWNER_ID", "1128658280546320426"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
-DISCORD_INVITE = os.getenv("DISCORD_INVITE", "")  # optional vanity invite
+DISCORD_INVITE = os.getenv("DISCORD_INVITE", "")
 
 GEM = "💎"
 MIN_BET = Decimal("1.00")
@@ -61,7 +60,6 @@ def iso(dt: Optional[datetime.datetime]) -> Optional[str]:
 
 # ---------- App / Lifespan / Static ----------
 def _get_static_dir():
-    # We'll still mount /static as a fallback, but images can live right next to main.py.
     base = os.path.dirname(os.path.abspath(__file__))
     static_dir = os.path.join(base, "static")
     try:
@@ -77,11 +75,9 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(lifespan=lifespan)
-# Optional fallback for anyone who still wants /static
 app.mount("/static", StaticFiles(directory=_get_static_dir()), name="static")
 
-# Serve images from the SAME directory as main.py (or fallback to /static).
-# If not found, we return a tiny transparent PNG so the UI never breaks.
+# Serve images placed next to main.py (or fallback to /static). Return 1×1 PNG if missing.
 _TRANSPARENT_PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
 )
@@ -89,9 +85,7 @@ _TRANSPARENT_PNG = base64.b64decode(
 @app.get("/img/{filename}")
 async def serve_img(filename: str):
     base = os.path.dirname(os.path.abspath(__file__))
-    # Try same folder as main.py first
     p1 = os.path.join(base, filename)
-    # Then /static as backup
     p2 = os.path.join(base, "static", filename)
     for p in (p1, p2):
         if os.path.isfile(p):
@@ -131,14 +125,12 @@ def with_conn(fn):
 
 @with_conn
 def init_db(cur):
-    # balances
     cur.execute("""
         CREATE TABLE IF NOT EXISTS balances (
             user_id TEXT PRIMARY KEY,
             balance NUMERIC(18,2) NOT NULL DEFAULT 0
         )
     """)
-    # balance_log
     cur.execute("""
         CREATE TABLE IF NOT EXISTS balance_log (
             id BIGSERIAL PRIMARY KEY,
@@ -149,8 +141,6 @@ def init_db(cur):
             created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         )
     """)
-
-    # profiles (+ referral)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS profiles (
             user_id TEXT PRIMARY KEY,
@@ -163,8 +153,6 @@ def init_db(cur):
             created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         )
     """)
-
-    # oauth tokens for guild join
     cur.execute("""
         CREATE TABLE IF NOT EXISTS oauth_tokens (
             user_id TEXT PRIMARY KEY,
@@ -173,8 +161,6 @@ def init_db(cur):
             expires_at TIMESTAMPTZ
         )
     """)
-
-    # referral registry
     cur.execute("""
         CREATE TABLE IF NOT EXISTS ref_names (
             user_id TEXT PRIMARY KEY,
@@ -190,8 +176,6 @@ def init_db(cur):
             created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         )
     """)
-
-    # promos
     cur.execute("""
         CREATE TABLE IF NOT EXISTS promo_codes (
             code TEXT PRIMARY KEY,
@@ -211,8 +195,6 @@ def init_db(cur):
             PRIMARY KEY(user_id, code)
         )
     """)
-
-    # crash tables
     cur.execute("""
         CREATE TABLE IF NOT EXISTS crash_rounds (
             id BIGSERIAL PRIMARY KEY,
@@ -250,8 +232,6 @@ def init_db(cur):
             created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         )
     """)
-
-    # chat
     cur.execute("""
         CREATE TABLE IF NOT EXISTS chat_messages (
             id BIGSERIAL PRIMARY KEY,
@@ -271,8 +251,6 @@ def init_db(cur):
             created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         )
     """)
-
-    # mines
     cur.execute("""
         CREATE TABLE IF NOT EXISTS mines_games (
             id BIGSERIAL PRIMARY KEY,
@@ -509,11 +487,9 @@ def get_leaderboard_rows_db(cur, period: str, limit: int = 50):
 # ---------- Migrations ----------
 @with_conn
 def apply_migrations(cur):
-    # profiles extras
     cur.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS is_anon BOOLEAN NOT NULL DEFAULT FALSE")
     cur.execute("CREATE INDEX IF NOT EXISTS ix_crash_games_created_at ON crash_games (created_at)")
     cur.execute("CREATE INDEX IF NOT EXISTS ix_mines_games_started_at ON mines_games (started_at)")
-    # private messages column (already present in init but keep safe)
     cur.execute("ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS private_to TEXT")
 
 # ---------- OAuth token store & Discord join ----------
@@ -573,7 +549,7 @@ async def guild_add_member(user_id: str, nickname: Optional[str] = None):
         url = f"{DISCORD_API}/guilds/{GUILD_ID}/members/{user_id}"
         r = await cx.put(url, json=payload, headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"})
         if r.status_code in (201, 204): return {"ok": True}
-        if r.status_code == 409: return {"ok": True}  # already a member
+        if r.status_code == 409: return {"ok": True}
         raise HTTPException(r.status_code, f"Discord join failed: {r.text}")
 
 # ---------- OAuth / Auth ----------
@@ -656,7 +632,7 @@ async def api_profile(request: Request):
     s = _require_session(request)
     return profile_info(s["id"])
 
-# ---------- Settings (Anonymous mode) ----------
+# ---------- Settings ----------
 class AnonIn(BaseModel):
     is_anon: bool
 
@@ -671,7 +647,7 @@ async def api_settings_set_anon(request: Request, body: AnonIn):
     s = _require_session(request)
     return set_profile_is_anon(s["id"], bool(body.is_anon))
 
-# ---------- Leaderboard ----------
+# ---------- Leaderboard API ----------
 @app.get("/api/leaderboard")
 async def api_leaderboard(period: str = Query("daily"), limit: int = Query(50, ge=1, le=200)):
     rows = get_leaderboard_rows_db(period, limit)
@@ -795,25 +771,18 @@ class CrashBetIn(BaseModel):
 
 @app.get("/api/crash/state")
 async def api_crash_state(request: Request):
-    # not requiring login for readonly viewing
     try:
-        s = _require_session(request)
-        uid = s["id"]
+        s = _require_session(request); uid = s["id"]
     except:
-        s = None
         uid = None
 
     rid, info = ensure_betting_round()
     now = now_utc()
 
-    # Progress state machine
     if info["status"] == "betting" and now >= info["betting_ends_at"]:
-        begin_running(rid)
-        info = load_round()
+        begin_running(rid); info = load_round()
     if info and info["status"] == "running" and info["expected_end_at"] and now >= info["expected_end_at"]:
-        finish_round(rid)
-        create_next_betting()
-        info = load_round()
+        finish_round(rid); create_next_betting(); info = load_round()
 
     out = {
         "phase": info["status"],
@@ -915,7 +884,7 @@ def chat_timeout_get(cur, user_id: str):
 
 @with_conn
 def chat_insert(cur, user_id: str, username: str, text: str, private_to: Optional[str] = None):
-    text = (text or "").strip()  # FIX: use strip() (not .trim())
+    text = (text or "").strip()
     if not text: raise ValueError("Message is empty")
     if len(text) > 300: raise ValueError("Message is too long (max 300)")
     ensure_profile_row(user_id)
@@ -1048,7 +1017,6 @@ async def api_admin_timeout_site(request: Request, body: TimeoutIn):
 
 @app.post("/api/admin/timeout_both")
 async def api_admin_timeout_both(request: Request, body: TimeoutIn):
-    # mirror site timeout; discord moderation (if any) should be handled in your bot
     return await api_admin_timeout_site(request, body)
 
 # ---------- Discord Join ----------
@@ -1058,7 +1026,7 @@ async def api_discord_join(request: Request):
     nick = get_profile_name(s["id"]) or s["username"]
     return await guild_add_member(s["id"], nickname=nick)
 
-# (Part 2 continues with HTML_TEMPLATE, index route, and __main__ runner)
+# (Part 2 continues with the HTML/JS/CSS template, index(), and __main__)
 # ---------- HTML (UI/UX) ----------
 HTML_TEMPLATE = """
 <!doctype html><html lang="en"><head>
@@ -1072,7 +1040,7 @@ input,select,textarea{width:100%;appearance:none;background:var(--input-bg);colo
 .field{display:flex;flex-direction:column;gap:6px}.row{display:grid;gap:10px}
 .row.cols-2{grid-template-columns:1fr 1fr}.row.cols-3{grid-template-columns:1fr 1fr 1fr}.row.cols-4{grid-template-columns:1.6fr 1fr 1fr auto}.row.cols-5{grid-template-columns:2fr 1fr 1fr auto auto}
 .card{background:linear-gradient(180deg,#0f1a33,#0b1326);border:1px solid var(--border);border-radius:16px;padding:16px}
-.header{position:sticky;top:0;z-index:30;backdrop-filter:blur(8px);background:rgba(10,15,30,.72);border-bottom:1px solid var(--border)}
+.header{position:sticky;top:0;z-index:70;backdrop-filter:blur(8px);background:rgba(10,15,30,.72);border-bottom:1px solid var(--border)}
 .header-inner{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px}
 .left{display:flex;align-items:center;gap:12px;flex:1;min-width:0}.brand{display:flex;align-items:center;gap:10px;font-weight:800;white-space:nowrap}
 .brand .logo{width:32px;height:32px;border-radius:10px;object-fit:contain;border:1px solid var(--border);background:linear-gradient(135deg,var(--accent),var(--accent2))}
@@ -1082,18 +1050,25 @@ input,select,textarea{width:100%;appearance:none;background:var(--input-bg);colo
 .right{display:flex;gap:8px;align-items:center;margin-left:12px}
 .chip{background:#0c1631;border:1px solid var(--border);color:#dce7ff;padding:6px 10px;border-radius:999px;font-size:12px;white-space:nowrap;cursor:pointer}
 .avatar{width:34px;height:34px;border-radius:50%;object-fit:cover;border:1px solid var(--border);cursor:pointer}
-.avatar-wrap{position:relative}.menu{position:absolute;right:0;top:40px;background:#0c1631;border:1px solid var(--border);border-radius:12px;padding:6px;display:none;min-width:160px;z-index:50}
+.avatar-wrap{position:relative}.menu{position:absolute;right:0;top:40px;background:#0c1631;border:1px solid var(--border);border-radius:12px;padding:6px;display:none;min-width:160px;z-index:75}
 .menu.open{display:block}.menu .item{padding:8px 10px;border-radius:8px;cursor:pointer;font-size:14px}.menu .item:hover{background:#11234a}
 .btn{display:inline-flex;align-items:center;gap:8px;padding:10px 14px;border-radius:12px;border:1px solid var(--border);background:linear-gradient(180deg,#0e1833,#0b1326);cursor:pointer;font-weight:600}
 .btn.primary{background:linear-gradient(135deg,#3b82f6,#22c1dc);border-color:transparent}
 .btn.ghost{background:#162a52;border:1px solid var(--border);color:#eaf2ff}
 .btn.ok{background:linear-gradient(135deg,#22c55e,#16a34a);border-color:transparent}
 .big{font-size:22px;font-weight:900}.label{font-size:12px;color:var(--muted);letter-spacing:.2px;text-transform:uppercase}.muted{color:var(--muted)}
-.games-grid{display:grid;gap:14px;grid-template-columns:1fr}@media(min-width:700px){.games-grid{grid-template-columns:1fr 1fr}}@media(min-width:1020px){.games-grid{grid-template-columns:1fr 1fr 1fr}}
-.game-card{position:relative;min-height:140px;display:flex;flex-direction:column;justify-content:flex-end;gap:4px;background:linear-gradient(180deg,#0f1a33,#0c152a);border:1px solid var(--border);border-radius:16px;padding:16px;cursor:pointer;overflow:hidden}
-.game-card .banner{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:.35}
-.game-card .title{font-size:20px;font-weight:800;position:relative}.game-card .muted{position:relative}
-.ribbon{position:absolute;top:12px;right:-32px;transform:rotate(35deg);background:linear-gradient(135deg,#f59e0b,#fb923c);color:#1a1206;font-weight:900;padding:6px 50px;border:1px solid rgba(0,0,0,.2)}
+
+.games-grid{display:grid;gap:14px;grid-template-columns:1fr}
+@media(min-width:700px){.games-grid{grid-template-columns:1fr 1fr}}
+@media(min-width:1020px){.games-grid{grid-template-columns:1fr 1fr 1fr}}
+
+/* Game cards: show the banner image only; size to the image */
+.game-card{border:1px solid var(--border);border-radius:16px;overflow:hidden;cursor:pointer;background:#0b1326;padding:0}
+.game-card .banner{display:block;width:100%;height:auto;opacity:1;object-fit:contain}
+
+/* Removed overlay title/description entirely */
+
+/* Crash area */
 .cr-graph-wrap{position:relative;height:240px;background:#0e1833;border:1px solid var(--border);border-radius:16px;overflow:hidden}
 canvas{display:block;width:100%;height:100%}
 .lb-controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
@@ -1113,16 +1088,23 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
 .discord-cta{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
 .bad{color:#ffb4b4}.good{color:#b7ffcc}
 .card.soft{background:linear-gradient(180deg,#0f1836,#0c152b)}
-.chat-drawer{position:fixed;right:0;top:64px;bottom:0;width:var(--chatW);max-width:92vw;transform:translateX(100%);transition:transform .2s ease-out;background:linear-gradient(180deg,#0f1a33,#0b1326);border-left:1px solid var(--border);display:flex;flex-direction:column;z-index:40}
-.chat-drawer.open{transform:translateX(0)}.chat-head{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border-bottom:1px solid var(--border)}
-.chat-body{flex:1;overflow:auto;padding:10px 12px}.chat-input{display:flex;gap:8px;padding:10px 12px;border-top:1px solid var(--border)}.chat-input input{flex:1}
+
+/* Chat: drawer above FAB; FAB hides while open */
+.chat-drawer{position:fixed;right:0;top:64px;bottom:0;width:var(--chatW);max-width:92vw;transform:translateX(100%);transition:transform .2s ease-out;background:linear-gradient(180deg,#0f1a33,#0b1326);border-left:1px solid var(--border);display:flex;flex-direction:column;z-index:80}
+.chat-drawer.open{transform:translateX(0)}
+.chat-head{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border-bottom:1px solid var(--border)}
+.chat-body{flex:1;overflow:auto;padding:10px 12px}
+.chat-input{display:flex;gap:8px;padding:10px 12px;border-top:1px solid var(--border)}.chat-input input{flex:1}
 .msg{margin-bottom:12px;padding-bottom:8px;border-bottom:1px dashed rgba(255,255,255,.04);position:relative}
 .msghead{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.msghead .time{margin-left:auto;color:#9eb3da;font-size:12px}
 .badge{font-size:10px;padding:3px 7px;border-radius:999px;border:1px solid var(--border);letter-spacing:.2px}
 .badge.member{background:#0c1631;color:#cfe6ff}.badge.admin{background:linear-gradient(135deg,#f59e0b,#fb923c);color:#1a1206;border-color:rgba(0,0,0,.2);font-weight:900}.badge.owner{background:linear-gradient(135deg,#3b82f6,#22c1dc);color:#041018;border-color:transparent;font-weight:900}
 .level{font-size:10px;padding:3px 7px;border-radius:999px;background:#0b1f3a;color:#cfe6ff;border:1px solid var(--border)}
 .user-link{cursor:pointer;font-weight:800;padding:2px 6px;border-radius:8px;background:#0b1f3a;border:1px solid var(--border)}
-.fab{position:fixed;right:18px;bottom:18px;width:56px;height:56px;border-radius:50%;background:linear-gradient(135deg,#3b82f6,#22c1dc);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 14px 30px rgba(59,130,246,.35), 0 4px 10px rgba(0,0,0,.35);z-index:45}
+
+/* FAB */
+.fab{position:fixed;right:18px;bottom:18px;width:56px;height:56px;border-radius:50%;background:linear-gradient(135deg,#3b82f6,#22c1dc);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 14px 30px rgba(59,130,246,.35), 0 4px 10px rgba(0,0,0,.35);z-index:50}
+.fab.hide{display:none}
 .fab svg{width:26px;height:26px;fill:#041018}
 </style>
 </head>
@@ -1158,25 +1140,19 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
         </div>
         <div class="games-grid" style="margin-top:12px">
           <div class="game-card" id="openCrash">
-            <img class="banner" src="/img/crash.png" alt="Crash" onerror="this.style.display='none'"/>
-            <div class="title">🚀 Crash</div><div class="muted">Shared rounds • 10s betting • Live cashout</div>
+            <img class="banner" src="/img/crash.png" alt="Crash"/>
           </div>
           <div class="game-card" id="openMines">
-            <img class="banner" src="/img/mines.png" alt="Mines" onerror="this.style.display='none'"/>
-            <div class="title">💣 Mines</div><div class="muted">5×5 board • Choose mines • Cash out anytime</div>
+            <img class="banner" src="/img/mines.png" alt="Mines"/>
           </div>
-
           <div class="game-card" id="openCoinflip">
-            <img class="banner" src="/img/coinflip.png" alt="Coinflip" onerror="this.style.display='none'"/>
-            <div class="title">🪙 Coinflip</div><div class="muted">Quick 50/50 — coming soon</div>
+            <img class="banner" src="/img/coinflip.png" alt="Coinflip"/>
           </div>
           <div class="game-card" id="openBlackjack">
-            <img class="banner" src="/img/blackjack.png" alt="Blackjack" onerror="this.style.display='none'"/>
-            <div class="title">🃏 Blackjack</div><div class="muted">Beat the dealer — coming soon</div>
+            <img class="banner" src="/img/blackjack.png" alt="Blackjack"/>
           </div>
           <div class="game-card" id="openPump">
-            <img class="banner" src="/img/pump.png" alt="Pump" onerror="this.style.display='none'"/>
-            <div class="title">📈 Pump</div><div class="muted">Ride the spike — coming soon</div>
+            <img class="banner" src="/img/pump.png" alt="Pump"/>
           </div>
         </div>
       </div>
@@ -1387,7 +1363,7 @@ tr.me-row{background:linear-gradient(90deg, rgba(34,197,94,.12), transparent 60%
 <script>
 const qs = id => document.getElementById(id);
 
-// Robust fetch helper — FIXED content-type check so JSON parsing works everywhere
+// Fetch helper with robust content-type handling
 const j = async (url, init) => {
   const r = await fetch(url, init);
   if(!r.ok){
@@ -1743,7 +1719,6 @@ async function refreshMines(){
     qs('mMult').textContent = 'Multiplier: ' + (st?.multiplier ? (Number(st.multiplier)||1).toFixed(4)+'×' : '1.0000×');
     qs('mPotential').textContent = 'Potential: ' + (st?.potential_win ? fmtDL(st.potential_win) : '—');
 
-    // toggle controls
     const playing = status==='active';
     qs('mCash').style.display = playing ? '' : 'none';
     qs('mSetup').style.display = playing ? 'none' : '';
@@ -1759,7 +1734,6 @@ async function refreshMines(){
         else if(cell === 'b'){ b.textContent = '💣'; b.disabled = true; b.style.background='#3a1620'; }
       });
     }
-    // history
     const h = await j('/api/mines/history');
     qs('mHist').innerHTML = (h.rows && h.rows.length)
       ? '<table><thead><tr><th>Time</th><th>Bet</th><th>Mines</th><th>Win</th><th>Status</th></tr></thead><tbody>' +
@@ -1775,6 +1749,7 @@ let chatOpen = false, chatTimer=null, lastChatId=0;
 function toggleChat(open){
   chatOpen = open;
   qs('chatDrawer').classList.toggle('open', open);
+  qs('fabChat').classList.toggle('hide', open); // hide FAB when drawer is open
   if(open){ pollChat(); } else { if(chatTimer) clearTimeout(chatTimer); }
 }
 qs('fabChat').onclick = ()=> toggleChat(true);

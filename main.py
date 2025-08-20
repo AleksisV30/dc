@@ -75,8 +75,8 @@ RESET_LINK_BASE = os.getenv("RESET_LINK_BASE", f"https://{CANONICAL_HOST}/reset"
 DEPOSIT_CHANNEL_ID = int(os.getenv("DISCORD_DEPOSIT_CHANNEL_ID", "1407130350940979210") or "0")
 WITHDRAW_CHANNEL_ID = int(os.getenv("DISCORD_WITHDRAW_CHANNEL_ID", "1407130468821766226") or "0")
 
-# New toggles for reliability
-START_DISCORD_BOT = os.getenv("START_DISCORD_BOT", "1") != "0"  # set to 0 to prevent bot from starting
+# Toggles
+START_DISCORD_BOT = os.getenv("START_DISCORD_BOT", "1") != "0"  # set 0 to prevent bot from starting
 RELOAD = os.getenv("RELOAD", "0") == "1"                        # if you want uvicorn.reload=True via env
 
 GEM = "💎"
@@ -363,13 +363,9 @@ def apply_migrations(cur):
     cur.execute("CREATE INDEX IF NOT EXISTS ix_accounts_provider ON accounts(provider)")
     cur.execute("CREATE INDEX IF NOT EXISTS ix_transfers_created_at ON transfers(created_at)")
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    init_db()
-    apply_migrations()
-    yield
+# NOTE: the crash daemon & discord bot are started in Part 2.
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI()
 app.mount("/static", StaticFiles(directory=_get_static_dir()), name="static")
 
 # ---------- Health ----------
@@ -390,7 +386,7 @@ async def _canonical_host_redirect(request: Request, call_next):
         pass
     return await call_next(request)
 
-# ---------- Owner-only lock (site closed for everyone except OWNER) ----------
+# ---------- Owner-only lock ----------
 OWNER_GATE_ALLOW = ("/login", "/callback", "/login/google", "/callback/google", "/reset", "/auth/", "/static/", "/img/", "/healthz", "/api/bot/status")
 
 @app.middleware("http")
@@ -399,7 +395,6 @@ async def _owner_only_gate(request: Request, call_next):
         return await call_next(request)
 
     path = request.url.path or "/"
-    # allow health, login, callback, assets, bot status
     if any(path == p or path.startswith(p) for p in OWNER_GATE_ALLOW):
         return await call_next(request)
 
@@ -415,7 +410,6 @@ async def _owner_only_gate(request: Request, call_next):
     if str(uid) == str(OWNER_ID):
         return await call_next(request)
 
-    # Gate page
     gate_html = """
     <!doctype html><html><head>
       <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
@@ -454,7 +448,7 @@ async def serve_img(filename: str):
         if os.path.isfile(p): return FileResponse(p)
     return Response(content=_TRANSPARENT_PNG, media_type="image/png")
 
-# ---------- Sessions (sticky cookie) ----------
+# ---------- Sessions ----------
 SER = URLSafeSerializer(SECRET_KEY, salt="session-v1")
 
 def _cookie_domain_from_request(request: Optional[Request]) -> Optional[str]:
@@ -651,9 +645,6 @@ def get_leaderboard_rows_db(cur, period: str, limit: int = 50):
     return out
 
 # ---------- HTML (UI/UX) ----------
-# Improvements:
-#  - Robust preloader removal (hides on load & then removes from DOM).
-#  - Crash canvas context is initialized in openCrash().
 HTML_TEMPLATE = r"""
 <!doctype html>
 <html lang="en">
@@ -902,7 +893,6 @@ canvas{display:block;width:100%;height:100%}
         </div>
         <div>
           <div class="card" style="min-height:420px;display:grid;place-items:center">
-            <div id="
             <div id="mGrid" style="display:grid;gap:10px;grid-template-columns:repeat(5,64px)"></div>
           </div>
         </div>
@@ -1083,7 +1073,7 @@ canvas{display:block;width:100%;height:100%}
   </div>
 </div>
 
-<!-- Login Modal (choose provider + email form) -->
+<!-- Login Modal -->
 <div class="modal" id="loginModal">
   <div class="box">
     <div class="head"><div class="big">Log in</div><button class="btn gray" id="loginClose">Close</button></div>
@@ -1457,12 +1447,14 @@ async function loadCrashHistory(){
 let mState=null;
 function renderMinesGrid(st){
   const grid = qs('mGrid'); grid.innerHTML='';
-  const picks = st.picks||0;
+  const picks = BigInt(st.picks || 0);
   for(let i=0;i<25;i++){
     const b = document.createElement('button');
     b.className='btn gray';
     b.style.width='64px'; b.style.height='64px';
-    b.textContent = (st.revealed && st.revealed[i]===1) ? '💎' : (st.revealed && st.revealed[i]===-1) ? '💣' : (picks & (1n<<BigInt(i))) ? '•' : '';
+    const isPicked = (picks & (1n << BigInt(i))) !== 0n;
+    const cellRevealed = st.revealed && st.revealed[i];
+    b.textContent = cellRevealed===1 ? '💎' : cellRevealed===-1 ? '💣' : (isPicked ? '•' : '');
     b.disabled = !!st.ended || (st.revealed && (st.revealed[i]!==0));
     b.onclick = async ()=>{ try{ const r = await j('/api/mines/pick?index='+i,{method:'POST'}); mState=r; updateMinesUI(); }catch(e){ toast(e.message,'error','Mines'); } };
     grid.appendChild(b);
@@ -1470,7 +1462,7 @@ function renderMinesGrid(st){
 }
 function updateMinesUI(){
   const st = mState; if(!st){ return; }
-  qs('mSetup').style.display = st.status==='active' ? 'none' : 'none';
+  qs('mSetup').style.display = st.status==='active' ? 'none' : '';
   qs('mCash').style.display = (st.status==='active' ? '' : 'none');
   qs('mMult').textContent = (st.multiplier||1).toFixed(4)+'×';
   qs('mPotential').textContent = st.potential ? fmtDL(st.potential)+' DL' : '—';
@@ -1801,7 +1793,7 @@ HTML_TEMPLATE = HTML_TEMPLATE.replace(
     "GROWCB is a sleek, community-driven arcade with provably-fair mini-games (Crash, Mines and more), cosmetic polish, and tight Discord integration. We’re building a smooth, low-friction experience: quick rounds, clear payouts, no-nonsense UI."
 )
 
-# ---------- SPA roots (serve same index for these paths) ----------
+# ---------- SPA roots ----------
 SPA_PATHS = {"", "games", "crash", "mines", "coinflip", "blackjack", "pump", "referral", "promocodes", "leaderboard", "about", "owner"}
 
 @app.get("/", response_class=HTMLResponse)
@@ -2527,157 +2519,294 @@ async def api_mines_history(request: Request):
         return {"rows": rows}
     except Exception:
         return {"rows": []}
+# === Part 2/2 — Discord bot + daemons + admin APIs + startup ===
+import asyncio
+import datetime as _dt
 
-# ---------- Admin helpers / endpoints ----------
-
-def fmtDL(x) -> str:
-    """Format an amount as 2dp string safely even for Decimals."""
-    try:
-        return format(q2(D(x)), ".2f")
-    except Exception:
-        return "0.00"
-
-def _require_role(request: Request, min_role: str) -> Tuple[dict, dict]:
-    """Ensure the calling user has at least min_role; returns (session, profile_info)."""
-    s = _require_session(request)
-    prof = profile_info(s["id"])
-    if _role_rank(prof.get("role") or "member") < _role_rank(min_role):
-        raise HTTPException(403, "Insufficient permissions")
-    return s, prof
-
-@with_conn
-def _resolve_identifier(cur, identifier: str) -> Optional[str]:
-    """
-    Accepts:
-      - raw user id (e_*, g_* or discord numeric id)
-      - discord mention like <@123456789> or <@!123456789>
-      - exact referral/profile handle (name_lower)
-    Returns user_id or None.
-    """
-    if not identifier:
-        return None
-    ident = identifier.strip()
-
-    # Discord mention
-    m = re.match(r"^<@!?(?P<id>\d+)>$", ident)
-    if m:
-        return m.group("id")
-
-    # If looks like a user id we already store
-    if re.fullmatch(r"(e|g)_[0-9a-f]{16}", ident) or re.fullmatch(r"\d{5,20}", ident):
-        return ident
-
-    # Otherwise, treat as handle
-    lower = ident.lower()
-    cur.execute("SELECT user_id FROM profiles WHERE name_lower=%s", (lower,))
-    r = cur.fetchone()
-    return str(r[0]) if r else None
-
-class AdminAdjustIn(BaseModel):
+# ---------- Admin / Announcements ----------
+class AdjustIn(BaseModel):
     identifier: str
     amount: str
     reason: Optional[str] = None
 
+class RoleIn(BaseModel):
+    identifier: str
+    role: str
+
+class AnnounceIn(BaseModel):
+    text: str
+    minutes: Optional[int] = 360
+
+def _require_admin(request: Request):
+    s = _require_session(request)
+    info = profile_info(s["id"])
+    if _role_rank(info.get("role","member")) < _role_rank("admin"):
+        raise HTTPException(403, "Admin only")
+    return s, info
+
+@with_conn
+def _resolve_identifier(cur, identifier: str) -> str:
+    ident = (identifier or "").strip()
+    if not ident:
+        raise HTTPException(400, "Missing identifier")
+    # Try direct user_id first
+    cur.execute("SELECT user_id FROM profiles WHERE user_id=%s", (ident,))
+    r = cur.fetchone()
+    if r:
+        return str(r[0])
+    # Mentions like <@123> or <@!123>
+    m = re.search(r"\d{6,}", ident)
+    if m:
+        discord_id = m.group(0)
+        cur.execute("SELECT user_id FROM profiles WHERE user_id=%s", (discord_id,))
+        r = cur.fetchone()
+        if r:
+            return str(r[0])
+    # @handle or plain handle -> name_lower
+    handle = ident.lstrip("@").lower()
+    cur.execute("SELECT user_id FROM profiles WHERE name_lower=%s", (handle,))
+    r = cur.fetchone()
+    if r:
+        return str(r[0])
+    # fallback: ref handle
+    cur.execute("SELECT user_id FROM ref_names WHERE name_lower=%s", (handle,))
+    r = cur.fetchone()
+    if r:
+        return str(r[0])
+    raise HTTPException(404, "User not found")
+
 @app.post("/api/admin/adjust")
-async def api_admin_adjust(request: Request, body: AdminAdjustIn):
-    # Admins and owners only
-    s, prof = _require_role(request, "admin")
-    with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
-        target = _resolve_identifier(cur, body.identifier)
-    if not target:
-        raise HTTPException(404, "Target user not found")
+async def api_admin_adjust(request: Request, body: AdjustIn):
+    s, _ = _require_admin(request)
     try:
         amt = q2(D(body.amount))
     except Exception:
         raise HTTPException(400, "Invalid amount")
-
-    new_bal = adjust_balance(s["id"], target, amt, body.reason or "admin-adjust")
-    return {"ok": True, "target_id": target, "new_balance": float(new_bal)}
-
-class AdminRoleIn(BaseModel):
-    identifier: str
-    role: str
-
-@app.post("/api/admin/role")
-async def api_admin_role(request: Request, body: AdminRoleIn):
-    # Owner only
-    s, prof = _require_role(request, "owner")
     with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
         target = _resolve_identifier(cur, body.identifier)
-    if not target:
-        raise HTTPException(404, "Target user not found")
-    try:
-        res = set_role(target, body.role)
-        return res
-    except ValueError as e:
-        raise HTTPException(400, str(e))
+    new_bal = adjust_balance(s["id"], target, amt, body.reason or f"admin adjust by {s['id']}")
+    return {"target": target, "new_balance": float(new_bal)}
 
-class AdminAnnounceIn(BaseModel):
-    text: str
-    minutes: Optional[int] = 120
-
-@with_conn
-def _create_announcement(cur, creator_id: str, text: str, minutes: int):
-    starts = now_utc()
-    ends = starts + datetime.timedelta(minutes=max(1, int(minutes or 0)))
-    cur.execute(
-        "INSERT INTO announcements(text, starts_at, ends_at, created_by) VALUES (%s,%s,%s,%s) RETURNING id",
-        (text, starts, ends, creator_id),
-    )
-    new_id = cur.fetchone()[0]
-    return {"ok": True, "id": int(new_id)}
+@app.post("/api/admin/role")
+async def api_admin_role(request: Request, body: RoleIn):
+    s, _ = _require_admin(request)
+    with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
+        target = _resolve_identifier(cur, body.identifier)
+    res = set_role(target, body.role)
+    return res
 
 @app.post("/api/admin/announce")
-async def api_admin_announce(request: Request, body: AdminAnnounceIn):
-    # Admins and owners can post announcements
-    s, _ = _require_role(request, "admin")
-    if not (body.text or "").strip():
+async def api_admin_announce(request: Request, body: AnnounceIn):
+    s, _ = _require_admin(request)
+    text = (body.text or "").strip()
+    if not text:
         raise HTTPException(400, "Text required")
-    return _create_announcement(s["id"], body.text.strip(), int(body.minutes or 120))
-
-# ---------- Announcements (public) ----------
-
-@with_conn
-def _active_announcements(cur):
-    now = now_utc()
-    cur.execute(
-        """
-        SELECT id, text, starts_at, ends_at
-        FROM announcements
-        WHERE (starts_at IS NULL OR starts_at <= %s)
-          AND (ends_at IS NULL OR ends_at >= %s)
-        ORDER BY COALESCE(starts_at, CURRENT_TIMESTAMP) DESC, id DESC
-        LIMIT 10
-        """,
-        (now, now),
-    )
-    return [
-        {"id": int(r[0]), "text": r[1], "starts_at": iso(r[2]), "ends_at": iso(r[3])}
-        for r in cur.fetchall()
-    ]
+    minutes = int(body.minutes or 360)
+    starts = now_utc()
+    ends = starts + datetime.timedelta(minutes=minutes)
+    with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
+        cur.execute("INSERT INTO announcements(text, starts_at, ends_at, created_by) VALUES (%s,%s,%s,%s) RETURNING id",
+                    (text, starts, ends, s["id"]))
+        new_id = cur.fetchone()[0]
+        con.commit()
+    return {"ok": True, "id": int(new_id)}
 
 @app.get("/api/announcements/active")
-async def api_ann_active():
-    return {"rows": _active_announcements()}
+async def api_announcements_active():
+    now = now_utc()
+    with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
+        cur.execute("""
+            SELECT id, text, starts_at, ends_at
+            FROM announcements
+            WHERE (starts_at IS NULL OR starts_at <= %s)
+              AND (ends_at IS NULL OR ends_at >= %s)
+            ORDER BY starts_at DESC
+            LIMIT 10
+        """, (now, now))
+        rows = [{"id": int(r[0]), "text": r[1], "starts_at": iso(r[2]), "ends_at": iso(r[3])} for r in cur.fetchall()]
+    return {"rows": rows}
 
-# ---------- Bot status (for health / gating) ----------
-
+# ---------- Bot status ----------
 @app.get("/api/bot/status")
 async def api_bot_status():
-    return {
-        "ok": True,
-        "configured": bool(DISCORD_BOT_TOKEN and GUILD_ID),
-        "guild_id": int(GUILD_ID or 0),
-        "start_flag": bool(START_DISCORD_BOT),
+    data = {
+        "configured": bool(DISCORD_BOT_TOKEN),
+        "start_enabled": bool(START_DISCORD_BOT),
+        "library_available": False,
+        "online": False,
+        "user": None,
+        "guilds": 0,
+        "latency": None
     }
+    try:
+        import discord  # noqa
+        data["library_available"] = True
+    except Exception:
+        return data
+    bot = _discord_bot_holder["client"]
+    if bot:
+        data["online"] = bot.is_ready()
+        data["user"] = str(bot.user) if bot.user else None
+        try:
+            data["guilds"] = len(bot.guilds)
+        except Exception:
+            data["guilds"] = 0
+        try:
+            data["latency"] = round(bot.latency * 1000.0, 1)  # ms
+        except Exception:
+            data["latency"] = None
+    return data
 
-# ---------- Uvicorn entrypoint ----------
+# ---------- Crash round daemon ----------
+def _parse_dt(val):
+    if not val:
+        return None
+    if isinstance(val, datetime.datetime):
+        return val if val.tzinfo else val.replace(tzinfo=UTC)
+    try:
+        dt = _dt.datetime.fromisoformat(str(val))
+        return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+    except Exception:
+        return None
+
+async def crash_daemon():
+    await asyncio.sleep(1.0)
+    print("[crash-daemon] started")
+    while True:
+        try:
+            ensure_betting_round()
+            st = load_round()
+            status = (st or {}).get("status")
+            if status == "betting":
+                ends = _parse_dt(st.get("betting_ends_at"))
+                if ends:
+                    sec = (ends - now_utc()).total_seconds()
+                else:
+                    sec = 1.0
+                if sec > 0.2:
+                    await asyncio.sleep(min(sec, 1.0))
+                else:
+                    begin_running()
+                    await asyncio.sleep(0.1)
+            elif status == "running":
+                # Let crash core progress & resolve; finish_round() should settle + mark as ended
+                finish_round()
+                await asyncio.sleep(0.25)
+            elif status == "ended":
+                create_next_betting()
+                await asyncio.sleep(0.25)
+            else:
+                await asyncio.sleep(0.5)
+        except Exception as e:
+            print("[crash-daemon] error:", e)
+            await asyncio.sleep(1.5)
+
+# ---------- Discord bot (online presence) ----------
+_discord_bot_holder: Dict[str, Optional[object]] = {"client": None, "task": None}
+
+def create_discord_client():
+    try:
+        import discord
+    except Exception as e:
+        print("[discord] library not available:", e)
+        return None
+
+    intents = discord.Intents.none()
+    intents.guilds = True  # presence & guilds ok without privileged intents
+
+    client = discord.Client(intents=intents)
+
+    @client.event
+    async def on_ready():
+        try:
+            await client.change_presence(
+                activity=discord.Game(name="growcb.net"),
+                status=discord.Status.online
+            )
+        except Exception as e:
+            print("[discord] presence error:", e)
+        gcount = 0
+        try:
+            gcount = len(client.guilds)
+        except Exception:
+            pass
+        print(f"[discord] online as {client.user} in {gcount} guild(s)")
+
+    return client
+
+async def start_discord_bot():
+    if not START_DISCORD_BOT:
+        print("[discord] START_DISCORD_BOT=0 — not starting")
+        return
+    if not DISCORD_BOT_TOKEN:
+        print("[discord] missing DISCORD_BOT_TOKEN — not starting")
+        return
+    client = create_discord_client()
+    if not client:
+        return
+    _discord_bot_holder["client"] = client
+    try:
+        print("[discord] starting…")
+        await client.start(DISCORD_BOT_TOKEN)
+    except Exception as e:
+        print("[discord] start error:", e)
+
+async def stop_discord_bot():
+    client = _discord_bot_holder["client"]
+    if client:
+        try:
+            await client.close()
+        except Exception as e:
+            print("[discord] close error:", e)
+    _discord_bot_holder["client"] = None
+
+# ---------- App startup/shutdown ----------
+_crash_task: Optional[asyncio.Task] = None
+_bot_task: Optional[asyncio.Task] = None
+
+@app.on_event("startup")
+async def _on_startup():
+    # DB up
+    try:
+        init_db()
+        apply_migrations()
+        print("[startup] database ready")
+    except Exception as e:
+        print("[startup] DB init error:", e)
+
+    loop = asyncio.get_event_loop()
+    # crash daemon
+    global _crash_task
+    _crash_task = loop.create_task(crash_daemon())
+
+    # discord bot
+    global _bot_task
+    if START_DISCORD_BOT and DISCORD_BOT_TOKEN:
+        _bot_task = loop.create_task(start_discord_bot())
+    else:
+        print("[startup] discord bot disabled or not configured")
+
+@app.on_event("shutdown")
+async def _on_shutdown():
+    # stop discord first
+    try:
+        await stop_discord_bot()
+    except Exception:
+        pass
+    # cancel tasks
+    for t in (_crash_task, _bot_task):
+        if t:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+            try:
+                await t
+            except Exception:
+                pass
+    print("[shutdown] graceful shutdown complete")
+
+# ---------- Uvicorn entry ----------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=PORT,
-        reload=RELOAD,
-        log_level="info",
-    )
+    uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=RELOAD, forwarded_allow_ips="*")

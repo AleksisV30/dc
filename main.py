@@ -2012,3 +2012,235 @@ function routeFromPath(path){
 </body>
 </html>
 """
+# ---------- Discord Bot (embeds, buttons, permissions) ----------
+# Placed near the end of the file so startup can find `bot`
+import math
+try:
+    import discord
+    from discord.ext import commands
+except Exception as _e:
+    discord = None
+    commands = None
+    print("[bot] discord.py not available:", _e)
+
+def _fmt_dl_str(amount: Decimal) -> str:
+    s = f"{q2(D(amount)):.2f}"
+    return s
+
+def _parse_user_identifier(s: str) -> Optional[str]:
+    """Accept raw ID or mention like <@123> / <@!123> / <@&123> and return numeric user id as str."""
+    if not s: return None
+    m = re.search(r"\d{5,}", s)
+    return m.group(0) if m else None
+
+def _is_owner_or_webhook(ctx) -> bool:
+    # Owner or a webhook message (rare but allowed per requirement)
+    try:
+        if int(ctx.author.id) == int(OWNER_ID):
+            return True
+        # In discord.py, a Message sent by webhook has webhook_id set (ctx.message.webhook_id)
+        if getattr(ctx.message, "webhook_id", None):
+            return True
+    except Exception:
+        pass
+    return False
+
+def _level_progress_bar(progress: int, need: int, width: int = 12) -> str:
+    pct = 0 if need <= 0 else max(0.0, min(1.0, progress / float(need)))
+    filled = int(round(pct * width))
+    return "█" * filled + "░" * (width - filled), int(round(pct * 100))
+
+# Only create a bot if discord.py is available
+if discord and commands:
+    intents = discord.Intents.default()
+    intents.message_content = True
+    bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
+
+    def _footer(embed: discord.Embed) -> discord.Embed:
+        embed.set_footer(text="https://growcb.net/")
+        return embed
+
+    @bot.event
+    async def on_ready():
+        try:
+            await bot.change_presence(
+                activity=discord.Game(name="growcb.net — .help")
+            )
+        except Exception:
+            pass
+        print(f"[bot] Logged in as {bot.user} (id={bot.user.id})")
+
+    # ------- .help -------
+    @bot.command(name="help")
+    async def help_cmd(ctx: commands.Context):
+        e = discord.Embed(
+            title="GROWCB — Commands",
+            description=(
+                "**.bal** — show your balance\n"
+                "**.bal @user|id** — show someone else's balance\n"
+                "**.level** — your level & progress\n"
+                "**.leaderboard** — top wagered (switch views)\n"
+                "\n"
+                "__Owner/Webhook only__:\n"
+                "**.addbal @user|id amount [reason]** — add DL\n"
+                "**.removebal @user|id amount [reason]** — remove DL"
+            ),
+            color=0x3b82f6
+        )
+        e = _footer(e)
+        await ctx.reply(embed=e, mention_author=False)
+
+    # ------- .bal [user] -------
+    @bot.command(name="bal")
+    async def bal_cmd(ctx: commands.Context, who: Optional[str] = None):
+        target_id = None
+        if who:
+            target_id = _parse_user_identifier(who)
+            if not target_id:
+                return await ctx.reply("Provide a valid user mention or numeric ID.", mention_author=False)
+        else:
+            target_id = str(ctx.author.id)
+
+        try:
+            bal = get_balance(target_id)
+        except Exception as e:
+            return await ctx.reply(f"Error: {e}", mention_author=False)
+
+        s = _fmt_dl_str(bal)
+        e = discord.Embed(
+            title="Balance",
+            description=f"<@{target_id}> has **{s} DL**",
+            color=0x22c1dc
+        )
+        e = _footer(e)
+        await ctx.reply(embed=e, mention_author=False)
+
+    # ------- .level -------
+    @bot.command(name="level")
+    async def level_cmd(ctx: commands.Context):
+        try:
+            p = profile_info(str(ctx.author.id))
+        except Exception as e:
+            return await ctx.reply(f"Error: {e}", mention_author=False)
+        bar, pct = _level_progress_bar(p["progress"], p["next_needed"])
+        e = discord.Embed(
+            title=f"Level • {ctx.author.display_name}",
+            color=0x6aa6ff
+        )
+        e.add_field(name="Level", value=str(p["level"]), inline=True)
+        e.add_field(name="XP", value=f'{p["xp"]}', inline=True)
+        e.add_field(name="Next", value=f'{p["progress"]}/{p["next_needed"]} ({pct}%)', inline=True)
+        e.add_field(name="Progress", value=f"`{bar}`", inline=False)
+        e = _footer(e)
+        await ctx.reply(embed=e, mention_author=False)
+
+    # ------- Leaderboard view with buttons -------
+    PERIOD_LABELS = {"daily": "Daily", "monthly": "Monthly", "alltime": "All-time"}
+
+    def _lb_embed(period: str) -> discord.Embed:
+        period = (period or "daily").lower()
+        rows = get_leaderboard_rows_db(period, 15)
+        lines = []
+        if not rows:
+            lines.append("_No data yet._")
+        else:
+            for i, r in enumerate(rows, 1):
+                name = "Anonymous" if r["is_anon"] else r["display_name"]
+                amt = "—" if r["is_anon"] else f'{_fmt_dl_str(Decimal(r["total_wagered"]))} DL'
+                lines.append(f"**{i:>2}.** {name} • {amt}")
+        e = discord.Embed(
+            title=f"Leaderboard — {PERIOD_LABELS.get(period, 'Daily')}",
+            description="\n".join(lines),
+            color=0x3b82f6
+        )
+        return _footer(e)
+
+    class LBView(discord.ui.View):
+        def __init__(self, current: str):
+            super().__init__(timeout=60)
+            self.current = (current or "daily").lower()
+            self._rebuild()
+
+        def _rebuild(self):
+            # clear then add buttons with active style
+            self.clear_items()
+            for p in ("daily", "monthly", "alltime"):
+                style = discord.ButtonStyle.primary if p == self.current else discord.ButtonStyle.secondary
+                self.add_item(LBButton(label=PERIOD_LABELS[p], period=p, style=style, parent=self))
+
+    class LBButton(discord.ui.Button):
+        def __init__(self, label: str, period: str, style: discord.ButtonStyle, parent: "LBView"):
+            super().__init__(label=label, style=style)
+            self.period = period
+            self.parent_view = parent
+
+        async def callback(self, interaction: discord.Interaction):
+            self.parent_view.current = self.period
+            self.parent_view._rebuild()
+            try:
+                await interaction.response.edit_message(embed=_lb_embed(self.period), view=self.parent_view)
+            except discord.errors.NotFound:
+                pass
+
+    @bot.command(name="leaderboard")
+    async def leaderboard_cmd(ctx: commands.Context, period: Optional[str] = "daily"):
+        period = (period or "daily").lower()
+        if period not in ("daily", "monthly", "alltime"):
+            period = "daily"
+        view = LBView(period)
+        await ctx.reply(embed=_lb_embed(period), view=view, mention_author=False)
+
+    # ------- Owner/Webhook: addbal / removebal -------
+    @bot.command(name="addbal")
+    async def addbal_cmd(ctx: commands.Context, who: Optional[str] = None, amount: Optional[str] = None, *, reason: Optional[str] = None):
+        if not _is_owner_or_webhook(ctx):
+            return await ctx.reply("Only the owner or a webhook can use this command.", mention_author=False)
+        if not who or not amount:
+            return await ctx.reply("Usage: `.addbal <@user|id> <amount> [reason]`", mention_author=False)
+
+        uid = _parse_user_identifier(who)
+        if not uid:
+            return await ctx.reply("Provide a valid user mention or ID.", mention_author=False)
+        try:
+            newbal = adjust_balance(str(ctx.author.id), uid, D(amount), reason)
+        except Exception as e:
+            return await ctx.reply(f"Error: {e}", mention_author=False)
+
+        e = discord.Embed(
+            title="Balance Updated",
+            description=f"Added **{_fmt_dl_str(D(amount))} DL** to <@{uid}>.\nNew balance: **{_fmt_dl_str(newbal)} DL**",
+            color=0x22c55e
+        )
+        e = _footer(e)
+        await ctx.reply(embed=e, mention_author=False)
+
+    @bot.command(name="removebal")
+    async def removebal_cmd(ctx: commands.Context, who: Optional[str] = None, amount: Optional[str] = None, *, reason: Optional[str] = None):
+        if not _is_owner_or_webhook(ctx):
+            return await ctx.reply("Only the owner or a webhook can use this command.", mention_author=False)
+        if not who or not amount:
+            return await ctx.reply("Usage: `.removebal <@user|id> <amount> [reason]`", mention_author=False)
+
+        uid = _parse_user_identifier(who)
+        if not uid:
+            return await ctx.reply("Provide a valid user mention or ID.", mention_author=False)
+        try:
+            newbal = adjust_balance(str(ctx.author.id), uid, D(amount) * Decimal("-1"), reason)
+        except Exception as e:
+            return await ctx.reply(f"Error: {e}", mention_author=False)
+
+        e = discord.Embed(
+            title="Balance Updated",
+            description=f"Removed **{_fmt_dl_str(D(amount))} DL** from <@{uid}>.\nNew balance: **{_fmt_dl_str(newbal)} DL**",
+            color=0xef4444
+        )
+        e = _footer(e)
+        await ctx.reply(embed=e, mention_author=False)
+
+# ---------- HTML index ----------
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    invite = DISCORD_INVITE or "#"
+    html = HTML_TEMPLATE.replace("__BASE_URL__", BASE_URL).replace("__INVITE__", invite)
+    return HTMLResponse(html)
+

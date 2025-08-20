@@ -1890,11 +1890,6 @@ async def api_ref_attach(request: Request, refname: str = ""):
 # ---------- Promo ----------
 class PromoIn(BaseModel):
     code: str
-
-@app.get("/api/promo/my")
-async def api_promo_my(request: Request):
-    s = _require_session(request)
-    with psycop
 @app.get("/api/promo/my")
 async def api_promo_my(request: Request):
     s = _require_session(request)
@@ -2404,4 +2399,5 @@ except Exception as _e:
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app.main:app", host="0.0.0.0", port=PORT, reload=RELOAD)
+
 

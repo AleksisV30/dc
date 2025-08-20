@@ -2494,8 +2494,6 @@ async def api_mines_start(request: Request, body: MinesStartIn):
         raise HTTPException(400, f"Bet must be between {MIN_BET} and {MAX_BET}")
     mines = int(body.mines or 3)
     if not (1 <= mines <= 24):
-        raise HTTPException(400, "Mines
-    if not (1 <= mines <= 24):
         raise HTTPException(400, "Mines must be between 1 and 24")
     try:
         st = mines_start(s["id"], bet, mines)

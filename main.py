@@ -1,14 +1,16 @@
 # app/main.py
-import os, json, asyncio, re, random, string, datetime, base64
+import os, json, asyncio, re, random, string, datetime, base64, secrets, hashlib, hmac, smtplib
 from urllib.parse import urlencode, urlparse
 from typing import Optional, Tuple, Dict, List
 from decimal import Decimal, ROUND_DOWN, getcontext
 from contextlib import asynccontextmanager
+from email.message import EmailMessage
+import ssl
 
 import httpx
 import psycopg
-from fastapi import FastAPI, Request, HTTPException, Query
-from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse, Response
+from fastapi import FastAPI, Request, HTTPException, Query, Body
+from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse, Response, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from itsdangerous import URLSafeSerializer, BadSignature
 from pydantic import BaseModel
@@ -56,6 +58,23 @@ REFERRAL_SHARE_BASE = os.getenv("REFERRAL_SHARE_BASE", "https://growcb.net/refer
 CANONICAL_HOST = os.getenv("CANONICAL_HOST", "growcb.net")  # force show this host in browser
 OWNER_ONLY_MODE = os.getenv("OWNER_ONLY_MODE", "1") != "0"   # lock site to owner only (default ON)
 
+# Google OAuth
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_REDIRECT = os.getenv("GOOGLE_REDIRECT", "")
+
+# Email SMTP for password reset
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587") or "587")
+SMTP_USERNAME = os.getenv("SMTP_USERNAME", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+FROM_EMAIL = os.getenv("FROM_EMAIL", "")
+RESET_LINK_BASE = os.getenv("RESET_LINK_BASE", f"https://{CANONICAL_HOST}/reset")
+
+# Discord notification channels
+DEPOSIT_CHANNEL_ID = int(os.getenv("DISCORD_DEPOSIT_CHANNEL_ID", "1407130350940979210") or "0")
+WITHDRAW_CHANNEL_ID = int(os.getenv("DISCORD_WITHDRAW_CHANNEL_ID", "1407130468821766226") or "0")
+
 # New toggles for reliability
 START_DISCORD_BOT = os.getenv("START_DISCORD_BOT", "1") != "0"  # set to 0 to prevent bot from starting
 RELOAD = os.getenv("RELOAD", "0") == "1"                        # if you want uvicorn.reload=True via env
@@ -77,6 +96,50 @@ def now_utc() -> datetime.datetime: return datetime.datetime.now(UTC)
 def iso(dt: Optional[datetime.datetime]) -> Optional[str]:
     if dt is None: return None
     return dt.astimezone(UTC).isoformat()
+
+# ---------- Password hashing (email auth) ----------
+def _hash_password(password: str) -> str:
+    if not password or len(password) < 6:
+        raise ValueError("Password must be at least 6 characters")
+    salt = base64.urlsafe_b64encode(os.urandom(16)).decode()
+    iters = 120_000
+    dk = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt.encode('utf-8'), iters)
+    return f"pbkdf2${iters}${salt}${base64.b64encode(dk).decode()}"
+
+def _verify_password(stored: str, password: str) -> bool:
+    try:
+        algo, iters_s, salt, h64 = stored.split("$", 3)
+        iters = int(iters_s)
+        dk = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt.encode('utf-8'), iters)
+        return hmac.compare_digest(base64.b64decode(h64), dk)
+    except Exception:
+        return False
+
+def _send_email(to_email: str, subject: str, body: str) -> bool:
+    if not (SMTP_HOST and SMTP_USERNAME and SMTP_PASSWORD and FROM_EMAIL):
+        # Fallback: log only
+        print(f"[EMAIL-FAKE] To: {to_email}\nSubj: {subject}\n\n{body}")
+        return False
+    msg = EmailMessage()
+    msg["From"] = FROM_EMAIL
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    msg.set_content(body)
+    ctx = ssl.create_default_context()
+    try:
+        if SMTP_PORT == 465:
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ctx) as s:
+                s.login(SMTP_USERNAME, SMTP_PASSWORD)
+                s.send_message(msg)
+        else:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
+                s.starttls(context=ctx)
+                s.login(SMTP_USERNAME, SMTP_PASSWORD)
+                s.send_message(msg)
+        return True
+    except Exception as e:
+        print("SMTP error:", e)
+        return False
 
 # ---------- App / Lifespan / Static ----------
 def _get_static_dir():
@@ -140,6 +203,19 @@ def init_db(cur):
             expires_at TIMESTAMPTZ
         )
     """)
+    # Accounts for multi-auth
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS accounts (
+            user_id TEXT PRIMARY KEY,
+            provider TEXT NOT NULL,                -- 'discord' | 'google' | 'email'
+            external_id TEXT,                      -- discord id, google sub, or same as email
+            email TEXT UNIQUE,
+            password_hash TEXT,
+            reset_token TEXT,
+            reset_expires TIMESTAMPTZ
+        )
+    """)
+
     # referral
     cur.execute("""
         CREATE TABLE IF NOT EXISTS ref_names (
@@ -284,6 +360,8 @@ def apply_migrations(cur):
     cur.execute("ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS private_to TEXT")
     cur.execute("ALTER TABLE profiles ALTER COLUMN role SET DEFAULT 'member'")
     cur.execute("CREATE INDEX IF NOT EXISTS ix_announcements_times ON announcements((starts_at IS NULL), starts_at, (ends_at IS NULL), ends_at)")
+    cur.execute("CREATE INDEX IF NOT EXISTS ix_accounts_provider ON accounts(provider)")
+    cur.execute("CREATE INDEX IF NOT EXISTS ix_transfers_created_at ON transfers(created_at)")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -313,7 +391,7 @@ async def _canonical_host_redirect(request: Request, call_next):
     return await call_next(request)
 
 # ---------- Owner-only lock (site closed for everyone except OWNER) ----------
-OWNER_GATE_ALLOW = ("/login", "/callback", "/static/", "/img/", "/healthz", "/api/bot/status")
+OWNER_GATE_ALLOW = ("/login", "/callback", "/login/google", "/callback/google", "/reset", "/auth/", "/static/", "/img/", "/healthz", "/api/bot/status")
 
 @app.middleware("http")
 async def _owner_only_gate(request: Request, call_next):
@@ -356,7 +434,7 @@ async def _owner_only_gate(request: Request, call_next):
         <div class="card">
           <div class="title">GROWCB — Private Beta</div>
           <p class="muted">Access is closed for now. Only the owner can view the site.</p>
-          <a class="btn" href="/login">Login with Discord</a>
+          <a class="btn" href="/games">Back to site</a>
         </div>
       </div>
     </body></html>
@@ -449,6 +527,14 @@ def ensure_profile_row(cur, user_id: str):
         VALUES (%s,%s,%s,%s,FALSE)
         ON CONFLICT (user_id) DO NOTHING
     """, (user_id, default_name, default_name, role))
+
+@with_conn
+def ensure_account_row(cur, user_id: str, provider: str, external_id: Optional[str], email: Optional[str], password_hash: Optional[str] = None):
+    cur.execute("""
+        INSERT INTO accounts(user_id, provider, external_id, email, password_hash)
+        VALUES (%s,%s,%s,%s,%s)
+        ON CONFLICT (user_id) DO NOTHING
+    """, (user_id, provider, external_id, email, password_hash))
 
 @with_conn
 def get_profile_name(cur, user_id: str):
@@ -816,6 +902,7 @@ canvas{display:block;width:100%;height:100%}
         </div>
         <div>
           <div class="card" style="min-height:420px;display:grid;place-items:center">
+            <div id="
             <div id="mGrid" style="display:grid;gap:10px;grid-template-columns:repeat(5,64px)"></div>
           </div>
         </div>
@@ -996,6 +1083,73 @@ canvas{display:block;width:100%;height:100%}
   </div>
 </div>
 
+<!-- Login Modal (choose provider + email form) -->
+<div class="modal" id="loginModal">
+  <div class="box">
+    <div class="head"><div class="big">Log in</div><button class="btn gray" id="loginClose">Close</button></div>
+    <div class="card">
+      <div class="grid-2">
+        <div class="card">
+          <div class="label">Social</div>
+          <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
+            <a class="btn primary" href="/login">Login with Discord</a>
+            <a class="btn ghost" href="/login/google">Login with Google</a>
+          </div>
+          <div class="muted" style="margin-top:6px">You’ll come back here after you authorize.</div>
+        </div>
+        <div class="card">
+          <div class="label">Email</div>
+          <div class="field" style="margin-top:6px"><input id="emEmail" placeholder="you@example.com"/></div>
+          <div class="field" style="margin-top:6px"><input id="emPass" type="password" placeholder="Password (min 6)"/></div>
+          <div class="field" style="margin-top:6px"><input id="emUser" placeholder="Display name (for first-time)"/></div>
+          <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
+            <button class="btn primary" id="emLoginBtn">Login</button>
+            <button class="btn alt" id="emRegisterBtn">Register</button>
+            <button class="btn gray" id="emResetBtn" title="Send password reset email">Reset password</button>
+          </div>
+          <div id="emMsg" class="muted" style="margin-top:6px"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Deposit / Withdraw Modal -->
+<div class="modal" id="dwModal">
+  <div class="box">
+    <div class="head">
+      <div class="tabbar">
+        <div class="t active" id="dwActionDeposit">Deposit</div>
+        <div class="t" id="dwActionWithdraw">Withdraw</div>
+      </div>
+      <button class="btn gray" id="dwClose">Close</button>
+    </div>
+    <div class="card">
+      <div class="grid-2">
+        <div class="card">
+          <div class="label">World</div>
+          <input id="dwWorld" placeholder="Your GT world"/>
+          <div class="label" style="margin-top:8px">GrowID</div>
+          <input id="dwGrow" placeholder="Your GrowID"/>
+          <div class="label" style="margin-top:8px">Discord (optional)</div>
+          <div style="display:flex;gap:8px">
+            <input id="dwDiscord" placeholder="Your Discord handle"/>
+            <button class="btn ghost" id="dwUseMe">Use my Discord</button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="label">Withdraw Amount (DL)</div>
+          <input id="dwAmount" type="number" step="0.01" min="1" placeholder="e.g. 10.00"/>
+          <div class="muted" style="margin-top:6px">Amount is required for withdraws only.</div>
+        </div>
+      </div>
+      <div class="foot">
+        <button class="btn primary" id="dwSubmit">Submit Request</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script>
 const REF_BASE="__REF_BASE__";
 const OWNER_ID="__OWNER_ID__";
@@ -1092,7 +1246,7 @@ async function renderHeader(){
       <button class="btn primary" id="btnDW">Deposit / Withdraw</button>
       <button class="btn ghost" id="btnJoinSmall">${me.in_guild ? 'In Discord' : 'Join Discord'}</button>
       <span class="balance-chip" id="balChip">${bal ? dlHtml(bal.balance) : dlHtml(0)}</span>
-      <img class="avatar" id="avatarBtn" src="${me.avatar_url||''}" title="${me.username||'user'}"/>
+      <img class="avatar" id="avatarBtn" src="${me.avatar_url||'/img/GrowCBnobackground.png'}" title="${me.username||'user'}"/>
     `;
     qs('btnJoinSmall').onclick = joinDiscord;
     qs('btnDW').onclick = ()=> openDW();
@@ -1100,11 +1254,42 @@ async function renderHeader(){
   }else{
     area.innerHTML = `
       <button class="btn primary" id="btnDW">Deposit / Withdraw</button>
-      <a class="btn ghost" href="/login">Login with Discord</a>
+      <button class="btn ghost" id="btnLogin">Log in</button>
     `;
     qs('btnDW').onclick = ()=> openDW();
+    qs('btnLogin').onclick = ()=> openLogin();
   }
 }
+function openLogin(){ qs('loginModal').classList.add('open'); }
+qs('loginClose').onclick = ()=> qs('loginModal').classList.remove('open');
+
+/* Email auth actions */
+qs('emLoginBtn').onclick = async ()=>{
+  const email = (qs('emEmail').value||'').trim(), pwd = qs('emPass').value||'';
+  try{
+    await j('/auth/login', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ email, password: pwd })});
+    qs('emMsg').textContent = 'Logged in!';
+    qs('loginModal').classList.remove('open');
+    renderHeader();
+  }catch(e){ qs('emMsg').textContent = e.message; }
+};
+qs('emRegisterBtn').onclick = async ()=>{
+  const email = (qs('emEmail').value||'').trim(), pwd = qs('emPass').value||'', username = (qs('emUser').value||'').trim();
+  try{
+    await j('/auth/register', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ email, password: pwd, display_name: username })});
+    qs('emMsg').textContent = 'Registered & logged in!';
+    qs('loginModal').classList.remove('open');
+    renderHeader();
+  }catch(e){ qs('emMsg').textContent = e.message; }
+};
+qs('emResetBtn').onclick = async ()=>{
+  const email = (qs('emEmail').value||'').trim();
+  if(!email){ qs('emMsg').textContent = 'Enter your email first'; return; }
+  try{
+    await j('/auth/request_reset', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ email })});
+    qs('emMsg').textContent = 'If the email exists, a reset link was sent.';
+  }catch(e){ qs('emMsg').textContent = e.message; }
+};
 
 function acctTab(sel){
   const prof = qs('acctProfileView'); const set = qs('acctSettingsView');
@@ -1157,7 +1342,6 @@ function openDW(){
 }
 function setDWType(t){
   dwType = t;
-  // buttons are inside DW modal; safe to query lazily
   const dep = document.getElementById('dwActionDeposit');
   const wdr = document.getElementById('dwActionWithdraw');
   if(dep && wdr){
@@ -1201,7 +1385,7 @@ function drawCrash(mult){
   const maxT = Math.max(1.0, crBust);
   for(let x=0;x<w;x+=4){
     const t = x/w*maxT;
-    const m = Math.min(mult, 1.0 + 2*Math.pow(t,1.2)); // fake curve
+    const m = Math.min(mult, 1.0 + 2*Math.pow(t,1.2));
     const y = h - (h-8) * Math.min(m/Math.max(mult,1.01),1);
     crCtx.lineTo(x,y);
   }
@@ -1212,7 +1396,6 @@ function drawCrash(mult){
 async function openCrash(){
   qs('crMsg').textContent='';
   qs('crCashout').style.display='none';
-  // init canvas context safely
   crCanvas = qs('crCanvas');
   crCtx = crCanvas ? crCanvas.getContext('2d') : null;
   await pollCrash(true);
@@ -1240,7 +1423,6 @@ async function pollCrash(first=false){
       drawCrash(Number(st.bust||1.0));
     }
     qs('lastBusts').textContent = (st.last_busts||[]).map(x=> Number(x).toFixed(2)+'×').join(' • ') || '—';
-    // Your bet
     if(st.your_bet && st.phase==='running' && !st.your_bet.cashed_out){
       qs('crCashout').style.display='';
     }else{
@@ -1288,7 +1470,7 @@ function renderMinesGrid(st){
 }
 function updateMinesUI(){
   const st = mState; if(!st){ return; }
-  qs('mSetup').style.display = st.status==='active' ? 'none' : 'none'; // hidden after start
+  qs('mSetup').style.display = st.status==='active' ? 'none' : 'none';
   qs('mCash').style.display = (st.status==='active' ? '' : 'none');
   qs('mMult').textContent = (st.multiplier||1).toFixed(4)+'×';
   qs('mPotential').textContent = st.potential ? fmtDL(st.potential)+' DL' : '—';
@@ -1304,7 +1486,6 @@ async function refreshMines(){
     if(st && st.status){
       mState = st; updateMinesUI();
     }else{
-      // no active game — show setup
       qs('mSetup').style.display='';
       qs('mCash').style.display='none';
       qs('mGrid').innerHTML='';
@@ -1315,7 +1496,6 @@ async function refreshMines(){
       qs('mPicks').textContent='Picks: 0';
       qs('mBombs').textContent='Mines: ' + (qs('mMines').value||3);
     }
-    // history
     try{
       const h = await j('/api/mines/history');
       qs('mHist').innerHTML = (h.rows||[]).map(r=>`<div>${new Date(r.started_at).toLocaleString()} — bet ${fmtDL(r.bet)} • mines ${r.mines} • win ${fmtDL(r.win)}</div>`).join('') || '—';
@@ -1463,7 +1643,6 @@ async function pollChat(initial){
       body.appendChild(div);
     }
     if(rows.length>0) body.scrollTop = body.scrollHeight;
-    // Bind profile popup
     qsa('.user-link').forEach(u=>{
       if(u.dataset.bind) return;
       u.dataset.bind='1';
@@ -1541,12 +1720,9 @@ async function bindOwnerPanel(){
 
 /* Navigation wiring */
 function wireNav(){
-  // Tabs
   qsa('.tabs .tab').forEach(t=>{
     t.onclick = ()=> goto(t.getAttribute('data-path')||'/games');
   });
-
-  // Game tiles
   const bindCard = (id, path)=>{ const el = qs(id); if(el) el.onclick = ()=> goto(path); };
   bindCard('openCrash','/crash');
   bindCard('openMines','/mines');
@@ -1554,7 +1730,6 @@ function wireNav(){
   bindCard('openBlackjack','/blackjack');
   bindCard('openPump','/pump');
 
-  // Back buttons
   const bindBack = (id)=>{ const el = qs(id); if(el) el.onclick = ()=> goto('/games'); };
   bindBack('backToGames');
   bindBack('backToGames2');
@@ -1562,7 +1737,6 @@ function wireNav(){
   bindBack('backToGames_bj');
   bindBack('backToGames_pu');
 
-  // Header brand
   const home = qs('homeLink');
   if(home) home.onclick = (e)=>{ e.preventDefault(); goto('/games'); };
 }
@@ -1574,7 +1748,6 @@ function wireNav(){
     renderHeader();
     handleRoute();
     bindOwnerPanel();
-    // Try attach referral cookie after login
     try{
       const refCookie = (document.cookie.split('; ').find(x=> x.startsWith('refname='))||'').split('=').slice(1).join('=');
       if(refCookie){
@@ -1583,7 +1756,6 @@ function wireNav(){
       }
     }catch(_){}
   }finally{
-    // Hide preloader regardless of minor JS errors
     hidePreload();
   }
 })();
@@ -1645,7 +1817,7 @@ async def spa_paths(path_name: str):
         return await index_root()
     raise HTTPException(404, "Not found")
 
-# ---------- Leaderboard API (used by UI) ----------
+# ---------- Leaderboard API ----------
 @app.get("/api/leaderboard")
 async def api_leaderboard(period: str = Query("daily"), limit: int = Query(50, ge=1, le=200)):
     rows = get_leaderboard_rows_db(period, limit)
@@ -1655,7 +1827,7 @@ async def api_leaderboard(period: str = Query("daily"), limit: int = Query(50, g
 @app.get("/login")
 async def login():
     if not (CLIENT_ID and OAUTH_REDIRECT):
-        return HTMLResponse("OAuth not configured")
+        return HTMLResponse("Discord OAuth not configured")
     params = {
         "client_id": CLIENT_ID,
         "redirect_uri": OAUTH_REDIRECT,
@@ -1668,7 +1840,7 @@ async def login():
 @app.get("/callback")
 async def callback(request: Request, code: str):
     if not (CLIENT_ID and CLIENT_SECRET and OAUTH_REDIRECT):
-        return HTMLResponse("OAuth not configured")
+        return HTMLResponse("Discord OAuth not configured")
     async with httpx.AsyncClient(timeout=15) as cx:
         data = {
             "client_id": CLIENT_ID,
@@ -1682,11 +1854,10 @@ async def callback(request: Request, code: str):
             return HTMLResponse(f"OAuth failed: {r.text}", status_code=400)
         tok = r.json()
         access = tok.get("access_token")
-        async with httpx.AsyncClient(timeout=15) as cx2:
-            u = await cx2.get(f"{DISCORD_API}/users/@me", headers={"Authorization": f"Bearer {access}"})
-            if u.status_code != 200:
-                return HTMLResponse(f"User fetch failed: {u.text}", status_code=400)
-            me = u.json()
+        u = await cx.get(f"{DISCORD_API}/users/@me", headers={"Authorization": f"Bearer {access}"})
+        if u.status_code != 200:
+            return HTMLResponse(f"User fetch failed: {u.text}", status_code=400)
+        me = u.json()
 
     user_id = str(me["id"])
     username = f'{me.get("username","user")}#{me.get("discriminator","0")}'.replace("#0","")
@@ -1694,11 +1865,173 @@ async def callback(request: Request, code: str):
     avatar_url = f"https://cdn.discordapp.com/avatars/{user_id}/{avatar_hash}.png?size=128" if avatar_hash else "https://cdn.discordapp.com/embed/avatars/0.png"
 
     ensure_profile_row(user_id)
+    ensure_account_row(user_id, 'discord', user_id, None, None)
     save_tokens(user_id, tok.get("access_token",""), tok.get("refresh_token"), tok.get("expires_in"))
 
     resp = RedirectResponse("/games")
     _set_session(resp, {"id": user_id, "username": username, "avatar_url": avatar_url}, request)
     return resp
+
+# ---- Google OAuth ----
+@app.get("/login/google")
+async def login_google():
+    if not (GOOGLE_CLIENT_ID and GOOGLE_REDIRECT):
+        return HTMLResponse("Google OAuth not configured")
+    params = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": GOOGLE_REDIRECT,
+        "response_type": "code",
+        "scope": "openid email profile",
+        "access_type": "offline",
+        "prompt": "consent"
+    }
+    return RedirectResponse(f"https://accounts.google.com/o/oauth2/v2/auth?{urlencode(params)}")
+
+@app.get("/callback/google")
+async def callback_google(request: Request, code: str):
+    if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REDIRECT):
+        return HTMLResponse("Google OAuth not configured")
+    async with httpx.AsyncClient(timeout=15) as cx:
+        data = {
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "code": code,
+            "grant_type": "authorization_code",
+            "redirect_uri": GOOGLE_REDIRECT
+        }
+        r = await cx.post("https://oauth2.googleapis.com/token", data=data)
+        if r.status_code != 200:
+            return HTMLResponse(f"Google token failed: {r.text}", status_code=400)
+        tok = r.json()
+        at = tok.get("access_token")
+        u = await cx.get("https://www.googleapis.com/oauth2/v3/userinfo", headers={"Authorization": f"Bearer {at}"})
+        if u.status_code != 200:
+            return HTMLResponse(f"Google userinfo failed: {u.text}", status_code=400)
+        me = u.json()
+    sub = me.get("sub")
+    email = me.get("email")
+    user_id = f"g_{sub}"
+    username = me.get("name") or (email or "user")
+    avatar_url = me.get("picture") or "/img/GrowCBnobackground.png"
+
+    ensure_profile_row(user_id)
+    ensure_account_row(user_id, 'google', sub, email, None)
+
+    resp = RedirectResponse("/games")
+    _set_session(resp, {"id": user_id, "username": username, "avatar_url": avatar_url}, request)
+    return resp
+
+# ---- Email/password auth ----
+class EmailRegisterIn(BaseModel):
+    email: str
+    password: str
+    display_name: Optional[str] = None
+
+class EmailLoginIn(BaseModel):
+    email: str
+    password: str
+
+class ResetReqIn(BaseModel):
+    email: str
+
+class ResetApplyIn(BaseModel):
+    email: str
+    token: str
+    new_password: str
+
+def _normalize_email(e: str) -> str:
+    return (e or "").strip().lower()
+
+def _user_id_from_email(email: str) -> str:
+    digest = hashlib.sha256(_normalize_email(email).encode()).hexdigest()[:16]
+    return f"e_{digest}"
+
+@with_conn
+def _get_account_by_email(cur, email: str):
+    cur.execute("SELECT user_id, password_hash FROM accounts WHERE email=%s", (email,))
+    r = cur.fetchone()
+    return (r[0], r[1]) if r else (None, None)
+
+@app.post("/auth/register")
+async def auth_register(request: Request, body: EmailRegisterIn):
+    email = _normalize_email(body.email)
+    if not email or "@" not in email:
+        raise HTTPException(400, "Invalid email")
+    if not body.password or len(body.password) < 6:
+        raise HTTPException(400, "Password too short")
+    user_id, _ = _get_account_by_email(email)
+    if user_id:
+        raise HTTPException(400, "Email already registered")
+    user_id = _user_id_from_email(email)
+    display = (body.display_name or f"user_{user_id[-4:]}").strip()
+    ensure_profile_row(user_id)
+    ensure_account_row(user_id, 'email', email, email, _hash_password(body.password))
+    with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
+        cur.execute("UPDATE profiles SET display_name=%s, name_lower=%s WHERE user_id=%s", (display, display.lower(), user_id))
+        con.commit()
+    resp = RedirectResponse("/games")
+    _set_session(resp, {"id": user_id, "username": display, "avatar_url": "/img/GrowCBnobackground.png"}, request)
+    return resp
+
+@app.post("/auth/login")
+async def auth_login(request: Request, body: EmailLoginIn):
+    email = _normalize_email(body.email)
+    user_id, pwh = _get_account_by_email(email)
+    if not user_id or not pwh or not _verify_password(pwh, body.password):
+        raise HTTPException(401, "Invalid email or password")
+    name = get_profile_name(user_id) or f"user_{user_id[-4:]}"
+    resp = RedirectResponse("/games")
+    _set_session(resp, {"id": user_id, "username": name, "avatar_url": "/img/GrowCBnobackground.png"}, request)
+    return resp
+
+@app.post("/auth/request_reset")
+async def auth_request_reset(body: ResetReqIn):
+    email = _normalize_email(body.email)
+    user_id, _ = _get_account_by_email(email)
+    if not user_id:
+        # Do not reveal; pretend success
+        return {"ok": True}
+    token = secrets.token_urlsafe(32)
+    expires = now_utc() + datetime.timedelta(minutes=30)
+    with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
+        cur.execute("UPDATE accounts SET reset_token=%s, reset_expires=%s WHERE user_id=%s", (token, expires, user_id))
+        con.commit()
+    link = f"{RESET_LINK_BASE}?email={urlencode({'e':email})[2:]}&token={token}"
+    _send_email(email, "Reset your GROWCB password", f"Hi,\n\nClick to reset your password:\n{link}\n\nThis link expires in 30 minutes.\n")
+    return {"ok": True}
+
+@app.get("/reset", response_class=HTMLResponse)
+async def reset_form(email: str = Query(""), token: str = Query("")):
+    html = f"""
+    <!doctype html><meta charset="utf-8"/><title>Reset Password</title>
+    <style>body{{background:#0a0f1e;color:#eaf2ff;font-family:Inter,system-ui;display:grid;place-items:center;height:100vh;margin:0}}
+    .card{{background:#0f1a33;border:1px solid #1f2b47;border-radius:16px;padding:16px;width:min(480px,92vw)}}</style>
+    <div class="card">
+      <h2>Reset Password</h2>
+      <form method="post" action="/auth/reset">
+        <input type="hidden" name="email" value="{email}"/>
+        <input type="hidden" name="token" value="{token}"/>
+        <div>New password</div>
+        <input name="new_password" type="password" minlength="6" style="width:100%;padding:8px;margin:8px 0"/>
+        <button type="submit" style="padding:10px 14px;border-radius:10px">Set new password</button>
+      </form>
+    </div>
+    """
+    return HTMLResponse(html)
+
+@app.post("/auth/reset")
+async def auth_reset(email: str = Body(...), token: str = Body(...), new_password: str = Body(...)):
+    if not new_password or len(new_password) < 6:
+        raise HTTPException(400, "Password too short")
+    email = _normalize_email(email)
+    with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
+        cur.execute("SELECT user_id, reset_token, reset_expires FROM accounts WHERE email=%s", (email,))
+        r = cur.fetchone()
+        if not r or not r[1] or r[1] != token or not r[2] or r[2] < now_utc():
+            raise HTTPException(400, "Invalid or expired reset token")
+        cur.execute("UPDATE accounts SET password_hash=%s, reset_token=NULL, reset_expires=NULL WHERE user_id=%s", (_hash_password(new_password), r[0]))
+        con.commit()
+    return RedirectResponse("/games", status_code=303)
 
 @app.get("/logout")
 async def logout(request: Request):
@@ -1769,9 +2102,15 @@ async def guild_add_member(user_id: str, nickname: Optional[str] = None):
 # ---------- Me / Balance / Profiles ----------
 @app.get("/api/me")
 async def api_me(request: Request):
-    s = _require_session(request)
+    s = None
+    try:
+        s = _require_session(request)
+    except Exception:
+        pass
+    if not s:
+        return None
     in_guild = False
-    if DISCORD_BOT_TOKEN and GUILD_ID:
+    if DISCORD_BOT_TOKEN and GUILD_ID and str(s["id"]).isdigit():
         try:
             async with httpx.AsyncClient(timeout=8) as cx:
                 r = await cx.get(f"{DISCORD_API}/guilds/{GUILD_ID}/members/{s['id']}",
@@ -1779,7 +2118,7 @@ async def api_me(request: Request):
                 in_guild = (r.status_code == 200)
         except:
             in_guild = False
-    return {"id": s["id"], "username": s["username"], "avatar_url": s.get("avatar_url"), "in_guild": in_guild}
+    return {"id": s["id"], "username": s.get("username","user"), "avatar_url": s.get("avatar_url"), "in_guild": in_guild}
 
 @app.get("/api/balance")
 async def api_balance(request: Request):
@@ -1911,9 +2250,7 @@ async def api_promo_redeem(request: Request, body: PromoIn):
     if not code:
         raise HTTPException(400, "Enter a code")
     try:
-        # Delegate to promo module if available
         amt = redeem_promo(s["id"], code)
-        # If redeem_promo returns an amount, credit balance here
         if amt:
             new_bal = adjust_balance(s["id"], s["id"], amt, f"promo:{code}")
             return {"ok": True, "win": float(q2(D(amt))), "balance": float(new_bal)}
@@ -1944,7 +2281,6 @@ def _is_timed_out(cur, user_id: str) -> Optional[datetime.datetime]:
     until = r[0]
     if until and until > now_utc():
         return until
-    # expired — cleanup
     cur.execute("DELETE FROM chat_timeouts WHERE user_id=%s", (user_id,))
     return None
 
@@ -1984,7 +2320,6 @@ async def api_chat_send(request: Request, body: ChatSendIn):
     if (info.get("level") or 1) < 5:
         raise HTTPException(403, "Level 5+ required to chat")
     with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
-        # Check timeout
         if _is_timed_out(cur, s["id"]):
             raise HTTPException(403, "You're temporarily muted")
         cur.execute("""
@@ -2006,7 +2341,19 @@ async def api_discord_join(request: Request):
     res = await guild_add_member(s["id"], nick)
     return res or {"ok": True}
 
-# ---------- Transfers (deposit / withdraw placeholders) ----------
+# ---------- Discord channel notify ----------
+async def discord_send(channel_id: int, content: str):
+    if not (DISCORD_BOT_TOKEN and channel_id):
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10) as cx:
+            await cx.post(f"{DISCORD_API}/channels/{channel_id}/messages",
+                          headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"},
+                          json={"content": content})
+    except Exception as e:
+        print("Discord send error:", e)
+
+# ---------- Transfers ----------
 class TransferIn(BaseModel):
     ttype: str
     amount: Optional[str] = None
@@ -2033,7 +2380,6 @@ async def api_transfer_create(request: Request, body: TransferIn):
             raise HTTPException(400, "Invalid amount")
         if amt <= 0:
             raise HTTPException(400, "Amount must be positive")
-        # lock funds
         bal = get_balance(s["id"])
         if bal < amt:
             raise HTTPException(400, "Insufficient balance")
@@ -2045,6 +2391,14 @@ async def api_transfer_create(request: Request, body: TransferIn):
         """, (s["id"], ttype, amt, world, grow_id))
         new_id = cur.fetchone()[0]
         con.commit()
+    # notify Discord
+    try:
+        if ttype == "deposit" and DEPOSIT_CHANNEL_ID:
+            await discord_send(DEPOSIT_CHANNEL_ID, f"💰 **Deposit** request #{new_id} by `{s['id']}` — World: **{world}**, GrowID: **{grow_id}**")
+        if ttype == "withdraw" and WITHDRAW_CHANNEL_ID:
+            await discord_send(WITHDRAW_CHANNEL_ID, f"🏧 **Withdraw** request #{new_id} by `{s['id']}` — Amount: **{fmtDL(amt)} DL**, World: **{world}**, GrowID: **{grow_id}**")
+    except Exception as e:
+        print("notify err:", e)
     return {"ok": True, "id": int(new_id)}
 
 # ---------- Crash endpoints ----------
@@ -2054,39 +2408,29 @@ class CrashPlaceIn(BaseModel):
 
 @app.get("/api/crash/state")
 async def api_crash_state(request: Request):
-    # current round & phase
     try:
         state = load_round()
     except Exception as e:
         raise HTTPException(500, f"Crash unavailable: {e}")
-    phase = state.get("status")  # 'betting' | 'running' | 'ended'
+    phase = state.get("status")
     resp = {"phase": phase}
     if phase == "running":
-        try:
-            resp["current_multiplier"] = float(current_multiplier())
-        except Exception:
-            resp["current_multiplier"] = 1.0
+        try: resp["current_multiplier"] = float(current_multiplier())
+        except Exception: resp["current_multiplier"] = 1.0
     if phase in ("ended","running"):
-        try:
-            resp["bust"] = float(state.get("bust") or 1.0)
-        except Exception:
-            resp["bust"] = 1.0
+        try: resp["bust"] = float(state.get("bust") or 1.0)
+        except Exception: resp["bust"] = 1.0
     try:
         resp["last_busts"] = [float(x) for x in last_busts(8)]
     except Exception:
         resp["last_busts"] = []
-    # user bet (if any)
     try:
-        # session is optional for viewing
         s = None
-        try:
-            s = _require_session(request)
-        except Exception:
-            s = None
+        try: s = _require_session(request)
+        except Exception: s = None
         if s:
             yb = your_bet(s["id"])
-            if yb:
-                resp["your_bet"] = yb
+            if yb: resp["your_bet"] = yb
     except Exception:
         pass
     return resp
@@ -2150,7 +2494,9 @@ async def api_mines_start(request: Request, body: MinesStartIn):
         raise HTTPException(400, f"Bet must be between {MIN_BET} and {MAX_BET}")
     mines = int(body.mines or 3)
     if not (1 <= mines <= 24):
-        raise HTTPException(400, "Mines must be 1–24")
+        raise HTTPException(400, "Mines
+    if not (1 <= mines <= 24):
+        raise HTTPException(400, "Mines must be between 1 and 24")
     try:
         st = mines_start(s["id"], bet, mines)
         return st
@@ -2158,10 +2504,10 @@ async def api_mines_start(request: Request, body: MinesStartIn):
         raise HTTPException(400, str(e))
 
 @app.post("/api/mines/pick")
-async def api_mines_pick(request: Request, index: int):
+async def api_mines_pick(request: Request, index: int = Query(..., ge=0, le=24)):
     s = _require_session(request)
     try:
-        st = mines_pick(s["id"], int(index))
+        st = mines_pick(s["id"], index)
         return st
     except Exception as e:
         raise HTTPException(400, str(e))
@@ -2184,222 +2530,156 @@ async def api_mines_history(request: Request):
     except Exception:
         return {"rows": []}
 
-# ---------- Admin ----------
-class AdjustIn(BaseModel):
-    identifier: str
-    amount: str
-    reason: Optional[str] = None
+# ---------- Admin helpers / endpoints ----------
 
-class RoleIn(BaseModel):
-    identifier: str
-    role: str
+def fmtDL(x) -> str:
+    """Format an amount as 2dp string safely even for Decimals."""
+    try:
+        return format(q2(D(x)), ".2f")
+    except Exception:
+        return "0.00"
 
-class AnnIn(BaseModel):
-    text: str
-    minutes: Optional[int] = 360
-
-def _require_role(request: Request, min_role: str):
+def _require_role(request: Request, min_role: str) -> Tuple[dict, dict]:
+    """Ensure the calling user has at least min_role; returns (session, profile_info)."""
     s = _require_session(request)
-    info = profile_info(s["id"])
-    if _role_rank(info.get("role")) < _role_rank(min_role):
-        raise HTTPException(403, "Insufficient role")
-    return s, info
+    prof = profile_info(s["id"])
+    if _role_rank(prof.get("role") or "member") < _role_rank(min_role):
+        raise HTTPException(403, "Insufficient permissions")
+    return s, prof
 
 @with_conn
-def _resolve_user_id(cur, identifier: str) -> Optional[str]:
-    ident = (identifier or "").strip()
-    if not ident:
+def _resolve_identifier(cur, identifier: str) -> Optional[str]:
+    """
+    Accepts:
+      - raw user id (e_*, g_* or discord numeric id)
+      - discord mention like <@123456789> or <@!123456789>
+      - exact referral/profile handle (name_lower)
+    Returns user_id or None.
+    """
+    if not identifier:
         return None
-    # mention
-    m = re.match(r"^<@!?(\d+)>$", ident)
+    ident = identifier.strip()
+
+    # Discord mention
+    m = re.match(r"^<@!?(?P<id>\d+)>$", ident)
     if m:
-        return m.group(1)
-    # numeric id
-    if ident.isdigit():
+        return m.group("id")
+
+    # If looks like a user id we already store
+    if re.fullmatch(r"(e|g)_[0-9a-f]{16}", ident) or re.fullmatch(r"\d{5,20}", ident):
         return ident
-    # leading @
-    if ident.startswith("@"):
-        ident = ident[1:]
+
+    # Otherwise, treat as handle
     lower = ident.lower()
     cur.execute("SELECT user_id FROM profiles WHERE name_lower=%s", (lower,))
     r = cur.fetchone()
     return str(r[0]) if r else None
 
+class AdminAdjustIn(BaseModel):
+    identifier: str
+    amount: str
+    reason: Optional[str] = None
+
 @app.post("/api/admin/adjust")
-async def api_admin_adjust(request: Request, body: AdjustIn):
-    s, info = _require_role(request, "admin")
+async def api_admin_adjust(request: Request, body: AdminAdjustIn):
+    # Admins and owners only
+    s, prof = _require_role(request, "admin")
     with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
-        target = _resolve_user_id(cur, body.identifier)
+        target = _resolve_identifier(cur, body.identifier)
     if not target:
-        raise HTTPException(400, "User not found")
+        raise HTTPException(404, "Target user not found")
     try:
         amt = q2(D(body.amount))
     except Exception:
         raise HTTPException(400, "Invalid amount")
-    new_bal = adjust_balance(s["id"], target, amt, body.reason or "admin adjust")
-    return {"ok": True, "target": target, "new_balance": float(new_bal)}
+
+    new_bal = adjust_balance(s["id"], target, amt, body.reason or "admin-adjust")
+    return {"ok": True, "target_id": target, "new_balance": float(new_bal)}
+
+class AdminRoleIn(BaseModel):
+    identifier: str
+    role: str
 
 @app.post("/api/admin/role")
-async def api_admin_role(request: Request, body: RoleIn):
-    s, info = _require_role(request, "owner")
+async def api_admin_role(request: Request, body: AdminRoleIn):
+    # Owner only
+    s, prof = _require_role(request, "owner")
     with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
-        target = _resolve_user_id(cur, body.identifier)
+        target = _resolve_identifier(cur, body.identifier)
     if not target:
-        raise HTTPException(400, "User not found")
-    return set_role(target, body.role)
+        raise HTTPException(404, "Target user not found")
+    try:
+        res = set_role(target, body.role)
+        return res
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+class AdminAnnounceIn(BaseModel):
+    text: str
+    minutes: Optional[int] = 120
+
+@with_conn
+def _create_announcement(cur, creator_id: str, text: str, minutes: int):
+    starts = now_utc()
+    ends = starts + datetime.timedelta(minutes=max(1, int(minutes or 0)))
+    cur.execute(
+        "INSERT INTO announcements(text, starts_at, ends_at, created_by) VALUES (%s,%s,%s,%s) RETURNING id",
+        (text, starts, ends, creator_id),
+    )
+    new_id = cur.fetchone()[0]
+    return {"ok": True, "id": int(new_id)}
 
 @app.post("/api/admin/announce")
-async def api_admin_announce(request: Request, body: AnnIn):
-    s, info = _require_role(request, "admin")
-    txt = (body.text or "").strip()
-    if not txt:
+async def api_admin_announce(request: Request, body: AdminAnnounceIn):
+    # Admins and owners can post announcements
+    s, _ = _require_role(request, "admin")
+    if not (body.text or "").strip():
         raise HTTPException(400, "Text required")
-    minutes = max(1, min(7*24*60, int(body.minutes or 360)))
-    starts = now_utc()
-    ends = starts + datetime.timedelta(minutes=minutes)
-    with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
-        cur.execute("INSERT INTO announcements(text, starts_at, ends_at, created_by) VALUES (%s,%s,%s,%s) RETURNING id",
-                    (txt, starts, ends, s["id"]))
-        new_id = cur.fetchone()[0]
-        con.commit()
-    return {"ok": True, "id": int(new_id)}
+    return _create_announcement(s["id"], body.text.strip(), int(body.minutes or 120))
+
+# ---------- Announcements (public) ----------
+
+@with_conn
+def _active_announcements(cur):
+    now = now_utc()
+    cur.execute(
+        """
+        SELECT id, text, starts_at, ends_at
+        FROM announcements
+        WHERE (starts_at IS NULL OR starts_at <= %s)
+          AND (ends_at IS NULL OR ends_at >= %s)
+        ORDER BY COALESCE(starts_at, CURRENT_TIMESTAMP) DESC, id DESC
+        LIMIT 10
+        """,
+        (now, now),
+    )
+    return [
+        {"id": int(r[0]), "text": r[1], "starts_at": iso(r[2]), "ends_at": iso(r[3])}
+        for r in cur.fetchall()
+    ]
 
 @app.get("/api/announcements/active")
 async def api_ann_active():
-    now = now_utc()
-    with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
-        cur.execute("""
-            SELECT id, text, starts_at, ends_at
-            FROM announcements
-            WHERE (starts_at IS NULL OR starts_at <= %s)
-              AND (ends_at IS NULL OR ends_at > %s)
-            ORDER BY starts_at DESC NULLS LAST, id DESC
-            LIMIT 10
-        """, (now, now))
-        rows = [{
-            "id": int(r[0]), "text": r[1],
-            "starts_at": r[2].isoformat() if r[2] else None,
-            "ends_at": r[3].isoformat() if r[3] else None
-        } for r in cur.fetchall()]
-    return {"rows": rows}
+    return {"rows": _active_announcements()}
 
-# ---------- Inject missing Deposit/Withdraw modal into HTML ----------
-DW_SNIPPET = r"""
-<!-- Deposit / Withdraw Modal -->
-<div class="modal" id="dwModal">
-  <div class="box">
-    <div class="head">
-      <div class="tabbar">
-        <div class="t active" id="dwActionDeposit">Deposit</div>
-        <div class="t" id="dwActionWithdraw">Withdraw</div>
-      </div>
-      <button class="btn gray" id="dwClose">Close</button>
-    </div>
-    <div class="card">
-      <div class="grid-2">
-        <div class="card">
-          <div class="label">World</div>
-          <input id="dwWorld" placeholder="Your GT world"/>
-          <div class="label" style="margin-top:8px">GrowID</div>
-          <input id="dwGrow" placeholder="Your GrowID"/>
-          <div class="label" style="margin-top:8px">Discord (optional)</div>
-          <div style="display:flex;gap:8px">
-            <input id="dwDiscord" placeholder="Your Discord handle"/>
-            <button class="btn ghost" id="dwUseMe">Use my Discord</button>
-          </div>
-        </div>
-        <div class="card">
-          <div class="label">Withdraw Amount (DL)</div>
-          <input id="dwAmount" type="number" step="0.01" min="1" placeholder="e.g. 10.00"/>
-          <div class="muted" style="margin-top:6px">Amount is required for withdraws only.</div>
-        </div>
-      </div>
-      <div class="foot">
-        <button class="btn primary" id="dwSubmit">Submit Request</button>
-      </div>
-    </div>
-  </div>
-</div>
-"""
-# Insert right before Profile Modal so JS hooks exist
-HTML_TEMPLATE = HTML_TEMPLATE.replace("<!-- Profile Modal -->", DW_SNIPPET + "\n\n<!-- Profile Modal -->")
-
-# ---------- Discord bot runner (optional) ----------
-# Starts a minimal Discord client so the bot shows as online.
-# Safe to disable with START_DISCORD_BOT=0.
-_bot_info = {"online": False, "last_ready": None, "error": None}
-
-def _start_discord_bot_if_configured():
-    if not START_DISCORD_BOT:
-        _bot_info["error"] = "Disabled by START_DISCORD_BOT=0"
-        return
-    if not DISCORD_BOT_TOKEN:
-        _bot_info["error"] = "DISCORD_BOT_TOKEN not set"
-        return
-    try:
-        import threading, asyncio as _asyncio
-        import discord  # discord.py 2.x
-    except Exception as e:
-        _bot_info["error"] = f"discord.py not available: {e}"
-        return
-
-    def runner():
-        loop = _asyncio.new_event_loop()
-        _asyncio.set_event_loop(loop)
-        intents = discord.Intents.none()
-        intents.guilds = True
-        client = discord.Client(intents=intents)
-
-        @client.event
-        async def on_ready():
-            _bot_info["online"] = True
-            _bot_info["last_ready"] = iso(now_utc())
-            try:
-                await client.change_presence(activity=discord.Game(name="GROWCB"))
-            except Exception:
-                pass
-
-        @client.event
-        async def on_disconnect():
-            _bot_info["online"] = False
-
-        try:
-            loop.run_until_complete(client.start(DISCORD_BOT_TOKEN))
-        except Exception as e:
-            _bot_info["error"] = f"bot error: {e}"
-            _bot_info["online"] = False
-        finally:
-            try:
-                loop.run_until_complete(client.close())
-            except Exception:
-                pass
-            loop.stop()
-            loop.close()
-
-    th = threading.Thread(target=runner, name="discord-bot", daemon=True)
-    th.start()
+# ---------- Bot status (for health / gating) ----------
 
 @app.get("/api/bot/status")
 async def api_bot_status():
     return {
-        "online": bool(_bot_info.get("online")),
-        "last_ready": _bot_info.get("last_ready"),
-        "error": _bot_info.get("error"),
-        "configured": bool(DISCORD_BOT_TOKEN),
+        "ok": True,
+        "configured": bool(DISCORD_BOT_TOKEN and GUILD_ID),
         "guild_id": int(GUILD_ID or 0),
+        "start_flag": bool(START_DISCORD_BOT),
     }
 
-# Start the bot when the module is imported by a server (e.g., uvicorn)
-try:
-    _start_discord_bot_if_configured()
-except Exception as _e:
-    _bot_info["error"] = f"startup error: {_e}"
-
-# ---------- Run ----------
+# ---------- Uvicorn entrypoint ----------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=PORT, reload=RELOAD)
-
-
-
-
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=PORT,
+        reload=RELOAD,
+        log_level="info",
+    )

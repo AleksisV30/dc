@@ -1193,6 +1193,409 @@ qs('dwSubmit').onclick = async ()=>{
   if(!payload.world){ toast('World is required.', 'error', 'Missing'); return; }
   if(!payload.grow_id){ toast('GrowID is required.', 'error', 'Missing'); return; }
   try{
+    const r = await j('/api/transfer/create', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+    toast(`Request #${r.id} submitted`, 'success', 'Submitted');
+    qs('dwModal').classList.remove('open');
+  }catch(e){ toast(e.message,'error','Transfer'); }
+};
+
+/* Crash logic */
+let crPoll=null, crCanvas=null, crCtx=null, crStart=null, crEnd=null, crBust=1.0;
+function drawCrash(mult){
+  if(!crCtx) return;
+  const w = crCanvas.width = crCanvas.clientWidth;
+  const h = crCanvas.height = crCanvas.clientHeight;
+  crCtx.clearRect(0,0,w,h);
+  crCtx.beginPath();
+  crCtx.moveTo(0,h-2);
+  const maxT = Math.max(1.0, crBust);
+  for(let x=0;x<w;x+=4){
+    const t = x/w*maxT;
+    const m = Math.min(mult, 1.0 + 2*Math.pow(t,1.2)); // fake curve
+    const y = h - (h-8) * Math.min(m/Math.max(mult,1.01),1);
+    crCtx.lineTo(x,y);
+  }
+  crCtx.strokeStyle = '#6aa6ff';
+  crCtx.lineWidth = 2;
+  crCtx.stroke();
+}
+async function openCrash(){
+  qs('crMsg').textContent='';
+  qs('crCashout').style.display='none';
+  await pollCrash(true);
+  if(crPoll) clearInterval(crPoll);
+  crPoll = setInterval(()=> pollCrash(false), 900);
+}
+async function pollCrash(first=false){
+  try{
+    const st = await j('/api/crash/state');
+    const nowEl = qs('crNow'); const hintEl = qs('crHint');
+    crBust = Number(st.bust||1.0);
+    if(st.phase==='betting'){
+      nowEl.textContent = '1.00×';
+      hintEl.textContent = 'Place your bets…';
+      drawCrash(1.0);
+    }else if(st.phase==='running'){
+      const m = Number(st.current_multiplier||1.0).toFixed(2);
+      nowEl.textContent = `${m}×`;
+      hintEl.textContent = 'Running… cash out anytime!';
+      drawCrash(Number(st.current_multiplier||1.0));
+    }else if(st.phase==='ended'){
+      nowEl.textContent = `${Number(st.bust||1).toFixed(2)}×`;
+      hintEl.textContent = 'Round ended. Next round starting…';
+      drawCrash(Number(st.bust||1.0));
+    }
+    qs('lastBusts').textContent = (st.last_busts||[]).map(x=> Number(x).toFixed(2)+'×').join(' • ') || '—';
+    // Your bet
+    if(st.your_bet && st.phase==='running' && !st.your_bet.cashed_out){
+      qs('crCashout').style.display='';
+    }else{
+      qs('crCashout').style.display='none';
+    }
+  }catch(e){
+    if(first) toast(e.message,'error','Crash');
+  }
+}
+qs('crPlace').onclick = async ()=>{
+  try{
+    const bet = String(qs('crBet').value||'');
+    const cash = qs('crCash').value ? Number(qs('crCash').value) : null;
+    const r = await j('/api/crash/place', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ bet, cashout: cash }) });
+    toast('Bet placed','success','Crash');
+    qs('crMsg').textContent = `Bet: ${fmtDL(r.bet)} DL  •  Auto: ${Number(r.cashout).toFixed(2)}×`;
+    renderHeader();
+  }catch(e){ toast(e.message,'error','Crash'); }
+};
+qs('crCashout').onclick = async ()=>{
+  try{ const r = await j('/api/crash/cashout', { method:'POST' }); toast(`Cashed out at ${Number(r.cashed_out).toFixed(2)}× (+${fmtDL(r.win)} DL)`, 'success', 'Crash'); renderHeader(); }
+  catch(e){ toast(e.message,'error','Crash'); }
+};
+async function loadCrashHistory(){
+  try{
+    const r = await j('/api/crash/history'); 
+    qs('crLast').innerHTML = (r.rows||[]).map(g=>`<div>${new Date(g.created_at).toLocaleString()} — bet ${fmtDL(g.bet)} • bust ${Number(g.bust).toFixed(2)}× • win ${fmtDL(g.win)}</div>`).join('') || '—';
+  }catch(_){ qs('crLast').textContent='—'; }
+}
+
+/* Mines logic */
+let mState=null;
+function renderMinesGrid(st){
+  const grid = qs('mGrid'); grid.innerHTML='';
+  const picks = st.picks||0;
+  for(let i=0;i<25;i++){
+    const b = document.createElement('button');
+    b.className='btn gray';
+    b.style.width='64px'; b.style.height='64px';
+    b.textContent = (st.revealed && st.revealed[i]===1) ? '💎' : (st.revealed && st.revealed[i]===-1) ? '💣' : (picks & (1n<<BigInt(i))) ? '•' : '';
+    b.disabled = !!st.ended || (st.revealed && (st.revealed[i]!==0));
+    b.onclick = async ()=>{ try{ const r = await j('/api/mines/pick?index='+i,{method:'POST'}); mState=r; updateMinesUI(); }catch(e){ toast(e.message,'error','Mines'); } };
+    grid.appendChild(b);
+  }
+}
+function updateMinesUI(){
+  const st = mState; if(!st){ return; }
+  qs('mSetup').style.display = st.status==='active' ? 'none' : 'none'; // keep hidden after start
+  qs('mCash').style.display = (st.status==='active' ? '' : 'none');
+  qs('mMult').textContent = (st.multiplier||1).toFixed(4)+'×';
+  qs('mPotential').textContent = st.potential ? fmtDL(st.potential)+' DL' : '—';
+  qs('mHash').textContent = 'Commit: ' + (st.commit_hash||'—');
+  qs('mStatus').textContent = 'Status: ' + (st.status||'—');
+  qs('mPicks').textContent = 'Picks: ' + (st.pick_count||0);
+  qs('mBombs').textContent = 'Mines: ' + (st.mines||0);
+  renderMinesGrid(st);
+}
+async function refreshMines(){
+  try{
+    const st = await j('/api/mines/state'); 
+    if(st && st.status){
+      mState = st; updateMinesUI();
+    }else{
+      // no active game — show setup
+      qs('mSetup').style.display='';
+      qs('mCash').style.display='none';
+      qs('mGrid').innerHTML='';
+      qs('mMult').textContent='1.0000×';
+      qs('mPotential').textContent='—';
+      qs('mHash').textContent='Commit: —';
+      qs('mStatus').textContent='Status: —';
+      qs('mPicks').textContent='Picks: 0';
+      qs('mBombs').textContent='Mines: ' + (qs('mMines').value||3);
+    }
+    // history
+    try{
+      const h = await j('/api/mines/history');
+      qs('mHist').innerHTML = (h.rows||[]).map(r=>`<div>${new Date(r.started_at).toLocaleString()} — bet ${fmtDL(r.bet)} • mines ${r.mines} • win ${fmtDL(r.win)}</div>`).join('') || '—';
+    }catch(_){}
+  }catch(e){ toast(e.message,'error','Mines'); }
+}
+qs('mStart').onclick = async ()=>{
+  try{
+    const bet = String(qs('mBet').value||'');
+    const mines = parseInt(qs('mMines').value||'3',10);
+    const st = await j('/api/mines/start', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ bet, mines }) });
+    mState = st; updateMinesUI(); toast('Game started!','success','Mines');
+    renderHeader();
+  }catch(e){ toast(e.message,'error','Mines'); }
+};
+qs('mCash').onclick = async ()=>{
+  try{ const r = await j('/api/mines/cashout',{method:'POST'}); toast(`Cashed out +${fmtDL(r.win)} DL`, 'success', 'Mines'); mState=r; updateMinesUI(); renderHeader(); }
+  catch(e){ toast(e.message,'error','Mines'); }
+};
+
+/* Referral */
+function refLinkFrom(name){
+  const host = location.origin.replace(/\/$/,'');
+  return `${REF_BASE.replace(/\/$/,'')}/${encodeURIComponent(name||'')}`;
+}
+async function loadReferral(){
+  try{
+    const r = await j('/api/referral/state');
+    const name = r.name || '';
+    qs('refName').value = name;
+    qs('refClicks').textContent = r.clicks||0;
+    qs('refJoins').textContent = r.joined||0;
+    qs('refLink').value = name ? refLinkFrom(name) : '';
+    qs('copyRef').onclick = ()=>{
+            if(!qs('refLink').value){ toast('Set a handle first','error','Referral'); return; }
+      navigator.clipboard.writeText(qs('refLink').value).then(()=> toast('Link copied!','success','Referral'));
+    };
+    qs('refSave').onclick = async ()=>{
+      const name = (qs('refName').value||'').trim();
+      if(!name){ toast('Enter a handle','error','Referral'); return; }
+      try{
+        const r = await j('/api/referral/set',{ method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ name }) });
+        qs('refLink').value = refLinkFrom(r.name||name);
+        toast('Saved','success','Referral');
+      }catch(e){
+        qs('refMsg').textContent = e.message || 'Could not save';
+        toast(e.message,'error','Referral');
+      }
+    };
+  }catch(e){
+    toast(e.message || 'Referral unavailable','error','Referral');
+  }
+}
+
+/* Promo Codes */
+async function renderPromo(){
+  try{
+    const list = await j('/api/promo/my').catch(()=>({rows:[]}));
+    const rows = (list.rows||[]).map(r=>`<div>${r.code} — ${new Date(r.redeemed_at).toLocaleString()}</div>`).join('') || '—';
+    qs('myCodes').innerHTML = rows;
+  }catch(_){}
+  const btn = qs('redeemBtn');
+  btn.onclick = async ()=>{
+    const code = (qs('promoInput').value||'').trim();
+    if(!code){ toast('Enter a code','error','Promo'); return; }
+    try{
+      const res = await j('/api/promo/redeem', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ code })});
+      toast('Code redeemed!','success','Promo');
+      renderHeader();
+      renderPromo();
+    }catch(e){
+      qs('promoMsg').textContent = e.message || 'Invalid code';
+      toast(e.message,'error','Promo');
+    }
+  };
+}
+
+/* Leaderboard */
+let lbPeriod='daily';
+function lbResetText(period){
+  const now = new Date();
+  if(period==='daily'){
+    const nxt = new Date(now); nxt.setUTCHours(24,0,0,0);
+    const ms = (+nxt) - (+now);
+    const h = Math.floor(ms/3600000), m = Math.floor((ms%3600000)/60000);
+    return `Resets in ${h}h ${m}m`;
+  }
+  if(period==='monthly'){
+    const nxt = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth()+1, 1, 0,0,0,0));
+    const ms = (+nxt) - (+now);
+    const d = Math.floor(ms/86400000), h = Math.floor((ms%86400000)/3600000);
+    return `Resets in ${d}d ${h}h`;
+  }
+  return 'All-time';
+}
+async function refreshLeaderboard(){
+  try{
+    const r = await j('/api/leaderboard?period='+encodeURIComponent(lbPeriod));
+    const rows = (r.rows||[]);
+    qs('lbWrap').innerHTML = rows.map((r,i)=>{
+      const name = r.is_anon ? 'Anonymous' : r.display_name;
+      const amt = r.is_anon ? '—' : fmtDL(r.total_wagered) + ' DL';
+      return `<div style="display:flex;gap:10px;align-items:center;padding:8px 0;border-bottom:1px solid var(--border)">
+        <div style="width:28px;text-align:right;font-weight:800">${i+1}.</div>
+        <div style="flex:1">${name}</div>
+        <div style="font-weight:900">${amt}</div>
+      </div>`;
+    }).join('') || '—';
+    qs('lbCountdown').textContent = lbResetText(lbPeriod);
+  }catch(e){ qs('lbWrap').textContent = e.message || 'Error'; }
+  const seg = qs('lbSeg');
+  qsa('#lbSeg button').forEach(b=>{
+    b.onclick = ()=>{ qsa('#lbSeg button').forEach(x=>x.classList.remove('active')); b.classList.add('active'); lbPeriod = b.dataset.period; refreshLeaderboard(); };
+  });
+}
+
+/* Chat */
+let chatOpen=false, chatPoll=null, chatLast=0;
+function toggleChat(open){
+  chatOpen=open;
+  qs('chatDrawer').classList.toggle('open', open);
+  if(open){
+    pollChat(true);
+    if(chatPoll) clearInterval(chatPoll);
+    chatPoll = setInterval(()=> pollChat(false), 2500);
+  }else{
+    if(chatPoll) clearInterval(chatPoll);
+  }
+}
+async function pollChat(initial){
+  try{
+    const r = await j('/api/chat/fetch?since='+chatLast+'&limit=50');
+    const rows = r.rows||[];
+    const body = qs('chatBody');
+    for(const m of rows){
+      chatLast = Math.max(chatLast, m.id||0);
+      const div = document.createElement('div');
+      const roleClass = 'role-'+(m.role||'member');
+      const badge = `<span class="badge ${m.role||'member'}">${m.role||'member'}</span>`;
+      const lvl = `<span class="level">Lv ${m.level||1}</span>`;
+      const user = `<span class="user-link" data-user="${m.user_id}">${(m.username||'user')}</span>`;
+      div.className = 'msg '+roleClass;
+      div.innerHTML = `<div class="msghead">${user} ${lvl} ${badge}<span class="time">${new Date(m.created_at).toLocaleTimeString()}</span></div>
+        <div class="txt"></div>`;
+      div.querySelector('.txt').innerText = m.text||'';
+      body.appendChild(div);
+    }
+    if(rows.length>0) body.scrollTop = body.scrollHeight;
+    // Bind profile popup
+    qsa('.user-link').forEach(u=>{
+      if(u.dataset.bind) return;
+      u.dataset.bind='1';
+      u.onclick = ()=> openProfile(u.dataset.user);
+    });
+  }catch(_){}
+}
+async function openProfile(user_id){
+  qs('pmBody').textContent='Loading…';
+  qs('profileModal').classList.add('open');
+  try{
+    const p = await j('/api/profile/public?user_id='+encodeURIComponent(user_id));
+    const body = `
+      <div class="games-grid" style="grid-template-columns:1fr 1fr 1fr">
+        <div class="card"><div class="label">Level</div><div class="big">Lv ${p.level||1}</div><div class="muted">${p.xp||0} XP</div></div>
+        <div class="card"><div class="label">Balance</div><div class="big">${fmtDL(p.balance||0)} DL</div></div>
+        <div class="card"><div class="label">Role</div><div class="big">${p.role||'member'}</div></div>
+      </div>
+      <div class="sep"></div>
+      <div class="muted">Crash games: ${p.crash_games||0} • Mines games: ${p.mines_games||0}</div>
+    `;
+    qs('pmTitle').textContent = p.name || 'Player';
+    qs('pmBody').innerHTML = body;
+  }catch(e){
+    qs('pmBody').textContent = e.message || 'Error';
+  }
+}
+qs('pmClose').onclick = ()=> qs('profileModal').classList.remove('open');
+
+qs('fabChat').onclick = ()=> toggleChat(true);
+qs('chatClose').onclick = ()=> toggleChat(false);
+qs('chatText').addEventListener('keydown', e=>{ if(e.key==='Enter') qs('chatSend').click(); });
+qs('chatSend').onclick = async ()=>{
+  const t = (qs('chatText').value||'').trim();
+  if(!t) return;
+  try{
+    await j('/api/chat/send',{ method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ text: t })});
+    qs('chatText').value='';
+    pollChat(false);
+  }catch(e){ toast(e.message || 'Could not send','error','Chat'); }
+};
+
+/* Owner panel controls */
+async function bindOwnerPanel(){
+  const op = qs('page-owner');
+  if(!op) return;
+  const a = id=> op.querySelector('#'+id);
+  a('opApply').onclick = async ()=>{
+    const identifier = a('opIdent').value||''; const amount = a('opAmt').value||''; const reason = a('opReason').value||'';
+    if(!identifier || !amount){ toast('Need target and amount','error','Adjust'); return; }
+    try{
+      const r = await j('/api/admin/adjust',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({identifier,amount,reason})});
+      a('opMsg').textContent = 'New balance: '+fmtDL(r.new_balance)+' DL';
+      toast('Adjusted','success','Admin');
+    }catch(e){ a('opMsg').textContent=e.message; toast(e.message,'error','Admin'); }
+  };
+  a('roleApply').onclick = async ()=>{
+    const identifier = a('roleIdent').value||''; const role = a('roleSelect').value||'member';
+    try{
+      const r = await j('/api/admin/role',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({identifier,role})});
+      a('roleMsg').textContent = 'Role set to '+(r.role||role);
+      toast('Role updated','success','Admin');
+    }catch(e){ a('roleMsg').textContent=e.message; toast(e.message,'error','Admin'); }
+  };
+  a('announceBtn').onclick = async ()=>{
+    const text = a('announceTxt').value||'';
+    if(!text){ toast('Write something to announce','error','Announce'); return; }
+    try{
+      await j('/api/admin/announce',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text, minutes:360})});
+      a('announceTxt').value='';
+      toast('Announcement posted','success','Announce');
+    }catch(e){ toast(e.message,'error','Announce'); }
+  };
+}
+
+/* Navigation wiring */
+function wireNav(){
+  // Tabs
+  qsa('.tabs .tab').forEach(t=>{
+    t.onclick = ()=> goto(t.getAttribute('data-path')||'/games');
+  });
+
+  // Game tiles
+  const bindCard = (id, path)=>{ const el = qs(id); if(el) el.onclick = ()=> goto(path); };
+  bindCard('openCrash','/crash');
+  bindCard('openMines','/mines');
+  bindCard('openCoinflip','/coinflip');
+  bindCard('openBlackjack','/blackjack');
+  bindCard('openPump','/pump');
+
+  // Back buttons
+  const bindBack = (id)=>{ const el = qs(id); if(el) el.onclick = ()=> goto('/games'); };
+  bindBack('backToGames');
+  bindBack('backToGames2');
+  bindBack('backToGames_cf');
+  bindBack('backToGames_bj');
+  bindBack('backToGames_pu');
+
+  // Header brand
+  const home = qs('homeLink');
+  if(home) home.onclick = (e)=>{ e.preventDefault(); goto('/games'); };
+}
+
+/* Initial boot */
+(async function boot(){
+  wireNav();
+  renderHeader();
+  handleRoute();
+  bindOwnerPanel();
+  // Try attach referral cookie after login
+  try{
+    const refCookie = (document.cookie.split('; ').find(x=> x.startsWith('refname='))||'').split('=').slice(1).join('=');
+    if(refCookie){
+      await j('/api/referral/attach?refname='+encodeURIComponent(decodeURIComponent(refCookie)));
+      document.cookie = 'refname=; Max-Age=0; path=/; samesite=lax';
+    }
+  }catch(_){}
+  // Hide preloader
+  setTimeout(()=> qs('preload')?.classList.add('hide'), 250);
+})();
+</script>
+</body>
+</html>
+"""
+
 # ---------- HTML augmentation (announcements + polish) ----------
 EXTRA_SNIPPET = r"""
 <script>

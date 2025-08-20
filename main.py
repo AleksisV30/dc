@@ -57,6 +57,11 @@ REFERRAL_SHARE_BASE = os.getenv("REFERRAL_SHARE_BASE", "https://growcb.net/refer
 CANONICAL_HOST = os.getenv("CANONICAL_HOST", "growcb.net")  # force show this host in browser
 OWNER_ONLY_MODE = os.getenv("OWNER_ONLY_MODE", "1") != "0"   # lock site to owner only (default ON)
 
+# NEW: control cookie secure behavior (auto/0/1) and bot start + reload
+COOKIE_SECURE = os.getenv("COOKIE_SECURE", "auto").lower()  # "auto" | "0" | "1"
+START_DISCORD_BOT = os.getenv("START_DISCORD_BOT", "1") != "0"
+RELOAD = os.getenv("RELOAD", "0") == "1"
+
 GEM = "💎"
 MIN_BET = Decimal("1.00")
 MAX_BET = Decimal("1000000.00")
@@ -391,6 +396,15 @@ def _cookie_domain_from_request(request: Optional[Request]) -> Optional[str]:
         return None
     return None
 
+def _cookie_is_secure(request: Optional[Request]) -> bool:
+    # auto: secure only when the request is HTTPS; override via env
+    if COOKIE_SECURE == "1": return True
+    if COOKIE_SECURE == "0": return False
+    try:
+        return bool(request and str(request.url).startswith("https://"))
+    except Exception:
+        return True
+
 def _set_session(resp, data: dict, request: Optional[Request] = None):
     cookie_val = SER.dumps(data)
     domain = _cookie_domain_from_request(request)
@@ -400,7 +414,7 @@ def _set_session(resp, data: dict, request: Optional[Request] = None):
         max_age=30*86400,
         httponly=True,
         samesite="lax",
-        secure=True,
+        secure=_cookie_is_secure(request),  # <-- fixed: works on localhost/HTTP
         path="/",
         domain=domain
     )
@@ -1294,7 +1308,7 @@ function renderMinesGrid(st){
 }
 function updateMinesUI(){
   const st = mState; if(!st){ return; }
-  qs('mSetup').style.display = st.status==='active' ? 'none' : 'none'; // keep hidden after start
+  qs('mSetup').style.display = st.status==='active' ? 'none' : ''; // fixed: show setup when not active
   qs('mCash').style.display = (st.status==='active' ? '' : 'none');
   qs('mMult').textContent = (st.multiplier||1).toFixed(4)+'×';
   qs('mPotential').textContent = st.potential ? fmtDL(st.potential)+' DL' : '—';
@@ -1323,6 +1337,7 @@ async function refreshMines(){
     }
     // history
     try{
+      const h = await
       const h = await j('/api/mines/history');
       qs('mHist').innerHTML = (h.rows||[]).map(r=>`<div>${new Date(r.started_at).toLocaleString()} — bet ${fmtDL(r.bet)} • mines ${r.mines} • win ${fmtDL(r.win)}</div>`).join('') || '—';
     }catch(_){}
@@ -1356,7 +1371,7 @@ async function loadReferral(){
     qs('refJoins').textContent = r.joined||0;
     qs('refLink').value = name ? refLinkFrom(name) : '';
     qs('copyRef').onclick = ()=>{
-            if(!qs('refLink').value){ toast('Set a handle first','error','Referral'); return; }
+      if(!qs('refLink').value){ toast('Set a handle first','error','Referral'); return; }
       navigator.clipboard.writeText(qs('refLink').value).then(()=> toast('Link copied!','success','Referral'));
     };
     qs('refSave').onclick = async ()=>{
@@ -2082,11 +2097,9 @@ class AdjustIn(BaseModel):
 def _id_from_identifier(identifier: str) -> str:
     m = re.search(r"\d{5,}", identifier or "")
     if m: return m.group(0)
+    # lookup by exact handle
     with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
-        cur.execute("SELECT user_id FROM profiles WHERE name_lower=%s", (identifier.lower(),))
-        r = con.cursor().fetchone() if False else None  # placeholder safeguard
-    with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
-        cur.execute("SELECT user_id FROM profiles WHERE name_lower=%s", (identifier.lower(),))
+        cur.execute("SELECT user_id FROM profiles WHERE name_lower=%s", ((identifier or "").lower(),))
         r = cur.fetchone()
         if r: return str(r[0])
     raise HTTPException(400, "Provide a numeric Discord ID, mention, or exact handle")
@@ -2272,6 +2285,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
 BOT_READY = False
+BOT_LAST_ERROR: Optional[str] = None
 
 bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
@@ -2303,6 +2317,11 @@ async def on_ready():
     except Exception as e:
         print("Presence set failed:", e)
 
+@bot.event
+async def on_error(event, *args, **kwargs):
+    global BOT_LAST_ERROR
+    BOT_LAST_ERROR = f"{event}: {args[:1]}"
+
 @bot.command(name="help")
 async def _help(ctx: commands.Context):
     em = embed_base("Help — GROWCB Bot")
@@ -2329,14 +2348,13 @@ async def _level(ctx: commands.Context, user: Optional[str] = None):
     if not target_id:
         return await ctx.reply(embed=embed_base("Level", "User not found"))
     p = profile_info(target_id)
-    prog = f"Level **{p['level']}** — {p['xp']} XP • {p['progress_pct']}% to next"
     em = embed_base("Level / Profile")
     em.add_field(name="User", value=f"<@{target_id}>", inline=True)
     em.add_field(name="Level", value=str(p["level"]), inline=True)
     em.add_field(name="XP", value=str(p["xp"]), inline=True)
     em.add_field(name="Role", value=p["role"], inline=True)
     em.add_field(name="Balance", value=f"{p['balance']:.2f} DL", inline=True)
-    em.description = prog
+    em.description = f"Level **{p['level']}** — {p['xp']} XP • {p['progress_pct']}% to next"
     await ctx.reply(embed=em)
 
 def _lb_reset_text(period: str) -> str:
@@ -2441,26 +2459,35 @@ async def _removebal(ctx: commands.Context, user: str, amount: str):
     await ctx.reply(embed=em)
 
 async def start_bot():
+    global BOT_LAST_ERROR
+    if not START_DISCORD_BOT:
+        print("START_DISCORD_BOT=0; bot disabled.")
+        return
     if not DISCORD_BOT_TOKEN:
+        BOT_LAST_ERROR = "DISCORD_BOT_TOKEN not set"
         print("DISCORD_BOT_TOKEN not set; bot disabled.")
         return
     try:
         await bot.start(DISCORD_BOT_TOKEN)
     except Exception as e:
+        BOT_LAST_ERROR = str(e)
         print("Bot start failed:", e)
 
 @app.get("/api/bot/status")
 async def bot_status():
-    return {"online": bool(BOT_READY), "token_present": bool(DISCORD_BOT_TOKEN)}
+    return {
+        "online": bool(BOT_READY),
+        "token_present": bool(DISCORD_BOT_TOKEN),
+        "last_error": BOT_LAST_ERROR
+    }
 
 # ---------- Startup ----------
 @app.on_event("startup")
 async def _on_startup():
-    if DISCORD_BOT_TOKEN:
+    if DISCORD_BOT_TOKEN and START_DISCORD_BOT:
         asyncio.create_task(start_bot())
 
 # ---------- Local runner ----------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=True)
-
+    uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=RELOAD)

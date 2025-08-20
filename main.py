@@ -2398,6 +2398,8 @@ except Exception as _e:
 # ---------- Run ----------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app.main:app", host="0.0.0.0", port=PORT, reload=RELOAD)
+    uvicorn.run(app, host="0.0.0.0", port=PORT, reload=RELOAD)
+
+
 
 

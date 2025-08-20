@@ -1,5 +1,4 @@
 # app/main.py
-
 import os, json, asyncio, re, random, string, datetime, base64
 from urllib.parse import urlencode, urlparse
 from typing import Optional, Tuple, Dict, List
@@ -57,10 +56,9 @@ REFERRAL_SHARE_BASE = os.getenv("REFERRAL_SHARE_BASE", "https://growcb.net/refer
 CANONICAL_HOST = os.getenv("CANONICAL_HOST", "growcb.net")  # force show this host in browser
 OWNER_ONLY_MODE = os.getenv("OWNER_ONLY_MODE", "1") != "0"   # lock site to owner only (default ON)
 
-# NEW: control cookie secure behavior (auto/0/1) and bot start + reload
-COOKIE_SECURE = os.getenv("COOKIE_SECURE", "auto").lower()  # "auto" | "0" | "1"
-START_DISCORD_BOT = os.getenv("START_DISCORD_BOT", "1") != "0"
-RELOAD = os.getenv("RELOAD", "0") == "1"
+# New toggles for reliability
+START_DISCORD_BOT = os.getenv("START_DISCORD_BOT", "1") != "0"  # set to 0 to prevent bot from starting
+RELOAD = os.getenv("RELOAD", "0") == "1"                        # if you want uvicorn.reload=True via env
 
 GEM = "💎"
 MIN_BET = Decimal("1.00")
@@ -396,15 +394,6 @@ def _cookie_domain_from_request(request: Optional[Request]) -> Optional[str]:
         return None
     return None
 
-def _cookie_is_secure(request: Optional[Request]) -> bool:
-    # auto: secure only when the request is HTTPS; override via env
-    if COOKIE_SECURE == "1": return True
-    if COOKIE_SECURE == "0": return False
-    try:
-        return bool(request and str(request.url).startswith("https://"))
-    except Exception:
-        return True
-
 def _set_session(resp, data: dict, request: Optional[Request] = None):
     cookie_val = SER.dumps(data)
     domain = _cookie_domain_from_request(request)
@@ -414,7 +403,7 @@ def _set_session(resp, data: dict, request: Optional[Request] = None):
         max_age=30*86400,
         httponly=True,
         samesite="lax",
-        secure=_cookie_is_secure(request),  # <-- fixed: works on localhost/HTTP
+        secure=True,
         path="/",
         domain=domain
     )
@@ -576,6 +565,9 @@ def get_leaderboard_rows_db(cur, period: str, limit: int = 50):
     return out
 
 # ---------- HTML (UI/UX) ----------
+# Improvements:
+#  - Robust preloader removal (hides on load & then removes from DOM).
+#  - Crash canvas context is initialized in openCrash().
 HTML_TEMPLATE = r"""
 <!doctype html>
 <html lang="en">
@@ -731,7 +723,7 @@ canvas{display:block;width:100%;height:100%}
 <body>
 
 <!-- Preloader -->
-<div id="preload"><div class="loader"></div></div>
+<div id="preload"><div class="loader"></div><div class="title" style="margin-top:12px;font-weight:900;letter-spacing:.5px;color:#eaf2ff;opacity:.9">GROWCB</div></div>
 
 <!-- Toasts -->
 <div id="toasts"></div>
@@ -962,39 +954,7 @@ canvas{display:block;width:100%;height:100%}
   <div class="chat-input"><input id="chatText" placeholder="Say something… (Lv 5+, Enter to send)"/><button class="btn primary" id="chatSend">Send</button></div>
 </div>
 
-<!-- Deposit / Withdraw Modal -->
-<div class="modal" id="dwModal">
-  <div class="box">
-    <div class="head"><div class="big">💠 Deposit / Withdraw</div><button class="btn gray" id="dwClose">Close</button></div>
-    <div class="field"><div class="label">Action</div>
-      <div style="display:flex;gap:8px">
-        <button class="btn primary" id="dwActionDeposit">Deposit</button>
-        <button class="btn ghost" id="dwActionWithdraw">Withdraw</button>
-      </div>
-    </div>
-    <div class="grid-2" style="margin-top:10px">
-      <div>
-        <div class="field"><div class="label">Discord Account</div>
-          <div style="display:flex;gap:8px">
-            <input id="dwDiscord" placeholder="username#1234 or ID"/>
-            <button class="btn gray" id="dwUseMe">Use my account</button>
-          </div>
-        </div>
-        <div class="field" style="margin-top:8px"><div class="label">GrowID</div><input id="dwGrow" placeholder="Your GrowID"/></div>
-        <div class="field" style="margin-top:8px"><div class="label">World</div><input id="dwWorld" placeholder="World name"/></div>
-      </div>
-      <div>
-        <div class="field"><div class="label">Amount (for withdraw only)</div><input id="dwAmount" placeholder="e.g. 10.00"/></div>
-        <div class="muted" style="margin-top:8px">Heads up: if GrowID is incorrect, delivery may fail.</div>
-      </div>
-    </div>
-    <div class="foot">
-      <button class="btn primary" id="dwSubmit">Submit</button>
-    </div>
-  </div>
-</div>
-
-<!-- Profile Modal (from chat username click) -->
+<!-- Profile Modal -->
 <div class="modal" id="profileModal">
   <div class="box">
     <div class="head"><div class="big" id="pmTitle">Player</div><button class="btn gray" id="pmClose">Close</button></div>
@@ -1002,7 +962,7 @@ canvas{display:block;width:100%;height:100%}
   </div>
 </div>
 
-<!-- Account Modal (avatar: Profile & Settings) -->
+<!-- Account Modal -->
 <div class="modal" id="acctModal">
   <div class="box">
     <div class="head">
@@ -1035,6 +995,7 @@ canvas{display:block;width:100%;height:100%}
     </div>
   </div>
 </div>
+
 <script>
 const REF_BASE="__REF_BASE__";
 const OWNER_ID="__OWNER_ID__";
@@ -1065,6 +1026,16 @@ function dlHtml(n){
   const [i,d] = s.split('.');
   return `<span class="dl-num"><span class="dl-int">${i}</span><span class="dl-dec">.${d}</span></span><img class="dl-icon" src="/img/diamondlock.png" alt="DL"/>`;
 }
+
+/* --- Robust preloader removal --- */
+function hidePreload(){
+  const el = qs('preload');
+  if(!el) return;
+  el.classList.add('hide');
+  setTimeout(()=>{ try{ el.remove(); }catch(_){} }, 450);
+}
+window.addEventListener('load', ()=> setTimeout(hidePreload, 100));
+setTimeout(hidePreload, 1500); // fallback
 
 /* Router */
 const pages = ['page-games','page-crash','page-mines','page-coinflip','page-blackjack','page-pump','page-ref','page-promo','page-lb','page-about','page-owner'];
@@ -1186,18 +1157,23 @@ function openDW(){
 }
 function setDWType(t){
   dwType = t;
-  qs('dwActionDeposit').classList.toggle('primary', t==='deposit');
-  qs('dwActionWithdraw').classList.toggle('primary', t==='withdraw');
-  qs('dwActionDeposit').classList.toggle('ghost', t!=='deposit');
-  qs('dwActionWithdraw').classList.toggle('ghost', t!=='withdraw');
+  // buttons are inside DW modal; safe to query lazily
+  const dep = document.getElementById('dwActionDeposit');
+  const wdr = document.getElementById('dwActionWithdraw');
+  if(dep && wdr){
+    dep.classList.toggle('primary', t==='deposit');
+    wdr.classList.toggle('primary', t==='withdraw');
+    dep.classList.toggle('ghost', t!=='deposit');
+    wdr.classList.toggle('ghost', t!=='withdraw');
+  }
 }
-qs('dwActionDeposit').onclick = ()=> setDWType('deposit');
-qs('dwActionWithdraw').onclick = ()=> setDWType('withdraw');
-qs('dwClose').onclick = ()=> qs('dwModal').classList.remove('open');
-qs('dwUseMe').onclick = async ()=>{
+document.getElementById('dwActionDeposit').onclick = ()=> setDWType('deposit');
+document.getElementById('dwActionWithdraw').onclick = ()=> setDWType('withdraw');
+document.getElementById('dwClose').onclick = ()=> qs('dwModal').classList.remove('open');
+document.getElementById('dwUseMe').onclick = async ()=>{
   try{ const me = await j('/api/me'); qs('dwDiscord').value = me.username || me.id || ''; }catch(_){ toast('Not logged in. Enter your Discord username or ID.', 'error', 'Discord'); }
 };
-qs('dwSubmit').onclick = async ()=>{
+document.getElementById('dwSubmit').onclick = async ()=>{
   const payload = {
     ttype: dwType,
     amount: (dwType==='withdraw') ? (qs('dwAmount').value||'') : null,
@@ -1214,9 +1190,9 @@ qs('dwSubmit').onclick = async ()=>{
 };
 
 /* Crash logic */
-let crPoll=null, crCanvas=null, crCtx=null, crStart=null, crEnd=null, crBust=1.0;
+let crPoll=null, crCanvas=null, crCtx=null, crBust=1.0;
 function drawCrash(mult){
-  if(!crCtx) return;
+  if(!crCtx || !crCanvas) return;
   const w = crCanvas.width = crCanvas.clientWidth;
   const h = crCanvas.height = crCanvas.clientHeight;
   crCtx.clearRect(0,0,w,h);
@@ -1236,9 +1212,13 @@ function drawCrash(mult){
 async function openCrash(){
   qs('crMsg').textContent='';
   qs('crCashout').style.display='none';
+  // init canvas context safely
+  crCanvas = qs('crCanvas');
+  crCtx = crCanvas ? crCanvas.getContext('2d') : null;
   await pollCrash(true);
   if(crPoll) clearInterval(crPoll);
   crPoll = setInterval(()=> pollCrash(false), 900);
+  window.addEventListener('resize', ()=> drawCrash(1.0));
 }
 async function pollCrash(first=false){
   try{
@@ -1270,7 +1250,7 @@ async function pollCrash(first=false){
     if(first) toast(e.message,'error','Crash');
   }
 }
-qs('crPlace').onclick = async ()=>{
+document.getElementById('crPlace').onclick = async ()=>{
   try{
     const bet = String(qs('crBet').value||'');
     const cash = qs('crCash').value ? Number(qs('crCash').value) : null;
@@ -1280,7 +1260,7 @@ qs('crPlace').onclick = async ()=>{
     renderHeader();
   }catch(e){ toast(e.message,'error','Crash'); }
 };
-qs('crCashout').onclick = async ()=>{
+document.getElementById('crCashout').onclick = async ()=>{
   try{ const r = await j('/api/crash/cashout', { method:'POST' }); toast(`Cashed out at ${Number(r.cashed_out).toFixed(2)}× (+${fmtDL(r.win)} DL)`, 'success', 'Crash'); renderHeader(); }
   catch(e){ toast(e.message,'error','Crash'); }
 };
@@ -1308,7 +1288,7 @@ function renderMinesGrid(st){
 }
 function updateMinesUI(){
   const st = mState; if(!st){ return; }
-  qs('mSetup').style.display = st.status==='active' ? 'none' : ''; // fixed: show setup when not active
+  qs('mSetup').style.display = st.status==='active' ? 'none' : 'none'; // hidden after start
   qs('mCash').style.display = (st.status==='active' ? '' : 'none');
   qs('mMult').textContent = (st.multiplier||1).toFixed(4)+'×';
   qs('mPotential').textContent = st.potential ? fmtDL(st.potential)+' DL' : '—';
@@ -1337,13 +1317,12 @@ async function refreshMines(){
     }
     // history
     try{
-      const h = await
       const h = await j('/api/mines/history');
       qs('mHist').innerHTML = (h.rows||[]).map(r=>`<div>${new Date(r.started_at).toLocaleString()} — bet ${fmtDL(r.bet)} • mines ${r.mines} • win ${fmtDL(r.win)}</div>`).join('') || '—';
     }catch(_){}
   }catch(e){ toast(e.message,'error','Mines'); }
 }
-qs('mStart').onclick = async ()=>{
+document.getElementById('mStart').onclick = async ()=>{
   try{
     const bet = String(qs('mBet').value||'');
     const mines = parseInt(qs('mMines').value||'3',10);
@@ -1352,7 +1331,7 @@ qs('mStart').onclick = async ()=>{
     renderHeader();
   }catch(e){ toast(e.message,'error','Mines'); }
 };
-qs('mCash').onclick = async ()=>{
+document.getElementById('mCash').onclick = async ()=>{
   try{ const r = await j('/api/mines/cashout',{method:'POST'}); toast(`Cashed out +${fmtDL(r.win)} DL`, 'success', 'Mines'); mState=r; updateMinesUI(); renderHeader(); }
   catch(e){ toast(e.message,'error','Mines'); }
 };
@@ -1447,7 +1426,6 @@ async function refreshLeaderboard(){
     }).join('') || '—';
     qs('lbCountdown').textContent = lbResetText(lbPeriod);
   }catch(e){ qs('lbWrap').textContent = e.message || 'Error'; }
-  const seg = qs('lbSeg');
   qsa('#lbSeg button').forEach(b=>{
     b.onclick = ()=>{ qsa('#lbSeg button').forEach(x=>x.classList.remove('active')); b.classList.add('active'); lbPeriod = b.dataset.period; refreshLeaderboard(); };
   });
@@ -1591,20 +1569,23 @@ function wireNav(){
 
 /* Initial boot */
 (async function boot(){
-  wireNav();
-  renderHeader();
-  handleRoute();
-  bindOwnerPanel();
-  // Try attach referral cookie after login
   try{
-    const refCookie = (document.cookie.split('; ').find(x=> x.startsWith('refname='))||'').split('=').slice(1).join('=');
-    if(refCookie){
-      await j('/api/referral/attach?refname='+encodeURIComponent(decodeURIComponent(refCookie)));
-      document.cookie = 'refname=; Max-Age=0; path=/; samesite=lax';
-    }
-  }catch(_){}
-  // Hide preloader
-  setTimeout(()=> qs('preload')?.classList.add('hide'), 250);
+    wireNav();
+    renderHeader();
+    handleRoute();
+    bindOwnerPanel();
+    // Try attach referral cookie after login
+    try{
+      const refCookie = (document.cookie.split('; ').find(x=> x.startsWith('refname='))||'').split('=').slice(1).join('=');
+      if(refCookie){
+        await j('/api/referral/attach?refname='+encodeURIComponent(decodeURIComponent(refCookie)));
+        document.cookie = 'refname=; Max-Age=0; path=/; samesite=lax';
+      }
+    }catch(_){}
+  }finally{
+    // Hide preloader regardless of minor JS errors
+    hidePreload();
+  }
 })();
 </script>
 </body>
@@ -1615,18 +1596,6 @@ function wireNav(){
 EXTRA_SNIPPET = r"""
 <script>
 (function(){
-  document.head.insertAdjacentHTML('beforeend', `<style>
-    .btn { font-weight: 800; }
-    .btn.gray, .btn.ghost { color:#eaf2ff !important; }
-    .modal.open .box { animation: pop .22s ease; transform-origin: 50% 40%; }
-    @keyframes pop { from{transform:scale(.96); opacity:.0} to{transform:scale(1); opacity:1} }
-    #preload .title { margin-top:12px; font-weight:900; letter-spacing:.5px; color:#eaf2ff; opacity:.9 }
-  </style>`);
-  const pr = document.getElementById('preload');
-  if(pr){
-    const t = document.createElement('div'); t.className='title'; t.textContent='GROWCB';
-    pr.appendChild(t);
-  }
   const SEEN_KEY = 'ann_seen_ids_v1';
   const seen = new Set((localStorage.getItem(SEEN_KEY)||'').split(',').filter(Boolean).map(x=>String(x)));
   async function poll(){
@@ -1925,569 +1894,513 @@ class PromoIn(BaseModel):
 @app.get("/api/promo/my")
 async def api_promo_my(request: Request):
     s = _require_session(request)
+    with psycop
+@app.get("/api/promo/my")
+async def api_promo_my(request: Request):
+    s = _require_session(request)
     with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
-        cur.execute("SELECT code, redeemed_at FROM promo_redemptions WHERE user_id=%s ORDER BY redeemed_at DESC LIMIT 50", (s["id"],))
-        rows = [{"code": r[0], "redeemed_at": str(r[1])} for r in cur.fetchall()]
+        cur.execute("""
+            SELECT pr.code, pr.redeemed_at
+            FROM promo_redemptions pr
+            WHERE pr.user_id=%s
+            ORDER BY pr.redeemed_at DESC
+            LIMIT 50
+        """, (s["id"],))
+        rows = [{"code": r[0], "redeemed_at": r[1]} for r in cur.fetchall()]
     return {"rows": rows}
 
 @app.post("/api/promo/redeem")
 async def api_promo_redeem(request: Request, body: PromoIn):
     s = _require_session(request)
+    code = (body.code or "").strip()
+    if not code:
+        raise HTTPException(400, "Enter a code")
     try:
-        bal = redeem_promo(s["id"], body.code)
-        return {"ok": True, "new_balance": float(bal)}
-    except (PromoInvalid, PromoExpired, PromoExhausted, PromoAlreadyRedeemed) as e:
-        raise HTTPException(400, str(e))
+        # Delegate to promo module if available
+        amt = redeem_promo(s["id"], code)
+        # If redeem_promo returns an amount, credit balance here
+        if amt:
+            new_bal = adjust_balance(s["id"], s["id"], amt, f"promo:{code}")
+            return {"ok": True, "win": float(q2(D(amt))), "balance": float(new_bal)}
+        return {"ok": True}
+    except PromoAlreadyRedeemed:
+        raise HTTPException(400, "You already redeemed this code")
+    except PromoExpired:
+        raise HTTPException(400, "Code expired")
+    except PromoExhausted:
+        raise HTTPException(400, "Code has reached maximum uses")
+    except PromoInvalid as e:
+        raise HTTPException(400, str(e) or "Invalid code")
 
-class PromoCreateIn(BaseModel):
-    code: Optional[str] = None
-    amount: str
-    max_uses: int = 1
-    expires_at: Optional[str] = None
+# ---------- Chat ----------
+class ChatSendIn(BaseModel):
+    text: str
 
-@app.post("/api/admin/promo/create")
-async def api_admin_promo_create(request: Request, body: PromoCreateIn):
+def _role_rank(role: str) -> int:
+    order = {"member":0,"media":1,"moderator":2,"admin":3,"owner":4}
+    return order.get((role or "member"), 0)
+
+@with_conn
+def _is_timed_out(cur, user_id: str) -> Optional[datetime.datetime]:
+    cur.execute("SELECT until FROM chat_timeouts WHERE user_id=%s", (user_id,))
+    r = cur.fetchone()
+    if not r:
+        return None
+    until = r[0]
+    if until and until > now_utc():
+        return until
+    # expired — cleanup
+    cur.execute("DELETE FROM chat_timeouts WHERE user_id=%s", (user_id,))
+    return None
+
+@app.get("/api/chat/fetch")
+async def api_chat_fetch(since: int = 0, limit: int = 50):
+    limit = max(1, min(200, limit))
+    with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
+        cur.execute("""
+            SELECT m.id, m.user_id, m.username, m.text, m.created_at,
+                   COALESCE(p.role,'member') AS role,
+                   (1 + COALESCE(p.xp,0)/100) AS level
+            FROM chat_messages m
+            LEFT JOIN profiles p ON p.user_id = m.user_id
+            WHERE m.id > %s
+            ORDER BY m.id ASC
+            LIMIT %s
+        """, (since, limit))
+        rows = cur.fetchall()
+    out = []
+    for r in rows:
+        out.append({
+            "id": int(r[0]), "user_id": str(r[1]), "username": r[2],
+            "text": r[3], "created_at": r[4].isoformat(),
+            "role": r[5], "level": int(r[6]),
+        })
+    return {"rows": out}
+
+@app.post("/api/chat/send")
+async def api_chat_send(request: Request, body: ChatSendIn):
     s = _require_session(request)
-    role = get_role(s["id"])
-    if role not in ("admin", "owner"): raise HTTPException(403, "No permission")
-    res = create_promo(s["id"], body.code, body.amount, int(body.max_uses or 1), body.expires_at)
-    return res
+    txt = (body.text or "").strip()
+    if not txt:
+        raise HTTPException(400, "Say something first")
+    if len(txt) > 400:
+        raise HTTPException(400, "Message too long (max 400)")
+    info = profile_info(s["id"])
+    if (info.get("level") or 1) < 5:
+        raise HTTPException(403, "Level 5+ required to chat")
+    with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
+        # Check timeout
+        if _is_timed_out(cur, s["id"]):
+            raise HTTPException(403, "You're temporarily muted")
+        cur.execute("""
+            INSERT INTO chat_messages(user_id, username, text) VALUES (%s,%s,%s)
+            RETURNING id, created_at
+        """, (s["id"], info.get("name") or s["username"], txt))
+        mid, created = cur.fetchone()
+        con.commit()
+    return {"ok": True, "id": int(mid), "created_at": created.isoformat()}
 
-# ---------- Transfers (deposit/withdraw) ----------
+# ---------- Discord join ----------
+@app.post("/api/discord/join")
+async def api_discord_join(request: Request):
+    s = _require_session(request)
+    try:
+        nick = get_profile_name(s["id"]) or None
+    except Exception:
+        nick = None
+    res = await guild_add_member(s["id"], nick)
+    return res or {"ok": True}
+
+# ---------- Transfers (deposit / withdraw placeholders) ----------
 class TransferIn(BaseModel):
     ttype: str
     amount: Optional[str] = None
-    world: Optional[str] = None
-    grow_id: Optional[str] = None
-
-@with_conn
-def create_transfer(cur, user_id: str, ttype: str, amount: Optional[str], world: Optional[str], grow_id: Optional[str]):
-    ttype = (ttype or "").lower().strip()
-    if ttype not in ("deposit","withdraw"):
-        raise ValueError("Invalid type")
-    amt = q2(D(amount or "0")) if amount else None
-    cur.execute("""
-        INSERT INTO transfers(user_id, ttype, amount, world, grow_id, status)
-        VALUES (%s,%s,%s,%s,%s,'pending') RETURNING id
-    """, (user_id, ttype, amt, world, (grow_id or "").strip() or None))
-    return {"ok": True, "id": int(cur.fetchone()[0])}
+    world: str
+    grow_id: str
 
 @app.post("/api/transfer/create")
 async def api_transfer_create(request: Request, body: TransferIn):
     s = _require_session(request)
-    try:
-        r = create_transfer(s["id"], body.ttype, body.amount, body.world, body.grow_id)
-        return r
-    except Exception as e:
-        raise HTTPException(400, str(e))
-
-# ---------- Chat ----------
-class ChatIn(BaseModel):
-    text: str
-
-@with_conn
-def get_role(cur, user_id: str) -> str:
-    cur.execute("SELECT role FROM profiles WHERE user_id=%s", (user_id,))
-    r = cur.fetchone()
-    return r[0] if r else "member"
-
-@with_conn
-def chat_timeout_set(cur, actor_id: str, user_id: str, seconds: int, reason: Optional[str]):
-    until = now_utc() + datetime.timedelta(seconds=max(1, seconds))
-    cur.execute("""INSERT INTO chat_timeouts(user_id, until, reason, created_by)
-                   VALUES (%s,%s,%s,%s)
-                   ON CONFLICT (user_id) DO UPDATE SET until=EXCLUDED.until, reason=EXCLUDED.reason, created_by=EXCLUDED.created_by""",
-                (user_id, until, reason, actor_id))
-    return {"ok": True, "until": str(until)}
-
-@with_conn
-def chat_insert(cur, user_id: str, username: str, text: str, private_to: Optional[str] = None):
-    text = (text or "").strip()
-    if not text: raise ValueError("Message is empty")
-    if len(text) > 300: raise ValueError("Message is too long (max 300)")
-    ensure_profile_row(user_id)
-    if private_to is None:
-        cur.execute("SELECT until FROM chat_timeouts WHERE user_id=%s", (user_id,))
-        r = cur.fetchone()
-        if r and r[0] > now_utc(): raise PermissionError("You are timed out")
-    cur.execute("INSERT INTO chat_messages(user_id, username, text, private_to) VALUES (%s,%s,%s,%s) RETURNING id, created_at",
-                (user_id, username, text, private_to))
-    row = cur.fetchone()
-    return {"id": int(row[0]), "created_at": str(row[1])}
-
-@with_conn
-def chat_fetch(cur, since_id: int, limit: int, for_user_id: Optional[str]):
-    if since_id <= 0:
-        cur.execute("""SELECT id, user_id, username, text, created_at, private_to
-                       FROM chat_messages
-                       WHERE private_to IS NULL
-                       ORDER BY id DESC LIMIT %s""", (limit,))
-        rows_pub = list(reversed(cur.fetchall()))
-        rows_priv = []
-        if for_user_id:
-            cur.execute("""SELECT id, user_id, username, text, created_at, private_to
-                           FROM chat_messages
-                           WHERE private_to=%s
-                           ORDER BY id DESC LIMIT %s""", (for_user_id, limit))
-            rows_priv = list(reversed(cur.fetchall()))
-        rows = sorted(rows_pub + rows_priv, key=lambda r: r[0])
-    else:
-        if for_user_id:
-            cur.execute("""SELECT id, user_id, username, text, created_at, private_to
-                           FROM chat_messages
-                           WHERE id>%s AND (private_to IS NULL OR private_to=%s)
-                           ORDER BY id ASC LIMIT %s""", (since_id, for_user_id, limit))
-        else:
-            cur.execute("""SELECT id, user_id, username, text, created_at, private_to
-                           FROM chat_messages
-                           WHERE id>%s AND private_to IS NULL
-                           ORDER BY id ASC LIMIT %s""", (since_id, limit))
-        rows = cur.fetchall()
-
-    uids = list({str(r[1]) for r in rows})
-    levels: Dict[str, int] = {}
-    roles: Dict[str, str] = {}
-    if uids:
-        cur.execute("SELECT user_id, xp, role FROM profiles WHERE user_id = ANY(%s)", (uids,))
-        for uid, xp, role in cur.fetchall():
-            levels[str(uid)] = 1 + int(xp) // 100
-            roles[str(uid)] = role or "member"
-    out = []
-    for mid, uid, uname, txt, ts, priv in rows:
-        uid = str(uid)
-        out.append({"id": int(mid), "user_id": uid, "username": uname,
-                    "level": int(levels.get(uid,1)), "role": roles.get(uid,"member"),
-                    "text": txt, "created_at": str(ts), "private_to": priv})
-    return out
-
-@with_conn
-def chat_delete(cur, message_id: int):
-    cur.execute("DELETE FROM chat_messages WHERE id=%s", (message_id,))
-    return {"ok": True}
-
-@app.post("/api/chat/send")
-async def api_chat_send(request: Request, body: ChatIn):
-    s = _require_session(request)
-    prof = profile_info(s["id"])
-    if prof["level"] < 5:
-        raise HTTPException(403, "You need to be level 5 to chat.")
-    return chat_insert(s["id"], s["username"], body.text, None)
-
-@app.get("/api/chat/fetch")
-async def api_chat_fetch(request: Request, since: int = 0, limit: int = 30):
-    uid = None
-    try: uid = _require_session(request)["id"]
-    except: pass
-    rows = chat_fetch(since, limit, uid)
-    return {"rows": rows}
-
-@app.post("/api/chat/delete")
-async def api_chat_del(request: Request, id: int):
-    s = _require_session(request)
-    role = get_role(s["id"])
-    if role not in ("admin","owner"): raise HTTPException(403, "No permission")
-    return chat_delete(id)
-
-# ---------- Admin ----------
-class AdjustIn(BaseModel):
-    identifier: str  # id or mention or handle
-    amount: str
-    reason: Optional[str] = None
-
-def _id_from_identifier(identifier: str) -> str:
-    m = re.search(r"\d{5,}", identifier or "")
-    if m: return m.group(0)
-    # lookup by exact handle
+    ttype = (body.ttype or "").lower()
+    world = (body.world or "").strip()
+    grow_id = (body.grow_id or "").strip()
+    if ttype not in ("deposit","withdraw"):
+        raise HTTPException(400, "Invalid type")
+    if not world:
+        raise HTTPException(400, "World required")
+    if not grow_id:
+        raise HTTPException(400, "GrowID required")
+    amt = None
+    if ttype == "withdraw":
+        try:
+            amt = q2(D(body.amount or "0"))
+        except Exception:
+            raise HTTPException(400, "Invalid amount")
+        if amt <= 0:
+            raise HTTPException(400, "Amount must be positive")
+        # lock funds
+        bal = get_balance(s["id"])
+        if bal < amt:
+            raise HTTPException(400, "Insufficient balance")
+        adjust_balance(s["id"], s["id"], -amt, "withdraw request lock")
     with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
-        cur.execute("SELECT user_id FROM profiles WHERE name_lower=%s", ((identifier or "").lower(),))
-        r = cur.fetchone()
-        if r: return str(r[0])
-    raise HTTPException(400, "Provide a numeric Discord ID, mention, or exact handle")
+        cur.execute("""
+            INSERT INTO transfers(user_id, ttype, amount, world, grow_id, status)
+            VALUES (%s,%s,%s,%s,%s,'pending') RETURNING id
+        """, (s["id"], ttype, amt, world, grow_id))
+        new_id = cur.fetchone()[0]
+        con.commit()
+    return {"ok": True, "id": int(new_id)}
 
-@app.post("/api/admin/adjust")
-async def api_admin_adjust(request: Request, body: AdjustIn):
-    s = _require_session(request)
-    role = get_role(s["id"])
-    if role not in ("admin","owner"): raise HTTPException(403, "No permission")
-    target = _id_from_identifier(body.identifier)
-    newbal = adjust_balance(s["id"], target, D(body.amount), body.reason)
-    return {"new_balance": float(newbal)}
-
-class RoleIn(BaseModel):
-    identifier: str
-    role: str
-
-@app.post("/api/admin/role")
-async def api_admin_role(request: Request, body: RoleIn):
-    s = _require_session(request)
-    role = get_role(s["id"])
-    if role != "owner": raise HTTPException(403, "Only owner can set roles")
-    target = _id_from_identifier(body.identifier)
-    return set_role(target, body.role)
-
-class TimeoutIn(BaseModel):
-    identifier: str
-    seconds: int
-    reason: Optional[str] = None
-
-@app.post("/api/admin/timeout_site")
-async def api_admin_timeout_site(request: Request, body: TimeoutIn):
-    s = _require_session(request)
-    role = get_role(s["id"])
-    if role not in ("admin","owner"): raise HTTPException(403, "No permission")
-    target = _id_from_identifier(body.identifier)
-    return chat_timeout_set(s["id"], target, int(body.seconds), body.reason or "")
-
-@app.post("/api/admin/timeout_both")
-async def api_admin_timeout_both(request: Request, body: TimeoutIn):
-    return await api_admin_timeout_site(request, body)
-
-# ---------- Global Announcements (not chat) ----------
-class AnnounceIn(BaseModel):
-    text: str
-    minutes: Optional[int] = 360  # default duration 6h
-
-@with_conn
-def create_announcement(cur, text: str, created_by: str, minutes: int = 360):
-    starts = now_utc()
-    ends = starts + datetime.timedelta(minutes=max(1, minutes)) if minutes else None
-    cur.execute("""
-        INSERT INTO announcements(text, starts_at, ends_at, created_by)
-        VALUES (%s,%s,%s,%s) RETURNING id
-    """, (text.strip(), starts, ends, str(created_by)))
-    return {"ok": True, "id": int(cur.fetchone()[0])}
-
-@with_conn
-def active_announcements(cur) -> List[Dict]:
-    now = now_utc()
-    cur.execute("""
-        SELECT id, text, starts_at, ends_at
-        FROM announcements
-        WHERE (starts_at IS NULL OR starts_at <= %s)
-          AND (ends_at IS NULL OR ends_at >= %s)
-        ORDER BY id DESC
-        LIMIT 5
-    """, (now, now))
-    return [{"id": int(r[0]), "text": r[1], "starts_at": str(r[2]), "ends_at": (str(r[3]) if r[3] else None)} for r in cur.fetchall()]
-
-@app.post("/api/admin/announce")
-async def api_admin_announce(request: Request, body: AnnounceIn):
-    s = _require_session(request)
-    role = get_role(s["id"])
-    if role not in ("admin","owner","moderator","media"): raise HTTPException(403, "No permission")
-    return create_announcement(body.text, s["id"], int(body.minutes or 360))
-
-@app.get("/api/announcements/active")
-async def api_announcements_active():
-    return {"rows": active_announcements()}
-
-# ---------- Discord Join ----------
-@app.post("/api/discord/join")
-async def api_discord_join(request: Request):
-    s = _require_session(request)
-    nick = get_profile_name(s["id"]) or s["username"]
-    return await guild_add_member(s["id"], nickname=nick)
-
-# ---------- Crash ----------
-class CrashBetIn(BaseModel):
+# ---------- Crash endpoints ----------
+class CrashPlaceIn(BaseModel):
     bet: str
     cashout: Optional[float] = None
 
 @app.get("/api/crash/state")
 async def api_crash_state(request: Request):
+    # current round & phase
     try:
-        s = _require_session(request); uid = s["id"]
-    except:
-        uid = None
-
-    rid, info = ensure_betting_round()
-    now = now_utc()
-
-    if info["status"] == "betting" and now >= info["betting_ends_at"]:
-        begin_running(rid); info = load_round()
-    if info and info["status"] == "running" and info["expected_end_at"] and now >= info["expected_end_at"]:
-        finish_round(rid); create_next_betting(); info = load_round()
-
-    out = {
-        "phase": info["status"],
-        "bust": info["bust"],
-        "betting_opens_at": iso(info["betting_opens_at"]),
-        "betting_ends_at": iso(info["betting_ends_at"]),
-        "started_at": iso(info["started_at"]),
-        "expected_end_at": iso(info["expected_end_at"]),
-        "last_busts": last_busts()
-    }
-    if info["status"] == "running":
-        out["current_multiplier"] = current_multiplier(info["started_at"], info["expected_end_at"], info["bust"], now)
-    if uid:
-        y = your_bet(rid, uid)
-        if y: out["your_bet"] = y
-    return out
+        state = load_round()
+    except Exception as e:
+        raise HTTPException(500, f"Crash unavailable: {e}")
+    phase = state.get("status")  # 'betting' | 'running' | 'ended'
+    resp = {"phase": phase}
+    if phase == "running":
+        try:
+            resp["current_multiplier"] = float(current_multiplier())
+        except Exception:
+            resp["current_multiplier"] = 1.0
+    if phase in ("ended","running"):
+        try:
+            resp["bust"] = float(state.get("bust") or 1.0)
+        except Exception:
+            resp["bust"] = 1.0
+    try:
+        resp["last_busts"] = [float(x) for x in last_busts(8)]
+    except Exception:
+        resp["last_busts"] = []
+    # user bet (if any)
+    try:
+        # session is optional for viewing
+        s = None
+        try:
+            s = _require_session(request)
+        except Exception:
+            s = None
+        if s:
+            yb = your_bet(s["id"])
+            if yb:
+                resp["your_bet"] = yb
+    except Exception:
+        pass
+    return resp
 
 @app.post("/api/crash/place")
-async def api_crash_place(request: Request, body: CrashBetIn):
+async def api_crash_place(request: Request, body: CrashPlaceIn):
     s = _require_session(request)
-    bet = q2(D(body.bet or "0"))
-    cashout = float(body.cashout or 2.0)
-    return place_bet(s["id"], bet, max(1.01, cashout))
+    try:
+        bet = q2(D(body.bet))
+    except Exception:
+        raise HTTPException(400, "Invalid bet")
+    if bet < MIN_BET or bet > MAX_BET:
+        raise HTTPException(400, f"Bet must be between {MIN_BET} and {MAX_BET}")
+    try:
+        ensure_betting_round()
+        r = place_bet(s["id"], bet, (float(body.cashout) if body.cashout else None))
+        return {"ok": True, **r}
+    except Exception as e:
+        raise HTTPException(400, str(e))
 
 @app.post("/api/crash/cashout")
 async def api_crash_cashout(request: Request):
     s = _require_session(request)
-    cur = load_round()
-    if not cur or cur["status"] != "running":
-        raise HTTPException(400, "No running round")
-    return cashout_now(s["id"])
+    try:
+        r = cashout_now(s["id"])
+        return r
+    except Exception as e:
+        raise HTTPException(400, str(e))
 
 @app.get("/api/crash/history")
 async def api_crash_history(request: Request):
     s = _require_session(request)
-    return {"rows": your_history(s["id"], 10)}
+    try:
+        rows = your_history(s["id"], limit=20)
+        return {"rows": rows}
+    except Exception:
+        return {"rows": []}
 
-# ---------- Mines ----------
+# ---------- Mines endpoints ----------
 class MinesStartIn(BaseModel):
-  bet: str
-  mines: int
-
-@app.post("/api/mines/start")
-async def api_mines_start(request: Request, body: MinesStartIn):
-    s = _require_session(request)
-    return mines_start(s["id"], q2(D(body.bet or "0")), int(body.mines))
-
-@app.post("/api/mines/pick")
-async def api_mines_pick(request: Request, index: int = Query(..., ge=0, le=24)):
-    s = _require_session(request)
-    return mines_pick(s["id"], index)
-
-@app.post("/api/mines/cashout")
-async def api_mines_cashout(request: Request):
-    s = _require_session(request)
-    return mines_cashout(s["id"])
+    bet: str
+    mines: int
 
 @app.get("/api/mines/state")
 async def api_mines_state(request: Request):
     s = _require_session(request)
-    st = mines_state(s["id"])
-    return st or {}
+    try:
+        st = mines_state(s["id"])
+        return st or {}
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+@app.post("/api/mines/start")
+async def api_mines_start(request: Request, body: MinesStartIn):
+    s = _require_session(request)
+    try:
+        bet = q2(D(body.bet))
+    except Exception:
+        raise HTTPException(400, "Invalid bet")
+    if bet < MIN_BET or bet > MAX_BET:
+        raise HTTPException(400, f"Bet must be between {MIN_BET} and {MAX_BET}")
+    mines = int(body.mines or 3)
+    if not (1 <= mines <= 24):
+        raise HTTPException(400, "Mines must be 1–24")
+    try:
+        st = mines_start(s["id"], bet, mines)
+        return st
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+@app.post("/api/mines/pick")
+async def api_mines_pick(request: Request, index: int):
+    s = _require_session(request)
+    try:
+        st = mines_pick(s["id"], int(index))
+        return st
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+@app.post("/api/mines/cashout")
+async def api_mines_cashout(request: Request):
+    s = _require_session(request)
+    try:
+        st = mines_cashout(s["id"])
+        return st
+    except Exception as e:
+        raise HTTPException(400, str(e))
 
 @app.get("/api/mines/history")
 async def api_mines_history(request: Request):
     s = _require_session(request)
-    return {"rows": mines_history(s["id"], 15)}
-
-# ---------- Discord Bot ----------
-import discord
-from discord.ext import commands
-
-FOOTER_URL = os.getenv("FOOTER_URL", "https://growcb.net")
-
-intents = discord.Intents.default()
-intents.message_content = True
-intents.guilds = True
-BOT_READY = False
-BOT_LAST_ERROR: Optional[str] = None
-
-bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
-
-def _id_from_any(s: str) -> Optional[str]:
-    if not s:
-        return None
-    m = re.search(r"\d{5,}", s)
-    if m:
-        return m.group(0)
-    with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
-        cur.execute("SELECT user_id FROM profiles WHERE name_lower=%s", (s.lower(),))
-        r = cur.fetchone()
-        if r:
-            return str(r[0])
-    return None
-
-def embed_base(title: str, desc: str = ""):
-    em = discord.Embed(title=title, description=desc, color=0x3b82f6)
-    em.set_footer(text=FOOTER_URL)
-    return em
-
-@bot.event
-async def on_ready():
-    global BOT_READY
-    BOT_READY = True
-    print(f"Bot logged in as {bot.user} (ready)")
     try:
-        await bot.change_presence(activity=discord.Game(name="growcb.net"))
-    except Exception as e:
-        print("Presence set failed:", e)
-
-@bot.event
-async def on_error(event, *args, **kwargs):
-    global BOT_LAST_ERROR
-    BOT_LAST_ERROR = f"{event}: {args[:1]}"
-
-@bot.command(name="help")
-async def _help(ctx: commands.Context):
-    em = embed_base("Help — GROWCB Bot")
-    em.add_field(name=".bal [@user|id]", value="Show your balance or another user's balance.", inline=False)
-    em.add_field(name=".level [@user|id]", value="Show level, XP and role.", inline=False)
-    em.add_field(name=".leaderboard", value="Show leaderboard with buttons to switch Daily / Monthly / All-time.", inline=False)
-    em.add_field(name=".addbal <@user|id> <amount>", value="(Owner/Webhooks) Add DL balance.", inline=False)
-    em.add_field(name=".removebal <@user|id> <amount>", value="(Owner/Webhooks) Remove DL balance.", inline=False)
-    await ctx.reply(embed=em)
-
-@bot.command(name="bal")
-async def _bal(ctx: commands.Context, user: Optional[str] = None):
-    target_id = _id_from_any(user) if user else str(ctx.author.id)
-    if not target_id:
-        return await ctx.reply(embed=embed_base("Balance", "User not found"))
-    bal = float(get_balance(target_id))
-    em = embed_base("Balance")
-    em.description = f"**{bal:.2f} DL**"
-    await ctx.reply(embed=em)
-
-@bot.command(name="level")
-async def _level(ctx: commands.Context, user: Optional[str] = None):
-    target_id = _id_from_any(user) if user else str(ctx.author.id)
-    if not target_id:
-        return await ctx.reply(embed=embed_base("Level", "User not found"))
-    p = profile_info(target_id)
-    em = embed_base("Level / Profile")
-    em.add_field(name="User", value=f"<@{target_id}>", inline=True)
-    em.add_field(name="Level", value=str(p["level"]), inline=True)
-    em.add_field(name="XP", value=str(p["xp"]), inline=True)
-    em.add_field(name="Role", value=p["role"], inline=True)
-    em.add_field(name="Balance", value=f"{p['balance']:.2f} DL", inline=True)
-    em.description = f"Level **{p['level']}** — {p['xp']} XP • {p['progress_pct']}% to next"
-    await ctx.reply(embed=em)
-
-def _lb_reset_text(period: str) -> str:
-    now = now_utc()
-    if period == "daily":
-        nxt = now.replace(hour=0, minute=0, second=0, microsecond=0) + datetime.timedelta(days=1)
-        delta = nxt - now
-        return f"Resets in {delta.seconds//3600}h {(delta.seconds%3600)//60}m"
-    if period == "monthly":
-        first_next = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        month = first_next.month + 1
-        year = first_next.year + (1 if month > 12 else 0)
-        month = 1 if month > 12 else month
-        nxt = first_next.replace(year=year, month=month)
-        delta = nxt - now
-        return f"Resets in {delta.days}d {(delta.seconds//3600)}h"
-    return "All-time"
-
-class LBView(discord.ui.View):
-    def __init__(self, author_id: int):
-        super().__init__(timeout=60)
-        self.author_id = author_id
-        self.period = "daily"
-        self.update_styles()
-
-    def update_styles(self):
-        for item in self.children:
-            if isinstance(item, discord.ui.Button):
-                item.style = discord.ButtonStyle.secondary
-        sel = next((b for b in self.children if isinstance(b, discord.ui.Button) and b.custom_id == self.period), None)
-        if sel:
-            sel.style = discord.ButtonStyle.primary
-
-    async def refresh_embed(self, interaction: discord.Interaction):
-        rows = get_leaderboard_rows_db(self.period, limit=10)
-        lines = []
-        for i, r in enumerate(rows, start=1):
-            name = "Anonymous" if r["is_anon"] else r["display_name"]
-            amt = "—" if r["is_anon"] else f"{r['total_wagered']:.2f} DL"
-            lines.append(f"**{i}.** {name} — {amt}")
-        em = embed_base(f"Leaderboard — {self.period.title()}", "\n".join(lines) or "—")
-        em.set_footer(text=f"{_lb_reset_text(self.period)} • {FOOTER_URL}")
-        self.update_styles()
-        await interaction.response.edit_message(embed=em, view=self)
-
-    @discord.ui.button(label="Daily", custom_id="daily")
-    async def daily(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.period = "daily"
-        await self.refresh_embed(interaction)
-
-    @discord.ui.button(label="Monthly", custom_id="monthly")
-    async def monthly(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.period = "monthly"
-        await self.refresh_embed(interaction)
-
-    @discord.ui.button(label="All-time", custom_id="alltime")
-    async def alltime(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.period = "alltime"
-        await self.refresh_embed(interaction)
-
-@bot.command(name="leaderboard")
-async def _leaderboard(ctx: commands.Context):
-    view = LBView(author_id=ctx.author.id)
-    rows = get_leaderboard_rows_db("daily", limit=10)
-    lines = []
-    for i, r in enumerate(rows, start=1):
-        name = "Anonymous" if r["is_anon"] else r["display_name"]
-        amt = "—" if r["is_anon"] else f"{r['total_wagered']:.2f} DL"
-        lines.append(f"**{i}.** {name} — {amt}")
-    em = embed_base("Leaderboard — Daily", "\n".join(lines) or "—")
-    em.set_footer(text=f"{_lb_reset_text('daily')} • {FOOTER_URL}")
-    await ctx.reply(embed=em, view=view)
-
-def _owner_or_webhook(ctx: commands.Context) -> bool:
-    try:
-        if int(ctx.author.id) == int(OWNER_ID):
-            return True
+        rows = mines_history(s["id"], limit=20)
+        return {"rows": rows}
     except Exception:
-        pass
-    return bool(getattr(ctx.message, "webhook_id", None))
+        return {"rows": []}
 
-@bot.command(name="addbal")
-async def _addbal(ctx: commands.Context, user: str, amount: str):
-    if not _owner_or_webhook(ctx):
-        return await ctx.reply("Only owner or webhooks can use this.")
-    target = _id_from_any(user)
+# ---------- Admin ----------
+class AdjustIn(BaseModel):
+    identifier: str
+    amount: str
+    reason: Optional[str] = None
+
+class RoleIn(BaseModel):
+    identifier: str
+    role: str
+
+class AnnIn(BaseModel):
+    text: str
+    minutes: Optional[int] = 360
+
+def _require_role(request: Request, min_role: str):
+    s = _require_session(request)
+    info = profile_info(s["id"])
+    if _role_rank(info.get("role")) < _role_rank(min_role):
+        raise HTTPException(403, "Insufficient role")
+    return s, info
+
+@with_conn
+def _resolve_user_id(cur, identifier: str) -> Optional[str]:
+    ident = (identifier or "").strip()
+    if not ident:
+        return None
+    # mention
+    m = re.match(r"^<@!?(\d+)>$", ident)
+    if m:
+        return m.group(1)
+    # numeric id
+    if ident.isdigit():
+        return ident
+    # leading @
+    if ident.startswith("@"):
+        ident = ident[1:]
+    lower = ident.lower()
+    cur.execute("SELECT user_id FROM profiles WHERE name_lower=%s", (lower,))
+    r = cur.fetchone()
+    return str(r[0]) if r else None
+
+@app.post("/api/admin/adjust")
+async def api_admin_adjust(request: Request, body: AdjustIn):
+    s, info = _require_role(request, "admin")
+    with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
+        target = _resolve_user_id(cur, body.identifier)
     if not target:
-        return await ctx.reply("User not found.")
-    newbal = adjust_balance(str(OWNER_ID), target, D(amount), "bot:addbal")
-    em = embed_base("Balance Added", f"New balance: **{newbal:.2f} DL**")
-    await ctx.reply(embed=em)
+        raise HTTPException(400, "User not found")
+    try:
+        amt = q2(D(body.amount))
+    except Exception:
+        raise HTTPException(400, "Invalid amount")
+    new_bal = adjust_balance(s["id"], target, amt, body.reason or "admin adjust")
+    return {"ok": True, "target": target, "new_balance": float(new_bal)}
 
-@bot.command(name="removebal")
-async def _removebal(ctx: commands.Context, user: str, amount: str):
-    if not _owner_or_webhook(ctx):
-        return await ctx.reply("Only owner or webhooks can use this.")
-    target = _id_from_any(user)
+@app.post("/api/admin/role")
+async def api_admin_role(request: Request, body: RoleIn):
+    s, info = _require_role(request, "owner")
+    with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
+        target = _resolve_user_id(cur, body.identifier)
     if not target:
-        return await ctx.reply("User not found.")
-    newbal = adjust_balance(str(OWNER_ID), target, D("-" + str(amount).lstrip("+")), "bot:removebal")
-    em = embed_base("Balance Removed", f"New balance: **{newbal:.2f} DL**")
-    await ctx.reply(embed=em)
+        raise HTTPException(400, "User not found")
+    return set_role(target, body.role)
 
-async def start_bot():
-    global BOT_LAST_ERROR
+@app.post("/api/admin/announce")
+async def api_admin_announce(request: Request, body: AnnIn):
+    s, info = _require_role(request, "admin")
+    txt = (body.text or "").strip()
+    if not txt:
+        raise HTTPException(400, "Text required")
+    minutes = max(1, min(7*24*60, int(body.minutes or 360)))
+    starts = now_utc()
+    ends = starts + datetime.timedelta(minutes=minutes)
+    with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
+        cur.execute("INSERT INTO announcements(text, starts_at, ends_at, created_by) VALUES (%s,%s,%s,%s) RETURNING id",
+                    (txt, starts, ends, s["id"]))
+        new_id = cur.fetchone()[0]
+        con.commit()
+    return {"ok": True, "id": int(new_id)}
+
+@app.get("/api/announcements/active")
+async def api_ann_active():
+    now = now_utc()
+    with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
+        cur.execute("""
+            SELECT id, text, starts_at, ends_at
+            FROM announcements
+            WHERE (starts_at IS NULL OR starts_at <= %s)
+              AND (ends_at IS NULL OR ends_at > %s)
+            ORDER BY starts_at DESC NULLS LAST, id DESC
+            LIMIT 10
+        """, (now, now))
+        rows = [{
+            "id": int(r[0]), "text": r[1],
+            "starts_at": r[2].isoformat() if r[2] else None,
+            "ends_at": r[3].isoformat() if r[3] else None
+        } for r in cur.fetchall()]
+    return {"rows": rows}
+
+# ---------- Inject missing Deposit/Withdraw modal into HTML ----------
+DW_SNIPPET = r"""
+<!-- Deposit / Withdraw Modal -->
+<div class="modal" id="dwModal">
+  <div class="box">
+    <div class="head">
+      <div class="tabbar">
+        <div class="t active" id="dwActionDeposit">Deposit</div>
+        <div class="t" id="dwActionWithdraw">Withdraw</div>
+      </div>
+      <button class="btn gray" id="dwClose">Close</button>
+    </div>
+    <div class="card">
+      <div class="grid-2">
+        <div class="card">
+          <div class="label">World</div>
+          <input id="dwWorld" placeholder="Your GT world"/>
+          <div class="label" style="margin-top:8px">GrowID</div>
+          <input id="dwGrow" placeholder="Your GrowID"/>
+          <div class="label" style="margin-top:8px">Discord (optional)</div>
+          <div style="display:flex;gap:8px">
+            <input id="dwDiscord" placeholder="Your Discord handle"/>
+            <button class="btn ghost" id="dwUseMe">Use my Discord</button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="label">Withdraw Amount (DL)</div>
+          <input id="dwAmount" type="number" step="0.01" min="1" placeholder="e.g. 10.00"/>
+          <div class="muted" style="margin-top:6px">Amount is required for withdraws only.</div>
+        </div>
+      </div>
+      <div class="foot">
+        <button class="btn primary" id="dwSubmit">Submit Request</button>
+      </div>
+    </div>
+  </div>
+</div>
+"""
+# Insert right before Profile Modal so JS hooks exist
+HTML_TEMPLATE = HTML_TEMPLATE.replace("<!-- Profile Modal -->", DW_SNIPPET + "\n\n<!-- Profile Modal -->")
+
+# ---------- Discord bot runner (optional) ----------
+# Starts a minimal Discord client so the bot shows as online.
+# Safe to disable with START_DISCORD_BOT=0.
+_bot_info = {"online": False, "last_ready": None, "error": None}
+
+def _start_discord_bot_if_configured():
     if not START_DISCORD_BOT:
-        print("START_DISCORD_BOT=0; bot disabled.")
+        _bot_info["error"] = "Disabled by START_DISCORD_BOT=0"
         return
     if not DISCORD_BOT_TOKEN:
-        BOT_LAST_ERROR = "DISCORD_BOT_TOKEN not set"
-        print("DISCORD_BOT_TOKEN not set; bot disabled.")
+        _bot_info["error"] = "DISCORD_BOT_TOKEN not set"
         return
     try:
-        await bot.start(DISCORD_BOT_TOKEN)
+        import threading, asyncio as _asyncio
+        import discord  # discord.py 2.x
     except Exception as e:
-        BOT_LAST_ERROR = str(e)
-        print("Bot start failed:", e)
+        _bot_info["error"] = f"discord.py not available: {e}"
+        return
+
+    def runner():
+        loop = _asyncio.new_event_loop()
+        _asyncio.set_event_loop(loop)
+        intents = discord.Intents.none()
+        intents.guilds = True
+        client = discord.Client(intents=intents)
+
+        @client.event
+        async def on_ready():
+            _bot_info["online"] = True
+            _bot_info["last_ready"] = iso(now_utc())
+            try:
+                await client.change_presence(activity=discord.Game(name="GROWCB"))
+            except Exception:
+                pass
+
+        @client.event
+        async def on_disconnect():
+            _bot_info["online"] = False
+
+        try:
+            loop.run_until_complete(client.start(DISCORD_BOT_TOKEN))
+        except Exception as e:
+            _bot_info["error"] = f"bot error: {e}"
+            _bot_info["online"] = False
+        finally:
+            try:
+                loop.run_until_complete(client.close())
+            except Exception:
+                pass
+            loop.stop()
+            loop.close()
+
+    th = threading.Thread(target=runner, name="discord-bot", daemon=True)
+    th.start()
 
 @app.get("/api/bot/status")
-async def bot_status():
+async def api_bot_status():
     return {
-        "online": bool(BOT_READY),
-        "token_present": bool(DISCORD_BOT_TOKEN),
-        "last_error": BOT_LAST_ERROR
+        "online": bool(_bot_info.get("online")),
+        "last_ready": _bot_info.get("last_ready"),
+        "error": _bot_info.get("error"),
+        "configured": bool(DISCORD_BOT_TOKEN),
+        "guild_id": int(GUILD_ID or 0),
     }
 
-# ---------- Startup ----------
-@app.on_event("startup")
-async def _on_startup():
-    if DISCORD_BOT_TOKEN and START_DISCORD_BOT:
-        asyncio.create_task(start_bot())
+# Start the bot when the module is imported by a server (e.g., uvicorn)
+try:
+    _start_discord_bot_if_configured()
+except Exception as _e:
+    _bot_info["error"] = f"startup error: {_e}"
 
-# ---------- Local runner ----------
+# ---------- Run ----------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=RELOAD)
+    uvicorn.run("app.main:app", host="0.0.0.0", port=PORT, reload=RELOAD)

@@ -14,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from itsdangerous import URLSafeSerializer, BadSignature
 from pydantic import BaseModel
 
-# ---------- Import games ----------
+# ---------- Games (external modules) ----------
 from crash import (
     ensure_betting_round, place_bet, load_round, begin_running,
     finish_round, create_next_betting, last_busts, your_bet,
@@ -23,6 +23,20 @@ from crash import (
 from mines import (
     mines_start, mines_pick, mines_cashout, mines_state, mines_history
 )
+
+# ---------- Promo (optional external module) ----------
+# If you don’t have promo.py, these fallbacks keep the app importable.
+try:
+    from promo import redeem_promo, create_promo, PromoInvalid, PromoExpired, PromoExhausted, PromoAlreadyRedeemed
+except Exception:
+    class PromoInvalid(Exception): pass
+    class PromoExpired(Exception): pass
+    class PromoExhausted(Exception): pass
+    class PromoAlreadyRedeemed(Exception): pass
+    def redeem_promo(user_id: str, code: str):
+        raise PromoInvalid("Promo feature not available")
+    def create_promo(actor_id: str, code: Optional[str], amount: str, max_uses: int, expires_at: Optional[str]):
+        raise PromoInvalid("Promo feature not available")
 
 # ---------- Config ----------
 getcontext().prec = 28
@@ -41,6 +55,7 @@ GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 DISCORD_INVITE = os.getenv("DISCORD_INVITE", "")
 REFERRAL_SHARE_BASE = os.getenv("REFERRAL_SHARE_BASE", "https://growcb.net/referral")
 CANONICAL_HOST = os.getenv("CANONICAL_HOST", "growcb.net")  # force show this host in browser
+OWNER_ONLY_MODE = os.getenv("OWNER_ONLY_MODE", "1") != "0"   # lock site to owner only (default ON)
 
 GEM = "💎"
 MIN_BET = Decimal("1.00")
@@ -68,89 +83,6 @@ def _get_static_dir():
     except Exception: pass
     return static_dir
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    init_db()
-    apply_migrations()
-    yield
-
-app = FastAPI(lifespan=lifespan)
-app.mount("/static", StaticFiles(directory=_get_static_dir()), name="static")
-
-# ---------- Canonical host redirect (force growcb.net) ----------
-@app.middleware("http")
-async def _canonical_host_redirect(request: Request, call_next):
-    try:
-        host = (request.headers.get("host") or urlparse(str(request.url)).hostname or "").split(":")[0].lower()
-        if host and CANONICAL_HOST and host not in ("localhost", "127.0.0.1") and host != CANONICAL_HOST.lower():
-            # Preserve path & query, just swap host
-            url = request.url
-            dest = str(url).replace(f"//{host}", f"//{CANONICAL_HOST}")
-            return RedirectResponse(dest, status_code=308)
-    except Exception:
-        pass
-    return await call_next(request)
-
-# Serve images next to main.py or /static
-_TRANSPARENT_PNG = base64.b64decode(
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
-)
-@app.get("/img/{filename}")
-async def serve_img(filename: str):
-    base = os.path.dirname(os.path.abspath(__file__))
-    p1 = os.path.join(base, filename)
-    p2 = os.path.join(base, "static", filename)
-    for p in (p1, p2):
-        if os.path.isfile(p): return FileResponse(p)
-    return Response(content=_TRANSPARENT_PNG, media_type="image/png")
-
-# ---------- Sessions (sticky cookie) ----------
-SER = URLSafeSerializer(SECRET_KEY, salt="session-v1")
-
-def _cookie_domain_from_request(request: Optional[Request]) -> Optional[str]:
-    try:
-        if not request: return None
-        host = request.headers.get("host") or urlparse(str(request.url)).hostname
-        if not host: return None
-        host = host.split(":")[0]
-        if re.match(r"^\d+\.\d+\.\d+\.\d+$", host) or host in ("localhost","127.0.0.1"):
-            return None
-        parts = host.split(".")
-        if len(parts) >= 2:
-            return "." + ".".join(parts[-2:])  # e.g. .growcb.net
-    except Exception:
-        return None
-    return None
-
-def _set_session(resp, data: dict, request: Optional[Request] = None):
-    cookie_val = SER.dumps(data)
-    domain = _cookie_domain_from_request(request)
-    resp.set_cookie(
-        "session",
-        cookie_val,
-        max_age=30*86400,
-        httponly=True,
-        samesite="lax",
-        secure=True,
-        path="/",
-        domain=domain
-    )
-
-def _clear_session(resp, request: Optional[Request] = None):
-    domain = _cookie_domain_from_request(request)
-    resp.delete_cookie("session", path="/", domain=domain)
-
-def _require_session(request: Request) -> dict:
-    raw = request.cookies.get("session")
-    if not raw: raise HTTPException(401, "Not logged in")
-    try:
-        sess = SER.loads(raw)
-        if not sess.get("id"): raise BadSignature("no id")
-        return sess
-    except BadSignature:
-        raise HTTPException(401, "Invalid session")
-
-# ---------- DB helpers ----------
 def with_conn(fn):
     def wrapper(*args, **kwargs):
         if not DATABASE_URL:
@@ -329,6 +261,17 @@ def init_db(cur):
             created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    # announcements (global, non-chat)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS announcements (
+            id BIGSERIAL PRIMARY KEY,
+            text TEXT NOT NULL,
+            starts_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+            ends_at TIMESTAMPTZ,
+            created_by TEXT,
+            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
 
 @with_conn
 def apply_migrations(cur):
@@ -337,8 +280,187 @@ def apply_migrations(cur):
     cur.execute("CREATE INDEX IF NOT EXISTS ix_mines_games_started_at ON mines_games (started_at)")
     cur.execute("ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS private_to TEXT")
     cur.execute("ALTER TABLE profiles ALTER COLUMN role SET DEFAULT 'member'")
+    cur.execute("CREATE INDEX IF NOT EXISTS ix_announcements_times ON announcements((starts_at IS NULL), starts_at, (ends_at IS NULL), ends_at)")
 
-# ---- balances / profiles
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    apply_migrations()
+    yield
+
+app = FastAPI(lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=_get_static_dir()), name="static")
+
+# ---------- Base HTML (SPA shell) ----------
+HTML_TEMPLATE = r"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>GROWCB</title>
+  <style>
+    :root{--bg:#070b16;--card:#0e1833;--border:#1b2746;--text:#eaf2ff;--muted:#9eb3da}
+    *{box-sizing:border-box}
+    html,body{height:100%}
+    body{margin:0;background:radial-gradient(900px 420px at 15% -10%,#12265d55,transparent 60%),linear-gradient(180deg,#070b16,#0a1020);color:var(--text);font-family:Inter,system-ui,Segoe UI,Roboto,Arial,Helvetica,sans-serif}
+    .wrap{max-width:1100px;margin:0 auto;padding:24px}
+    .hero{display:grid;gap:16px;margin-top:24px}
+    .card{background:linear-gradient(180deg,#0f1a33,#0b1326);border:1px solid var(--border);border-radius:16px;padding:20px;box-shadow:0 20px 50px rgba(0,0,0,.35)}
+    h1{margin:0 0 8px 0;font-size:28px}
+    p{margin:8px 0;color:var(--muted)}
+    .btn{display:inline-flex;gap:10px;align-items:center;padding:10px 14px;border-radius:12px;border:1px solid var(--border);cursor:pointer;background:linear-gradient(135deg,#3b82f6,#22c1dc);color:#06121a;font-weight:900;text-decoration:none}
+    #toasts{position:fixed;right:16px;bottom:16px;display:flex;flex-direction:column;gap:10px;z-index:9999}
+    .toast{background:#0f1a33;border:1px solid #1b2746;border-left:6px solid #3b82f6;padding:12px 14px;border-radius:12px;transition:opacity .2s}
+    .toast .t{font-weight:800;margin-bottom:4px}
+    #preload{display:flex;flex-direction:column;align-items:center;justify-content:center;margin:40px 0;opacity:.8}
+    #preload .spinner{width:30px;height:30px;border-radius:50%;border:3px solid #234;padding:0;border-top-color:#6aa6ff;animation:spin 1s linear infinite}
+    @keyframes spin{to{transform:rotate(360deg)}}
+  </style>
+</head>
+<body>
+  <div id="toasts"></div>
+  <div class="wrap">
+    <div class="card hero">
+      <h1>Welcome to GROWCB</h1>
+      <p>GROWCB is a community project offering fun, provably-fair mini-games like Crash and Mines, with Discord integration.</p>
+      <div>
+        <a class="btn" href="/login">Login with Discord</a>
+        <a class="btn" href="__INVITE__" target="_blank" rel="noreferrer">Join our Discord</a>
+      </div>
+    </div>
+
+    <div id="preload">
+      <div class="spinner"></div>
+    </div>
+  </div>
+</body>
+</html>
+"""
+
+# ---------- Canonical host redirect (force growcb.net) ----------
+@app.middleware("http")
+async def _canonical_host_redirect(request: Request, call_next):
+    try:
+        host = (request.headers.get("host") or urlparse(str(request.url)).hostname or "").split(":")[0].lower()
+        if host and CANONICAL_HOST and host not in ("localhost", "127.0.0.1") and host != CANONICAL_HOST.lower():
+            url = request.url
+            dest = str(url).replace(f"//{host}", f"//{CANONICAL_HOST}")
+            return RedirectResponse(dest, status_code=308)
+    except Exception:
+        pass
+    return await call_next(request)
+
+# ---------- Owner-only lock (site closed for everyone except OWNER) ----------
+OWNER_GATE_ALLOW = ("/login", "/callback", "/static/", "/img/", "/healthz", "/api/bot/status")
+
+@app.middleware("http")
+async def _owner_only_gate(request: Request, call_next):
+    if not OWNER_ONLY_MODE:
+        return await call_next(request)
+
+    path = request.url.path or "/"
+    # allow health, login, callback, assets, bot status
+    if any(path == p or path.startswith(p) for p in OWNER_GATE_ALLOW):
+        return await call_next(request)
+
+    # Check session
+    raw = request.cookies.get("session")
+    uid = None
+    if raw:
+        try:
+            uid = URLSafeSerializer(SECRET_KEY, salt="session-v1").loads(raw).get("id")
+        except Exception:
+            uid = None
+
+    if str(uid) == str(OWNER_ID):
+        return await call_next(request)
+
+    # Gate page
+    gate_html = """
+    <!doctype html><html><head>
+      <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+      <title>GROWCB — Private</title>
+      <style>
+        :root{--bg:#070b16;--card:#0e1833;--border:#1b2746;--text:#eaf2ff;--muted:#9eb3da}
+        *{box-sizing:border-box}body,html{height:100%}body{margin:0;background:radial-gradient(900px 420px at 15% -10%,#12265d55,transparent 60%),linear-gradient(180deg,#070b16,#0a1020);color:var(--text);font-family:Inter,system-ui,Segoe UI,Roboto,Arial,Helvetica,sans-serif}
+        .wrap{min-height:100%;display:grid;place-items:center;padding:20px}
+        .card{width:min(560px,92vw);background:linear-gradient(180deg,#0f1a33,#0b1326);border:1px solid var(--border);border-radius:16px;padding:20px;box-shadow:0 20px 50px rgba(0,0,0,.35)}
+        .title{font-weight:900;font-size:26px;letter-spacing:.3px}
+        .muted{color:var(--muted)}
+        .btn{display:inline-flex;gap:10px;align-items:center;padding:10px 14px;border-radius:12px;border:1px solid var(--border);cursor:pointer;background:linear-gradient(135deg,#3b82f6,#22c1dc);color:#06121a;font-weight:900}
+      </style>
+    </head><body>
+      <div class="wrap">
+        <div class="card">
+          <div class="title">GROWCB — Private Beta</div>
+          <p class="muted">Access is closed for now. Only the owner can view the site.</p>
+          <a class="btn" href="/login">Login with Discord</a>
+        </div>
+      </div>
+    </body></html>
+    """
+    return HTMLResponse(gate_html, status_code=403)
+
+# Serve images next to main.py or /static
+_TRANSPARENT_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
+)
+@app.get("/img/{filename}")
+async def serve_img(filename: str):
+    base = os.path.dirname(os.path.abspath(__file__))
+    p1 = os.path.join(base, filename)
+    p2 = os.path.join(base, "static", filename)
+    for p in (p1, p2):
+        if os.path.isfile(p): return FileResponse(p)
+    return Response(content=_TRANSPARENT_PNG, media_type="image/png")
+
+# ---------- Sessions (sticky cookie) ----------
+SER = URLSafeSerializer(SECRET_KEY, salt="session-v1")
+
+def _cookie_domain_from_request(request: Optional[Request]) -> Optional[str]:
+    try:
+        if not request: return None
+        host = request.headers.get("host") or urlparse(str(request.url)).hostname
+        if not host: return None
+        host = host.split(":")[0]
+        if re.match(r"^\d+\.\d+\.\d+\.\d+$", host) or host in ("localhost","127.0.0.1"):
+            return None
+        parts = host.split(".")
+        if len(parts) >= 2:
+            return "." + ".".join(parts[-2:])  # e.g. .growcb.net
+    except Exception:
+        return None
+    return None
+
+def _set_session(resp, data: dict, request: Optional[Request] = None):
+    cookie_val = SER.dumps(data)
+    domain = _cookie_domain_from_request(request)
+    resp.set_cookie(
+        "session",
+        cookie_val,
+        max_age=30*86400,
+        httponly=True,
+        samesite="lax",
+        secure=True,
+        path="/",
+        domain=domain
+    )
+
+def _clear_session(resp, request: Optional[Request] = None):
+    domain = _cookie_domain_from_request(request)
+    resp.delete_cookie("session", path="/", domain=domain)
+
+def _require_session(request: Request) -> dict:
+    raw = request.cookies.get("session")
+    if not raw: raise HTTPException(401, "Not logged in")
+    try:
+        sess = SER.loads(raw)
+        if not sess.get("id"): raise BadSignature("no id")
+        return sess
+    except BadSignature:
+        raise HTTPException(401, "Invalid session")
+
+# ---------- DB helpers: balances / profiles ----------
 @with_conn
 def get_balance(cur, user_id: str) -> Decimal:
     cur.execute("SELECT balance FROM balances WHERE user_id = %s", (user_id,))
@@ -373,7 +495,6 @@ def get_profile_name(cur, user_id: str):
 
 @with_conn
 def set_profile_is_anon(cur, user_id: str, is_anon: bool):
-    ensure_profile_row(user_id)
     cur.execute("UPDATE profiles SET is_anon=%s WHERE user_id=%s", (bool(is_anon), user_id))
     return {"ok": True, "is_anon": bool(is_anon)}
 
@@ -417,7 +538,7 @@ def set_role(cur, target_id: str, role: str):
     cur.execute("UPDATE profiles SET role=%s WHERE user_id=%s", (role, target_id))
     return {"ok": True, "role": role}
 
-# ---------- Leaderboard ----------
+# ---------- Leaderboard helpers ----------
 def _start_of_utc_day(dt: datetime.datetime) -> datetime.datetime:
     return dt.astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
 def _start_of_utc_month(dt: datetime.datetime) -> datetime.datetime:
@@ -480,573 +601,6 @@ def get_leaderboard_rows_db(cur, period: str, limit: int = 50):
             "total_wagered": float(q2(D(total)))
         })
     return out
-
-# ---------- OAuth / Auth ----------
-@app.get("/login")
-async def login():
-    if not (CLIENT_ID and OAUTH_REDIRECT):
-        return HTMLResponse("OAuth not configured")
-    params = {
-        "client_id": CLIENT_ID,
-        "redirect_uri": OAUTH_REDIRECT,
-        "response_type": "code",
-        "scope": "identify guilds.join",
-        "prompt": "consent"
-    }
-    return RedirectResponse(f"{DISCORD_API}/oauth2/authorize?{urlencode(params)}")
-
-@app.get("/callback")
-async def callback(request: Request, code: str):
-    if not (CLIENT_ID and CLIENT_SECRET and OAUTH_REDIRECT):
-        return HTMLResponse("OAuth not configured")
-    async with httpx.AsyncClient(timeout=15) as cx:
-        data = {
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": OAUTH_REDIRECT
-        }
-        r = await cx.post(f"{DISCORD_API}/oauth2/token", data=data, headers={"Content-Type":"application/x-www-form-urlencoded"})
-        if r.status_code != 200:
-            return HTMLResponse(f"OAuth failed: {r.text}", status_code=400)
-        tok = r.json()
-        access = tok.get("access_token")
-        async with httpx.AsyncClient(timeout=15) as cx2:
-            u = await cx2.get(f"{DISCORD_API}/users/@me", headers={"Authorization": f"Bearer {access}"})
-            if u.status_code != 200:
-                return HTMLResponse(f"User fetch failed: {u.text}", status_code=400)
-            me = u.json()
-
-    user_id = str(me["id"])
-    username = f'{me.get("username","user")}#{me.get("discriminator","0")}'.replace("#0","")
-    avatar_hash = me.get("avatar")
-    avatar_url = f"https://cdn.discordapp.com/avatars/{user_id}/{avatar_hash}.png?size=128" if avatar_hash else "https://cdn.discordapp.com/embed/avatars/0.png"
-
-    ensure_profile_row(user_id)
-    save_tokens(user_id, tok.get("access_token",""), tok.get("refresh_token"), tok.get("expires_in"))
-
-    resp = RedirectResponse("/games")
-    _set_session(resp, {"id": user_id, "username": username, "avatar_url": avatar_url}, request)
-    return resp
-
-@app.get("/logout")
-async def logout(request: Request):
-    resp = RedirectResponse("/games")
-    _clear_session(resp, request)
-    return resp
-
-# ---------- Token store & guild join ----------
-@with_conn
-def save_tokens(cur, user_id: str, access_token: str, refresh_token: Optional[str], expires_in: Optional[int]):
-    expires_at = now_utc() + datetime.timedelta(seconds=int(expires_in or 0)) if expires_in else None
-    cur.execute("""
-        INSERT INTO oauth_tokens(user_id, access_token, refresh_token, expires_at)
-        VALUES (%s,%s,%s,%s)
-        ON CONFLICT (user_id) DO UPDATE SET access_token=EXCLUDED.access_token, refresh_token=EXCLUDED.refresh_token, expires_at=EXCLUDED.expires_at
-    """, (user_id, access_token, refresh_token, expires_at))
-
-@with_conn
-def get_tokens(cur, user_id: str):
-    cur.execute("SELECT access_token, refresh_token, expires_at FROM oauth_tokens WHERE user_id=%s", (user_id,))
-    r = cur.fetchone()
-    if not r: return None
-    return {"access_token": r[0], "refresh_token": r[1], "expires_at": r[2]}
-
-async def discord_refresh_token(user_id: str):
-    rec = get_tokens(user_id)
-    if not rec or not rec.get("refresh_token"): return None
-    if not CLIENT_ID or not CLIENT_SECRET: return None
-    async with httpx.AsyncClient(timeout=15) as cx:
-        data = {
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
-            "grant_type": "refresh_token",
-            "refresh_token": rec["refresh_token"]
-        }
-        r = await cx.post(f"{DISCORD_API}/oauth2/token", data=data, headers={"Content-Type":"application/x-www-form-urlencoded"})
-        if r.status_code != 200: return None
-        js = r.json()
-        save_tokens(user_id, js.get("access_token",""), js.get("refresh_token"), js.get("expires_in"))
-        return js.get("access_token")
-
-async def discord_get_valid_access_token(user_id: str):
-    rec = get_tokens(user_id)
-    if not rec: return None
-    exp = rec.get("expires_at")
-    if exp and isinstance(exp, datetime.datetime) and exp.tzinfo is None:
-        exp = exp.replace(tzinfo=UTC)
-    if (not exp) or (exp - now_utc() < datetime.timedelta(seconds=30)):
-        tok = await discord_refresh_token(user_id)
-        if tok: return tok
-    return rec.get("access_token")
-
-async def guild_add_member(user_id: str, nickname: Optional[str] = None):
-    if not (DISCORD_BOT_TOKEN and GUILD_ID):
-        raise HTTPException(500, "Discord bot or guild not configured")
-    access = await discord_get_valid_access_token(user_id)
-    if not access:
-        raise HTTPException(400, "Missing OAuth token. Re-login needed.")
-    payload = {"access_token": access}
-    if nickname: payload["nick"] = nickname
-    async with httpx.AsyncClient(timeout=15) as cx:
-        url = f"{DISCORD_API}/guilds/{GUILD_ID}/members/{user_id}"
-        r = await cx.put(url, json=payload, headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"})
-        if r.status_code in (201, 204): return {"ok": True}
-        if r.status_code == 409: return {"ok": True}
-        raise HTTPException(r.status_code, f"Discord join failed: {r.text}")
-
-# ---------- Me / Balance / Public profile ----------
-@app.get("/api/me")
-async def api_me(request: Request):
-    s = _require_session(request)
-    in_guild = False
-    if DISCORD_BOT_TOKEN and GUILD_ID:
-        try:
-            async with httpx.AsyncClient(timeout=8) as cx:
-                r = await cx.get(f"{DISCORD_API}/guilds/{GUILD_ID}/members/{s['id']}",
-                                 headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"})
-                in_guild = (r.status_code == 200)
-        except:
-            in_guild = False
-    return {"id": s["id"], "username": s["username"], "avatar_url": s.get("avatar_url"), "in_guild": in_guild}
-
-@app.get("/api/balance")
-async def api_balance(request: Request):
-    s = _require_session(request)
-    return {"balance": float(get_balance(s["id"]))}
-
-@app.get("/api/profile/public")
-async def api_profile_public(user_id: str):
-    prof = public_profile(user_id)
-    if not prof: raise HTTPException(404, "User not found")
-    return prof
-
-# small internal profile for header/menu
-@app.get("/api/profile")
-async def api_profile(request: Request):
-    s = _require_session(request)
-    return profile_info(s["id"])
-
-# ---------- Settings (Anon) ----------
-class AnonIn(BaseModel):
-    is_anon: bool
-
-@app.get("/api/settings/get")
-async def api_settings_get(request: Request):
-    s = _require_session(request)
-    info = profile_info(s["id"])
-    return {"is_anon": bool(info["is_anon"])}
-
-@app.post("/api/settings/set_anon")
-async def api_settings_set_anon(request: Request, body: AnonIn):
-    s = _require_session(request)
-    return set_profile_is_anon(s["id"], bool(body.is_anon))
-
-# ---------- Referral ----------
-@with_conn
-def get_ref_state(cur, user_id: str):
-    cur.execute("SELECT name_lower FROM ref_names WHERE user_id=%s", (user_id,))
-    r = cur.fetchone()
-    name = r[0] if r else None
-    cur.execute("SELECT COUNT(*) FROM ref_visits WHERE referrer_id=%s AND joined_user_id IS NOT NULL", (user_id,))
-    joined = int(cur.fetchone()[0])
-    cur.execute("SELECT COUNT(*) FROM ref_visits WHERE referrer_id=%s", (user_id,))
-    clicks = int(cur.fetchone()[0])
-    return {"name": name, "joined": joined, "clicks": clicks}
-
-NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{3,20}$")
-
-@with_conn
-def set_ref_name(cur, user_id: str, name: str):
-    if not NAME_RE.match(name): raise ValueError("3–20 chars: letters, numbers, _ or -")
-    lower = name.lower()
-    cur.execute("SELECT user_id FROM ref_names WHERE name_lower=%s AND user_id<>%s", (lower, user_id))
-    if cur.fetchone(): raise ValueError("Name is already taken")
-    cur.execute("""
-        INSERT INTO ref_names(user_id, name_lower)
-        VALUES(%s,%s)
-        ON CONFLICT (user_id) DO UPDATE SET name_lower=EXCLUDED.name_lower
-    """, (user_id, lower))
-    return {"ok": True, "name": lower}
-
-@app.get("/api/referral/state")
-async def api_ref_state(request: Request):
-    s = _require_session(request)
-    return get_ref_state(s["id"])
-
-class RefIn(BaseModel):
-    name: str
-
-@app.post("/api/referral/set")
-async def api_ref_set(request: Request, body: RefIn):
-    s = _require_session(request)
-    return set_ref_name(s["id"], body.name)
-
-@app.get("/r/{refname}")
-async def referral_landing(refname: str, request: Request):
-    refname = (refname or "").lower()
-    with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
-        cur.execute("SELECT user_id FROM ref_names WHERE name_lower=%s", (refname,))
-        r = cur.fetchone()
-        if r:
-            referrer = str(r[0])
-            cur.execute("INSERT INTO ref_visits(referrer_id) VALUES (%s)", (referrer,))
-            con.commit()
-    html = f"""
-    <script>
-      document.cookie = "refname={refname}; path=/; max-age=1209600; samesite=lax";
-      location.href = "/games";
-    </script>
-    """
-    return HTMLResponse(html)
-
-@app.get("/api/referral/attach")
-async def api_ref_attach(request: Request, refname: str = ""):
-    s = _require_session(request)
-    rn = (refname or "").lower()
-    if not rn: return {"ok": True}
-    with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
-        cur.execute("SELECT user_id FROM ref_names WHERE name_lower=%s", (rn,))
-        r = cur.fetchone()
-        if not r: return {"ok": True}
-        referrer = str(r[0])
-        if referrer == s["id"]: return {"ok": True}
-        cur.execute("SELECT referred_by FROM profiles WHERE user_id=%s", (s["id"],))
-        already = cur.fetchone()
-        if already and already[0]: return {"ok": True}
-        cur.execute("UPDATE profiles SET referred_by=%s WHERE user_id=%s", (referrer, s["id"]))
-        cur.execute("INSERT INTO ref_visits(referrer_id, joined_user_id) VALUES (%s,%s)", (referrer, s["id"]))
-        con.commit()
-    return {"ok": True}
-
-# ---------- Promo ----------
-class PromoIn(BaseModel):
-    code: str
-
-@app.get("/api/promo/my")
-async def api_promo_my(request: Request):
-    s = _require_session(request)
-    with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
-        cur.execute("SELECT code, redeemed_at FROM promo_redemptions WHERE user_id=%s ORDER BY redeemed_at DESC LIMIT 50", (s["id"],))
-        rows = [{"code": r[0], "redeemed_at": str(r[1])} for r in cur.fetchall()]
-    return {"rows": rows}
-
-@app.post("/api/promo/redeem")
-async def api_promo_redeem(request: Request, body: PromoIn):
-    s = _require_session(request)
-    try:
-        bal = redeem_promo(s["id"], body.code)
-        return {"ok": True, "new_balance": float(bal)}
-    except (PromoInvalid, PromoExpired, PromoExhausted, PromoAlreadyRedeemed) as e:
-        raise HTTPException(400, str(e))
-
-class PromoCreateIn(BaseModel):
-    code: Optional[str] = None
-    amount: str
-    max_uses: int = 1
-    expires_at: Optional[str] = None
-
-@app.post("/api/admin/promo/create")
-async def api_admin_promo_create(request: Request, body: PromoCreateIn):
-    s = _require_session(request)
-    role = get_role(s["id"])
-    if role not in ("admin", "owner"): raise HTTPException(403, "No permission")
-    res = create_promo(s["id"], body.code, body.amount, int(body.max_uses or 1), body.expires_at)
-    return res
-
-# ---------- Transfers (deposit/withdraw) ----------
-class TransferIn(BaseModel):
-    ttype: str           # 'deposit' or 'withdraw'
-    amount: Optional[str] = None
-    world: Optional[str] = None
-    grow_id: Optional[str] = None
-
-@with_conn
-def create_transfer(cur, user_id: str, ttype: str, amount: Optional[str], world: Optional[str], grow_id: Optional[str]):
-    ttype = (ttype or "").lower().strip()
-    if ttype not in ("deposit","withdraw"):
-        raise ValueError("Invalid type")
-    amt = q2(D(amount or "0")) if amount else None
-    cur.execute("""
-        INSERT INTO transfers(user_id, ttype, amount, world, grow_id, status)
-        VALUES (%s,%s,%s,%s,%s,'pending') RETURNING id
-    """, (user_id, ttype, amt, world, (grow_id or "").strip() or None))
-    return {"ok": True, "id": int(cur.fetchone()[0])}
-
-@app.post("/api/transfer/create")
-async def api_transfer_create(request: Request, body: TransferIn):
-    s = _require_session(request)
-    try:
-        r = create_transfer(s["id"], body.ttype, body.amount, body.world, body.grow_id)
-        return r
-    except Exception as e:
-        raise HTTPException(400, str(e))
-
-# ---------- Chat ----------
-class ChatIn(BaseModel):
-    text: str
-
-@with_conn
-def get_role(cur, user_id: str) -> str:
-    cur.execute("SELECT role FROM profiles WHERE user_id=%s", (user_id,))
-    r = cur.fetchone()
-    return r[0] if r else "member"
-
-@with_conn
-def chat_timeout_set(cur, actor_id: str, user_id: str, seconds: int, reason: Optional[str]):
-    until = now_utc() + datetime.timedelta(seconds=max(1, seconds))
-    cur.execute("""INSERT INTO chat_timeouts(user_id, until, reason, created_by)
-                   VALUES (%s,%s,%s,%s)
-                   ON CONFLICT (user_id) DO UPDATE SET until=EXCLUDED.until, reason=EXCLUDED.reason, created_by=EXCLUDED.created_by""",
-                (user_id, until, reason, actor_id))
-    return {"ok": True, "until": str(until)}
-
-@with_conn
-def chat_insert(cur, user_id: str, username: str, text: str, private_to: Optional[str] = None):
-    text = (text or "").strip()
-    if not text: raise ValueError("Message is empty")
-    if len(text) > 300: raise ValueError("Message is too long (max 300)")
-    ensure_profile_row(user_id)
-    if private_to is None:
-        cur.execute("SELECT until FROM chat_timeouts WHERE user_id=%s", (user_id,))
-        r = cur.fetchone()
-        if r and r[0] > now_utc(): raise PermissionError("You are timed out")
-    cur.execute("INSERT INTO chat_messages(user_id, username, text, private_to) VALUES (%s,%s,%s,%s) RETURNING id, created_at",
-                (user_id, username, text, private_to))
-    row = cur.fetchone()
-    return {"id": int(row[0]), "created_at": str(row[1])}
-
-@with_conn
-def chat_fetch(cur, since_id: int, limit: int, for_user_id: Optional[str]):
-    if since_id <= 0:
-        cur.execute("""SELECT id, user_id, username, text, created_at, private_to
-                       FROM chat_messages
-                       WHERE private_to IS NULL
-                       ORDER BY id DESC LIMIT %s""", (limit,))
-        rows_pub = list(reversed(cur.fetchall()))
-        rows_priv = []
-        if for_user_id:
-            cur.execute("""SELECT id, user_id, username, text, created_at, private_to
-                           FROM chat_messages
-                           WHERE private_to=%s
-                           ORDER BY id DESC LIMIT %s""", (for_user_id, limit))
-            rows_priv = list(reversed(cur.fetchall()))
-        rows = sorted(rows_pub + rows_priv, key=lambda r: r[0])
-    else:
-        if for_user_id:
-            cur.execute("""SELECT id, user_id, username, text, created_at, private_to
-                           FROM chat_messages
-                           WHERE id>%s AND (private_to IS NULL OR private_to=%s)
-                           ORDER BY id ASC LIMIT %s""", (since_id, for_user_id, limit))
-        else:
-            cur.execute("""SELECT id, user_id, username, text, created_at, private_to
-                           FROM chat_messages
-                           WHERE id>%s AND private_to IS NULL
-                           ORDER BY id ASC LIMIT %s""", (since_id, limit))
-        rows = cur.fetchall()
-
-    uids = list({str(r[1]) for r in rows})
-    levels: Dict[str, int] = {}
-    roles: Dict[str, str] = {}
-    if uids:
-        cur.execute("SELECT user_id, xp, role FROM profiles WHERE user_id = ANY(%s)", (uids,))
-        for uid, xp, role in cur.fetchall():
-            levels[str(uid)] = 1 + int(xp) // 100
-            roles[str(uid)] = role or "member"
-    out = []
-    for mid, uid, uname, txt, ts, priv in rows:
-        uid = str(uid)
-        out.append({"id": int(mid), "user_id": uid, "username": uname,
-                    "level": int(levels.get(uid,1)), "role": roles.get(uid,"member"),
-                    "text": txt, "created_at": str(ts), "private_to": priv})
-    return out
-
-@with_conn
-def chat_delete(cur, message_id: int):
-    cur.execute("DELETE FROM chat_messages WHERE id=%s", (message_id,))
-    return {"ok": True}
-
-@app.post("/api/chat/send")
-async def api_chat_send(request: Request, body: ChatIn):
-    s = _require_session(request)
-    prof = profile_info(s["id"])
-    if prof["level"] < 5:
-        raise HTTPException(403, "You need to be level 5 to chat.")
-    return chat_insert(s["id"], s["username"], body.text, None)
-
-@app.get("/api/chat/fetch")
-async def api_chat_fetch(request: Request, since: int = 0, limit: int = 30):
-    uid = None
-    try: uid = _require_session(request)["id"]
-    except: pass
-    rows = chat_fetch(since, limit, uid)
-    return {"rows": rows}
-
-@app.post("/api/chat/delete")
-async def api_chat_del(request: Request, id: int):
-    s = _require_session(request)
-    role = get_role(s["id"])
-    if role not in ("admin","owner"): raise HTTPException(403, "No permission")
-    return chat_delete(id)
-
-# ---------- Admin (minimal) ----------
-class AdjustIn(BaseModel):
-    identifier: str  # id or mention or handle
-    amount: str
-    reason: Optional[str] = None
-
-def _id_from_identifier(identifier: str) -> str:
-    m = re.search(r"\d{5,}", identifier or "")
-    if m: return m.group(0)
-    with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
-        cur.execute("SELECT user_id FROM profiles WHERE name_lower=%s", (identifier.lower(),))
-        r = cur.fetchone()
-        if r: return str(r[0])
-    raise HTTPException(400, "Provide a numeric Discord ID, mention, or exact handle")
-
-@app.post("/api/admin/adjust")
-async def api_admin_adjust(request: Request, body: AdjustIn):
-    s = _require_session(request)
-    role = get_role(s["id"])
-    if role not in ("admin","owner"): raise HTTPException(403, "No permission")
-    target = _id_from_identifier(body.identifier)
-    newbal = adjust_balance(s["id"], target, D(body.amount), body.reason)
-    return {"new_balance": float(newbal)}
-
-class RoleIn(BaseModel):
-    identifier: str
-    role: str
-
-@app.post("/api/admin/role")
-async def api_admin_role(request: Request, body: RoleIn):
-    s = _require_session(request)
-    role = get_role(s["id"])
-    if role != "owner": raise HTTPException(403, "Only owner can set roles")
-    target = _id_from_identifier(body.identifier)
-    return set_role(target, body.role)
-
-class TimeoutIn(BaseModel):
-    identifier: str
-    seconds: int
-    reason: Optional[str] = None
-
-@app.post("/api/admin/timeout_site")
-async def api_admin_timeout_site(request: Request, body: TimeoutIn):
-    s = _require_session(request)
-    role = get_role(s["id"])
-    if role not in ("admin","owner"): raise HTTPException(403, "No permission")
-    target = _id_from_identifier(body.identifier)
-    return chat_timeout_set(s["id"], target, int(body.seconds), body.reason or "")
-
-@app.post("/api/admin/timeout_both")
-async def api_admin_timeout_both(request: Request, body: TimeoutIn):
-    return await api_admin_timeout_site(request, body)
-
-class AnnounceIn(BaseModel):
-    text: str
-
-@app.post("/api/admin/announce")
-async def api_admin_announce(request: Request, body: AnnounceIn):
-    s = _require_session(request)
-    role = get_role(s["id"])
-    if role not in ("admin","owner","moderator","media"): raise HTTPException(403, "No permission")
-    return chat_insert(s["id"], s["username"], f"[Announcement] {body.text}", None)
-
-# ---------- Discord Join ----------
-@app.post("/api/discord/join")
-async def api_discord_join(request: Request):
-    s = _require_session(request)
-    nick = get_profile_name(s["id"]) or s["username"]
-    return await guild_add_member(s["id"], nickname=nick)
-
-# ---------- Crash ----------
-class CrashBetIn(BaseModel):
-    bet: str
-    cashout: Optional[float] = None
-
-@app.get("/api/crash/state")
-async def api_crash_state(request: Request):
-    try:
-        s = _require_session(request); uid = s["id"]
-    except:
-        uid = None
-
-    rid, info = ensure_betting_round()
-    now = now_utc()
-
-    if info["status"] == "betting" and now >= info["betting_ends_at"]:
-        begin_running(rid); info = load_round()
-    if info and info["status"] == "running" and info["expected_end_at"] and now >= info["expected_end_at"]:
-        finish_round(rid); create_next_betting(); info = load_round()
-
-    out = {
-        "phase": info["status"],
-        "bust": info["bust"],
-        "betting_opens_at": iso(info["betting_opens_at"]),
-        "betting_ends_at": iso(info["betting_ends_at"]),
-        "started_at": iso(info["started_at"]),
-        "expected_end_at": iso(info["expected_end_at"]),
-        "last_busts": last_busts()
-    }
-    if info["status"] == "running":
-        out["current_multiplier"] = current_multiplier(info["started_at"], info["expected_end_at"], info["bust"], now)
-    if uid:
-        y = your_bet(rid, uid)
-        if y: out["your_bet"] = y
-    return out
-
-@app.post("/api/crash/place")
-async def api_crash_place(request: Request, body: CrashBetIn):
-    s = _require_session(request)
-    bet = q2(D(body.bet or "0"))
-    cashout = float(body.cashout or 2.0)
-    return place_bet(s["id"], bet, max(1.01, cashout))
-
-@app.post("/api/crash/cashout")
-async def api_crash_cashout(request: Request):
-    s = _require_session(request)
-    cur = load_round()
-    if not cur or cur["status"] != "running":
-        raise HTTPException(400, "No running round")
-    return cashout_now(s["id"])
-
-@app.get("/api/crash/history")
-async def api_crash_history(request: Request):
-    s = _require_session(request)
-    return {"rows": your_history(s["id"], 10)}
-
-# ---------- Mines ----------
-class MinesStartIn(BaseModel):
-    bet: str
-    mines: int
-
-@app.post("/api/mines/start")
-async def api_mines_start(request: Request, body: MinesStartIn):
-    s = _require_session(request)
-    return mines_start(s["id"], q2(D(body.bet or "0")), int(body.mines))
-
-@app.post("/api/mines/pick")
-async def api_mines_pick(request: Request, index: int = Query(..., ge=0, le=24)):
-    s = _require_session(request)
-    return mines_pick(s["id"], index)
-
-@app.post("/api/mines/cashout")
-async def api_mines_cashout(request: Request):
-    s = _require_session(request)
-    return mines_cashout(s["id"])
-
-@app.get("/api/mines/state")
-async def api_mines_state(request: Request):
-    s = _require_session(request)
-    st = mines_state(s["id"])
-    return st or {}
-
-@app.get("/api/mines/history")
-async def api_mines_history(request: Request):
-    s = _require_session(request)
-    return {"rows": mines_history(s["id"], 15)}
-
 # ---------- HTML (UI/UX) ----------
 HTML_TEMPLATE = r"""
 <!doctype html>
@@ -1085,13 +639,11 @@ a{color:inherit;text-decoration:none}
 /* Inputs & buttons */
 input,select,textarea{width:100%;appearance:none;background:var(--input-bg);color:var(--input-tx);border:1px solid var(--input-br);border-radius:12px;padding:10px 12px;outline:none}
 .field{display:flex;flex-direction:column;gap:6px}
-.btn{display:inline-flex;align-items:center;gap:10px;padding:10px 14px;border-radius:12px;border:1px solid var(--border);cursor:pointer;font-weight:700;user-select:none}
+.btn{display:inline-flex;align-items:center;gap:10px;padding:10px 14px;border-radius:12px;border:1px solid var(--border);cursor:pointer;font-weight:800;user-select:none}
 .btn.primary{background:linear-gradient(135deg,#3b82f6,#22c1dc);border-color:transparent;color:#041018;box-shadow:0 12px 24px rgba(59,130,246,.25)}
-.btn.ghost{background:linear-gradient(180deg,#0e1833,#0b1326);border:1px solid var(--border)}
+.btn.ghost{background:linear-gradient(180deg,#0e1833,#0b1326);border:1px solid var(--border);color:#eaf2ff}
 .btn.alt{background:linear-gradient(135deg,#22c55e,#16a34a);border-color:transparent;color:#041018}
 .btn.gray{background:#0e1833;border:1px solid var(--border);color:#eaf2ff}
-.btn.discord{background:linear-gradient(135deg,#6a73ff,#5865f2);border-color:transparent;color:#050916;box-shadow:0 10px 22px rgba(88,101,242,.35);display:inline-flex;align-items:center;gap:8px}
-.btn.discord svg{width:18px;height:18px;}
 
 /* Toasts bottom-right */
 #toasts{position:fixed;right:16px;bottom:16px;display:flex;flex-direction:column;gap:10px;z-index:10000}
@@ -1584,11 +1136,8 @@ function handleRoute(){
 window.addEventListener('popstate', handleRoute);
 
 /* Header / Auth + Account modal */
-function discordIcon(){
-  return `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.317 4.369A19.791 19.791 0 0016.558 3c-.2.36-.433.846-.593 1.226a18.3 18.3 0 00-7.93 0A7.9 7.9 0 007.442 3a19.736 19.736 0 00-3.76 1.369C1.992 7.109 1.28 9.753 1.5 12.357c1.58 1.173 3.114 1.892 4.607 2.357a14.63 14.63 0 001.014-1.624c-.56-.214-1.095-.476-1.602-.781.134-.1.266-.204.394-.31 3.094 1.45 6.437 1.45 9.506 0 .13.106.262.21.396.31-.51.306-1.046.57-1.608.783.29.56.63 1.11 1.012 1.626 1.493-.465 3.027-1.184 4.607-2.357.378-4.393-.64-7.016-2.609-7.988zM9.25 12.348c-.935 0-1.693-.86-1.693-1.915 0-1.054.75-1.914 1.693-1.914.943 0 1.705.86 1.693 1.914 0 1.055-.75 1.915-1.693 1.915zm5.5 0c-.934 0-1.692-.86-1.692-1.915 0-1.054.758-1.914 1.693-1.914.943 0 1.692.86 1.692 1.914 0 1.055-.75 1.915-1.693 1.915z"/></svg>`;
-}
 async function renderHeader(){
-  let me=null, bal=null, prof=null, settings=null;
+  let me=null, bal=null, prof=null;
   try{ me = await j('/api/me'); }catch(_){}
   const area = qs('authArea');
   if(me){
@@ -1596,7 +1145,7 @@ async function renderHeader(){
     try{ prof = await j('/api/profile'); }catch(_){}
     area.innerHTML = `
       <button class="btn primary" id="btnDW">Deposit / Withdraw</button>
-      <button class="btn discord" id="btnJoinSmall">${discordIcon()} ${me.in_guild ? 'In Discord' : 'Join Discord'}</button>
+      <button class="btn ghost" id="btnJoinSmall">${me.in_guild ? 'In Discord' : 'Join Discord'}</button>
       <span class="balance-chip" id="balChip">${bal ? dlHtml(bal.balance) : dlHtml(0)}</span>
       <img class="avatar" id="avatarBtn" src="${me.avatar_url||''}" title="${me.username||'user'}"/>
     `;
@@ -1977,13 +1526,69 @@ if(qs('opApply')){
 </body>
 </html>
 """
+# ---------- HTML augmentation (announcements + polish) ----------
+# Inject a tiny polling script for announcements + enhanced preloader + modal animation & safer button contrast
+EXTRA_SNIPPET = r"""
+<script>
+(function(){
+  // safer button text contrast on dark surfaces
+  document.head.insertAdjacentHTML('beforeend', `<style>
+    .btn { font-weight: 800; }
+    .btn.gray, .btn.ghost { color:#eaf2ff !important; }
+    .modal.open .box { animation: pop .22s ease; transform-origin: 50% 40%; }
+    @keyframes pop { from{transform:scale(.96); opacity:.0} to{transform:scale(1); opacity:1} }
+    #preload .title { margin-top:12px; font-weight:900; letter-spacing:.5px; color:#eaf2ff; opacity:.9 }
+  </style>`);
+
+  // add wordmark under spinner
+  const pr = document.getElementById('preload');
+  if(pr){
+    const t = document.createElement('div'); t.className='title'; t.textContent='GROWCB';
+    pr.appendChild(t);
+  }
+
+  // announcement polling -> use toast UI
+  const SEEN_KEY = 'ann_seen_ids_v1';
+  const seen = new Set((localStorage.getItem(SEEN_KEY)||'').split(',').filter(Boolean).map(x=>String(x)));
+  async function poll(){
+    try{
+      const r = await fetch('/api/announcements/active'); if(!r.ok) throw new Error('net');
+      const js = await r.json();
+      const rows = (js && js.rows)||[];
+      for(const a of rows){
+        const id = String(a.id);
+        if(!seen.has(id)){
+          // compact toast
+          const box = document.createElement('div');
+          box.className='toast';
+          box.style.borderLeftColor='#6aa6ff';
+          box.innerHTML = `<div class="t">Announcement</div><div class="m">${(a.text||'').replace(/[<>&]/g, m=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[m]))}</div>`;
+          const host = document.getElementById('toasts'); host.appendChild(box);
+          setTimeout(()=>{ box.style.opacity='0'; setTimeout(()=> box.remove(), 250); }, 6000);
+          seen.add(id);
+        }
+      }
+      localStorage.setItem(SEEN_KEY, Array.from(seen).join(','));
+    }catch(_){}
+    finally{ setTimeout(poll, 25000); }
+  }
+  setTimeout(poll, 2000);
+})();
+</script>
+"""
+HTML_TEMPLATE = HTML_TEMPLATE.replace("</body>", EXTRA_SNIPPET + "\n</body>")
+
+# Improve About text
+HTML_TEMPLATE = HTML_TEMPLATE.replace(
+    "GROWCB is a community project offering fun, provably-fair mini-games like Crash and Mines, with Discord integration.",
+    "GROWCB is a sleek, community-driven arcade with provably-fair mini-games (Crash, Mines and more), cosmetic polish, and tight Discord integration. We’re building a smooth, low-friction experience: quick rounds, clear payouts, no-nonsense UI."
+)
 
 # ---------- SPA roots (serve same index for these paths) ----------
 SPA_PATHS = {"", "games", "crash", "mines", "coinflip", "blackjack", "pump", "referral", "promocodes", "leaderboard", "about", "owner"}
 
 @app.get("/", response_class=HTMLResponse)
 async def index_root():
-    # Prefer canonical /games in UI navigation, but root serves app too
     html = HTML_TEMPLATE.replace("__INVITE__", DISCORD_INVITE or "__INVITE__") \
                         .replace("__OWNER_ID__", str(OWNER_ID)) \
                         .replace("__REF_BASE__", os.getenv("REFERRAL_SHARE_BASE", "https://growcb.net/referral"))
@@ -1997,6 +1602,11 @@ async def spa_paths(path_name: str):
         return await index_root()
     raise HTTPException(404, "Not found")
 
+# ---------- Leaderboard API (used by UI) ----------
+@app.get("/api/leaderboard")
+async def api_leaderboard(period: str = Query("daily"), limit: int = Query(50, ge=1, le=200)):
+    rows = get_leaderboard_rows_db(period, limit)
+    return {"rows": rows}
 # ---------- Discord Bot ----------
 import discord
 from discord.ext import commands
@@ -2005,16 +1615,22 @@ FOOTER_URL = os.getenv("FOOTER_URL", "https://growcb.net")
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.guilds = True
+BOT_READY = False
+
 bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
 def _id_from_any(s: str) -> Optional[str]:
-    if not s: return None
+    if not s:
+        return None
     m = re.search(r"\d{5,}", s)
-    if m: return m.group(0)
+    if m:
+        return m.group(0)
     with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
         cur.execute("SELECT user_id FROM profiles WHERE name_lower=%s", (s.lower(),))
         r = cur.fetchone()
-        if r: return str(r[0])
+        if r:
+            return str(r[0])
     return None
 
 def embed_base(title: str, desc: str = ""):
@@ -2024,8 +1640,13 @@ def embed_base(title: str, desc: str = ""):
 
 @bot.event
 async def on_ready():
+    global BOT_READY
+    BOT_READY = True
     print(f"Bot logged in as {bot.user} (ready)")
-    await bot.change_presence(activity=discord.Game(name="growcb.net"))
+    try:
+        await bot.change_presence(activity=discord.Game(name="growcb.net"))
+    except Exception as e:
+        print("Presence set failed:", e)
 
 @bot.command(name="help")
 async def _help(ctx: commands.Context):
@@ -2065,14 +1686,15 @@ async def _level(ctx: commands.Context, user: Optional[str] = None):
 
 def _lb_reset_text(period: str) -> str:
     now = now_utc()
-    if period=="daily":
-        nxt = now.replace(hour=0,minute=0,second=0,microsecond=0) + datetime.timedelta(days=1)
-        return f"Resets in {(nxt-now).seconds//3600}h {((nxt-now).seconds%3600)//60}m"
-    if period=="monthly":
-        first_next = now.replace(day=1,hour=0,minute=0,second=0,microsecond=0)
+    if period == "daily":
+        nxt = now.replace(hour=0, minute=0, second=0, microsecond=0) + datetime.timedelta(days=1)
+        delta = nxt - now
+        return f"Resets in {delta.seconds//3600}h {(delta.seconds%3600)//60}m"
+    if period == "monthly":
+        first_next = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         month = first_next.month + 1
-        year = first_next.year + (1 if month>12 else 0)
-        month = 1 if month>12 else month
+        year = first_next.year + (1 if month > 12 else 0)
+        month = 1 if month > 12 else month
         nxt = first_next.replace(year=year, month=month)
         delta = nxt - now
         return f"Resets in {delta.days}d {(delta.seconds//3600)}h"
@@ -2089,13 +1711,14 @@ class LBView(discord.ui.View):
         for item in self.children:
             if isinstance(item, discord.ui.Button):
                 item.style = discord.ButtonStyle.secondary
-        sel = next((b for b in self.children if isinstance(b, discord.ui.Button) and b.custom_id==self.period), None)
-        if sel: sel.style = discord.ButtonStyle.primary
+        sel = next((b for b in self.children if isinstance(b, discord.ui.Button) and b.custom_id == self.period), None)
+        if sel:
+            sel.style = discord.ButtonStyle.primary
 
     async def refresh_embed(self, interaction: discord.Interaction):
         rows = get_leaderboard_rows_db(self.period, limit=10)
         lines = []
-        for i,r in enumerate(rows, start=1):
+        for i, r in enumerate(rows, start=1):
             name = "Anonymous" if r["is_anon"] else r["display_name"]
             amt = "—" if r["is_anon"] else f"{r['total_wagered']:.2f} DL"
             lines.append(f"**{i}.** {name} — {amt}")
@@ -2106,22 +1729,25 @@ class LBView(discord.ui.View):
 
     @discord.ui.button(label="Daily", custom_id="daily")
     async def daily(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.period="daily"; await self.refresh_embed(interaction)
+        self.period = "daily"
+        await self.refresh_embed(interaction)
 
     @discord.ui.button(label="Monthly", custom_id="monthly")
     async def monthly(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.period="monthly"; await self.refresh_embed(interaction)
+        self.period = "monthly"
+        await self.refresh_embed(interaction)
 
     @discord.ui.button(label="All-time", custom_id="alltime")
     async def alltime(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.period="alltime"; await self.refresh_embed(interaction)
+        self.period = "alltime"
+        await self.refresh_embed(interaction)
 
 @bot.command(name="leaderboard")
 async def _leaderboard(ctx: commands.Context):
     view = LBView(author_id=ctx.author.id)
     rows = get_leaderboard_rows_db("daily", limit=10)
     lines = []
-    for i,r in enumerate(rows, start=1):
+    for i, r in enumerate(rows, start=1):
         name = "Anonymous" if r["is_anon"] else r["display_name"]
         amt = "—" if r["is_anon"] else f"{r['total_wagered']:.2f} DL"
         lines.append(f"**{i}.** {name} — {amt}")
@@ -2131,8 +1757,10 @@ async def _leaderboard(ctx: commands.Context):
 
 def _owner_or_webhook(ctx: commands.Context) -> bool:
     try:
-        if int(ctx.author.id) == int(OWNER_ID): return True
-    except: pass
+        if int(ctx.author.id) == int(OWNER_ID):
+            return True
+    except Exception:
+        pass
     return bool(getattr(ctx.message, "webhook_id", None))
 
 @bot.command(name="addbal")
@@ -2140,7 +1768,8 @@ async def _addbal(ctx: commands.Context, user: str, amount: str):
     if not _owner_or_webhook(ctx):
         return await ctx.reply("Only owner or webhooks can use this.")
     target = _id_from_any(user)
-    if not target: return await ctx.reply("User not found.")
+    if not target:
+        return await ctx.reply("User not found.")
     newbal = adjust_balance(str(OWNER_ID), target, D(amount), "bot:addbal")
     em = embed_base("Balance Added", f"New balance: **{newbal:.2f} DL**")
     await ctx.reply(embed=em)
@@ -2150,8 +1779,9 @@ async def _removebal(ctx: commands.Context, user: str, amount: str):
     if not _owner_or_webhook(ctx):
         return await ctx.reply("Only owner or webhooks can use this.")
     target = _id_from_any(user)
-    if not target: return await ctx.reply("User not found.")
-    newbal = adjust_balance(str(OWNER_ID), target, D("-"+str(amount).lstrip("+")), "bot:removebal")
+    if not target:
+        return await ctx.reply("User not found.")
+    newbal = adjust_balance(str(OWNER_ID), target, D("-" + str(amount).lstrip("+")), "bot:removebal")
     em = embed_base("Balance Removed", f"New balance: **{newbal:.2f} DL**")
     await ctx.reply(embed=em)
 
@@ -2164,13 +1794,11 @@ async def start_bot():
     except Exception as e:
         print("Bot start failed:", e)
 
-# ---------- Leaderboard API (used by UI) ----------
-@app.get("/api/leaderboard")
-async def api_leaderboard(period: str = Query("daily"), limit: int = Query(50, ge=1, le=200)):
-    rows = get_leaderboard_rows_db(period, limit)
-    return {"rows": rows}
+@app.get("/api/bot/status")
+async def bot_status():
+    return {"online": bool(BOT_READY), "token_present": bool(DISCORD_BOT_TOKEN)}
 
-# Lifespan: start bot concurrently
+# ---------- Startup ----------
 @app.on_event("startup")
 async def _on_startup():
     if DISCORD_BOT_TOKEN:

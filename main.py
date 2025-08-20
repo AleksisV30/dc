@@ -75,8 +75,8 @@ RESET_LINK_BASE = os.getenv("RESET_LINK_BASE", f"https://{CANONICAL_HOST}/reset"
 DEPOSIT_CHANNEL_ID = int(os.getenv("DISCORD_DEPOSIT_CHANNEL_ID", "1407130350940979210") or "0")
 WITHDRAW_CHANNEL_ID = int(os.getenv("DISCORD_WITHDRAW_CHANNEL_ID", "1407130468821766226") or "0")
 
-# Toggles
-START_DISCORD_BOT = os.getenv("START_DISCORD_BOT", "1") != "0"  # set 0 to prevent bot from starting
+# New toggles for reliability
+START_DISCORD_BOT = os.getenv("START_DISCORD_BOT", "1") != "0"  # set to 0 to prevent bot from starting
 RELOAD = os.getenv("RELOAD", "0") == "1"                        # if you want uvicorn.reload=True via env
 
 GEM = "💎"
@@ -90,6 +90,9 @@ def D(x) -> Decimal:
     return Decimal(str(x))
 def q2(x: Decimal) -> Decimal:
     return D(x).quantize(TWO, rounding=ROUND_DOWN)
+def fmtDL(x) -> str:
+    """Python-side fmtDL to match usage in transfer Discord notices."""
+    return f"{q2(D(x)):.2f}"
 
 UTC = datetime.timezone.utc
 def now_utc() -> datetime.datetime: return datetime.datetime.now(UTC)
@@ -363,9 +366,13 @@ def apply_migrations(cur):
     cur.execute("CREATE INDEX IF NOT EXISTS ix_accounts_provider ON accounts(provider)")
     cur.execute("CREATE INDEX IF NOT EXISTS ix_transfers_created_at ON transfers(created_at)")
 
-# NOTE: the crash daemon & discord bot are started in Part 2.
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    apply_migrations()
+    yield
 
-app = FastAPI()
+app = FastAPI(lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=_get_static_dir()), name="static")
 
 # ---------- Health ----------
@@ -386,7 +393,7 @@ async def _canonical_host_redirect(request: Request, call_next):
         pass
     return await call_next(request)
 
-# ---------- Owner-only lock ----------
+# ---------- Owner-only lock (site closed for everyone except OWNER) ----------
 OWNER_GATE_ALLOW = ("/login", "/callback", "/login/google", "/callback/google", "/reset", "/auth/", "/static/", "/img/", "/healthz", "/api/bot/status")
 
 @app.middleware("http")
@@ -395,6 +402,7 @@ async def _owner_only_gate(request: Request, call_next):
         return await call_next(request)
 
     path = request.url.path or "/"
+    # allow health, login, callback, assets, bot status
     if any(path == p or path.startswith(p) for p in OWNER_GATE_ALLOW):
         return await call_next(request)
 
@@ -410,6 +418,7 @@ async def _owner_only_gate(request: Request, call_next):
     if str(uid) == str(OWNER_ID):
         return await call_next(request)
 
+    # Gate page
     gate_html = """
     <!doctype html><html><head>
       <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
@@ -448,7 +457,7 @@ async def serve_img(filename: str):
         if os.path.isfile(p): return FileResponse(p)
     return Response(content=_TRANSPARENT_PNG, media_type="image/png")
 
-# ---------- Sessions ----------
+# ---------- Sessions (sticky cookie) ----------
 SER = URLSafeSerializer(SECRET_KEY, salt="session-v1")
 
 def _cookie_domain_from_request(request: Optional[Request]) -> Optional[str]:
@@ -645,6 +654,9 @@ def get_leaderboard_rows_db(cur, period: str, limit: int = 50):
     return out
 
 # ---------- HTML (UI/UX) ----------
+# Improvements:
+#  - Robust preloader removal (hides on load & then removes from DOM).
+#  - Crash canvas context is initialized in openCrash().
 HTML_TEMPLATE = r"""
 <!doctype html>
 <html lang="en">
@@ -1073,7 +1085,7 @@ canvas{display:block;width:100%;height:100%}
   </div>
 </div>
 
-<!-- Login Modal -->
+<!-- Login Modal (choose provider + email form) -->
 <div class="modal" id="loginModal">
   <div class="box">
     <div class="head"><div class="big">Log in</div><button class="btn gray" id="loginClose">Close</button></div>
@@ -1447,14 +1459,12 @@ async function loadCrashHistory(){
 let mState=null;
 function renderMinesGrid(st){
   const grid = qs('mGrid'); grid.innerHTML='';
-  const picks = BigInt(st.picks || 0);
+  const picks = st.picks||0;
   for(let i=0;i<25;i++){
     const b = document.createElement('button');
     b.className='btn gray';
     b.style.width='64px'; b.style.height='64px';
-    const isPicked = (picks & (1n << BigInt(i))) !== 0n;
-    const cellRevealed = st.revealed && st.revealed[i];
-    b.textContent = cellRevealed===1 ? '💎' : cellRevealed===-1 ? '💣' : (isPicked ? '•' : '');
+    b.textContent = (st.revealed && st.revealed[i]===1) ? '💎' : (st.revealed && st.revealed[i]===-1) ? '💣' : (picks & (1n<<BigInt(i))) ? '•' : '';
     b.disabled = !!st.ended || (st.revealed && (st.revealed[i]!==0));
     b.onclick = async ()=>{ try{ const r = await j('/api/mines/pick?index='+i,{method:'POST'}); mState=r; updateMinesUI(); }catch(e){ toast(e.message,'error','Mines'); } };
     grid.appendChild(b);
@@ -1462,7 +1472,7 @@ function renderMinesGrid(st){
 }
 function updateMinesUI(){
   const st = mState; if(!st){ return; }
-  qs('mSetup').style.display = st.status==='active' ? 'none' : '';
+  qs('mSetup').style.display = st.status==='active' ? 'none' : 'none';
   qs('mCash').style.display = (st.status==='active' ? '' : 'none');
   qs('mMult').textContent = (st.multiplier||1).toFixed(4)+'×';
   qs('mPotential').textContent = st.potential ? fmtDL(st.potential)+' DL' : '—';
@@ -1793,7 +1803,7 @@ HTML_TEMPLATE = HTML_TEMPLATE.replace(
     "GROWCB is a sleek, community-driven arcade with provably-fair mini-games (Crash, Mines and more), cosmetic polish, and tight Discord integration. We’re building a smooth, low-friction experience: quick rounds, clear payouts, no-nonsense UI."
 )
 
-# ---------- SPA roots ----------
+# ---------- SPA roots (serve same index for these paths) ----------
 SPA_PATHS = {"", "games", "crash", "mines", "coinflip", "blackjack", "pump", "referral", "promocodes", "leaderboard", "about", "owner"}
 
 @app.get("/", response_class=HTMLResponse)
@@ -2486,7 +2496,7 @@ async def api_mines_start(request: Request, body: MinesStartIn):
         raise HTTPException(400, f"Bet must be between {MIN_BET} and {MAX_BET}")
     mines = int(body.mines or 3)
     if not (1 <= mines <= 24):
-        raise HTTPException(400, "Mines must be between 1 and 24")
+        raise HTTPException(400, "Mines count must be 1..24")
     try:
         st = mines_start(s["id"], bet, mines)
         return st
@@ -2497,7 +2507,7 @@ async def api_mines_start(request: Request, body: MinesStartIn):
 async def api_mines_pick(request: Request, index: int = Query(..., ge=0, le=24)):
     s = _require_session(request)
     try:
-        st = mines_pick(s["id"], index)
+        st = mines_pick(s["id"], int(index))
         return st
     except Exception as e:
         raise HTTPException(400, str(e))
@@ -2512,18 +2522,21 @@ async def api_mines_cashout(request: Request):
         raise HTTPException(400, str(e))
 
 @app.get("/api/mines/history")
-async def api_mines_history(request: Request):
+async def api_mines_history(request: Request, limit: int = Query(20, ge=1, le=100)):
     s = _require_session(request)
     try:
-        rows = mines_history(s["id"], limit=20)
+        rows = mines_history(s["id"], limit=limit)
         return {"rows": rows}
-    except Exception:
-        return {"rows": []}
-# === Part 2/2 — Discord bot + daemons + admin APIs + startup ===
-import asyncio
-import datetime as _dt
+    except Exception as e:
+        raise HTTPException(400, str(e))
 
-# ---------- Admin / Announcements ----------
+# ===== Part 1/2 ends here. Say "continue" for Part 2 (Discord bot commands + daemon + admin APIs + startup). =====
+# =========================
+# Part 2/2 — Bot + Admin + Daemons + Startup
+# =========================
+import asyncio
+
+# ---------- Admin helpers / endpoints ----------
 class AdjustIn(BaseModel):
     identifier: str
     amount: str
@@ -2535,278 +2548,434 @@ class RoleIn(BaseModel):
 
 class AnnounceIn(BaseModel):
     text: str
-    minutes: Optional[int] = 360
+    minutes: Optional[int] = 120
 
-def _require_admin(request: Request):
+def _must_admin(request: Request) -> dict:
     s = _require_session(request)
     info = profile_info(s["id"])
-    if _role_rank(info.get("role","member")) < _role_rank("admin"):
+    role = (info.get("role") or "member").lower()
+    if role not in ("admin", "owner"):
         raise HTTPException(403, "Admin only")
-    return s, info
+    return s
+
+def _must_owner(request: Request) -> dict:
+    s = _require_session(request)
+    info = profile_info(s["id"])
+    role = (info.get("role") or "member").lower()
+    if role != "owner" and str(s["id"]) != str(OWNER_ID):
+        raise HTTPException(403, "Owner only")
+    return s
 
 @with_conn
-def _resolve_identifier(cur, identifier: str) -> str:
+def _resolve_identifier(cur, identifier: str) -> Optional[str]:
     ident = (identifier or "").strip()
     if not ident:
-        raise HTTPException(400, "Missing identifier")
-    # Try direct user_id first
-    cur.execute("SELECT user_id FROM profiles WHERE user_id=%s", (ident,))
-    r = cur.fetchone()
-    if r:
-        return str(r[0])
-    # Mentions like <@123> or <@!123>
-    m = re.search(r"\d{6,}", ident)
+        return None
+    # Discord mention <@123> or <@!123>
+    m = re.match(r"^<@!?(\d{5,30})>$", ident)
     if m:
-        discord_id = m.group(0)
-        cur.execute("SELECT user_id FROM profiles WHERE user_id=%s", (discord_id,))
-        r = cur.fetchone()
-        if r:
-            return str(r[0])
-    # @handle or plain handle -> name_lower
-    handle = ident.lstrip("@").lower()
-    cur.execute("SELECT user_id FROM profiles WHERE name_lower=%s", (handle,))
+        return m.group(1)
+    # Pure numeric (discord id)
+    if re.match(r"^\d{5,30}$", ident):
+        return ident
+    # Profile handle (name_lower exact)
+    cur.execute("SELECT user_id FROM profiles WHERE name_lower=%s", (ident.lower(),))
     r = cur.fetchone()
-    if r:
-        return str(r[0])
-    # fallback: ref handle
-    cur.execute("SELECT user_id FROM ref_names WHERE name_lower=%s", (handle,))
+    if r: return str(r[0])
+    # Try by display name exact (rare; not guaranteed unique)
+    cur.execute("SELECT user_id FROM profiles WHERE display_name=%s LIMIT 1", (ident,))
     r = cur.fetchone()
-    if r:
-        return str(r[0])
-    raise HTTPException(404, "User not found")
+    if r: return str(r[0])
+    # Try account email exact
+    cur.execute("SELECT user_id FROM accounts WHERE email=%s LIMIT 1", (ident.lower(),))
+    r = cur.fetchone()
+    if r: return str(r[0])
+    return None
 
 @app.post("/api/admin/adjust")
 async def api_admin_adjust(request: Request, body: AdjustIn):
-    s, _ = _require_admin(request)
+    s = _must_admin(request)
+    tid = _resolve_identifier(body.identifier)
+    if not tid:
+        raise HTTPException(400, "User not found")
     try:
         amt = q2(D(body.amount))
     except Exception:
         raise HTTPException(400, "Invalid amount")
-    with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
-        target = _resolve_identifier(cur, body.identifier)
-    new_bal = adjust_balance(s["id"], target, amt, body.reason or f"admin adjust by {s['id']}")
-    return {"target": target, "new_balance": float(new_bal)}
+    new_bal = adjust_balance(s["id"], tid, amt, (body.reason or "admin adjust"))
+    return {"ok": True, "user_id": tid, "new_balance": float(new_bal)}
 
 @app.post("/api/admin/role")
 async def api_admin_role(request: Request, body: RoleIn):
-    s, _ = _require_admin(request)
-    with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
-        target = _resolve_identifier(cur, body.identifier)
-    res = set_role(target, body.role)
-    return res
+    _must_owner(request)
+    tid = _resolve_identifier(body.identifier)
+    if not tid:
+        raise HTTPException(400, "User not found")
+    role = (body.role or "").lower()
+    if role not in ("member","media","moderator","admin","owner"):
+        raise HTTPException(400, "Invalid role")
+    set_role(tid, role)
+    return {"ok": True, "user_id": tid, "role": role}
 
 @app.post("/api/admin/announce")
 async def api_admin_announce(request: Request, body: AnnounceIn):
-    s, _ = _require_admin(request)
+    _must_admin(request)
     text = (body.text or "").strip()
     if not text:
         raise HTTPException(400, "Text required")
-    minutes = int(body.minutes or 360)
+    mins = int(body.minutes or 120)
     starts = now_utc()
-    ends = starts + datetime.timedelta(minutes=minutes)
+    ends = starts + datetime.timedelta(minutes=max(5, mins))
     with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
         cur.execute("INSERT INTO announcements(text, starts_at, ends_at, created_by) VALUES (%s,%s,%s,%s) RETURNING id",
-                    (text, starts, ends, s["id"]))
-        new_id = cur.fetchone()[0]
+                    (text, starts, ends, str(OWNER_ID)))
+        new_id = int(cur.fetchone()[0])
         con.commit()
-    return {"ok": True, "id": int(new_id)}
+    return {"ok": True, "id": new_id}
 
 @app.get("/api/announcements/active")
-async def api_announcements_active():
+async def api_ann_active():
     now = now_utc()
     with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
         cur.execute("""
-            SELECT id, text, starts_at, ends_at
-            FROM announcements
-            WHERE (starts_at IS NULL OR starts_at <= %s)
-              AND (ends_at IS NULL OR ends_at >= %s)
-            ORDER BY starts_at DESC
-            LIMIT 10
+          SELECT id, text, starts_at, ends_at
+          FROM announcements
+          WHERE (starts_at IS NULL OR starts_at <= %s)
+            AND (ends_at IS NULL OR ends_at > %s)
+          ORDER BY starts_at DESC NULLS LAST
+          LIMIT 10
         """, (now, now))
         rows = [{"id": int(r[0]), "text": r[1], "starts_at": iso(r[2]), "ends_at": iso(r[3])} for r in cur.fetchall()]
     return {"rows": rows}
 
-# ---------- Bot status ----------
+# ---------- Bot status endpoint ----------
+_BOT_STATUS = {"online": False, "latency": None, "synced": False}
+
 @app.get("/api/bot/status")
 async def api_bot_status():
-    data = {
-        "configured": bool(DISCORD_BOT_TOKEN),
-        "start_enabled": bool(START_DISCORD_BOT),
-        "library_available": False,
-        "online": False,
-        "user": None,
-        "guilds": 0,
-        "latency": None
-    }
-    try:
-        import discord  # noqa
-        data["library_available"] = True
-    except Exception:
-        return data
-    bot = _discord_bot_holder["client"]
-    if bot:
-        data["online"] = bot.is_ready()
-        data["user"] = str(bot.user) if bot.user else None
-        try:
-            data["guilds"] = len(bot.guilds)
-        except Exception:
-            data["guilds"] = 0
-        try:
-            data["latency"] = round(bot.latency * 1000.0, 1)  # ms
-        except Exception:
-            data["latency"] = None
-    return data
+    return {"online": bool(_BOT_STATUS["online"]), "latency": _BOT_STATUS["latency"], "synced": bool(_BOT_STATUS["synced"])}
 
-# ---------- Crash round daemon ----------
-def _parse_dt(val):
-    if not val:
-        return None
-    if isinstance(val, datetime.datetime):
-        return val if val.tzinfo else val.replace(tzinfo=UTC)
-    try:
-        dt = _dt.datetime.fromisoformat(str(val))
-        return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
-    except Exception:
-        return None
+# ---------- Discord Bot (slash commands) ----------
+# Uses discord.py v2 (app_commands). If the library is missing, the app will still run.
+try:
+    import discord
+    from discord import app_commands
+    from discord.ext import commands
+except Exception as e:
+    discord = None
+    print("[BOT] discord.py not available:", e)
 
-async def crash_daemon():
-    await asyncio.sleep(1.0)
-    print("[crash-daemon] started")
-    while True:
-        try:
-            ensure_betting_round()
-            st = load_round()
-            status = (st or {}).get("status")
-            if status == "betting":
-                ends = _parse_dt(st.get("betting_ends_at"))
-                if ends:
-                    sec = (ends - now_utc()).total_seconds()
-                else:
-                    sec = 1.0
-                if sec > 0.2:
-                    await asyncio.sleep(min(sec, 1.0))
-                else:
-                    begin_running()
-                    await asyncio.sleep(0.1)
-            elif status == "running":
-                # Let crash core progress & resolve; finish_round() should settle + mark as ended
-                finish_round()
-                await asyncio.sleep(0.25)
-            elif status == "ended":
-                create_next_betting()
-                await asyncio.sleep(0.25)
-            else:
-                await asyncio.sleep(0.5)
-        except Exception as e:
-            print("[crash-daemon] error:", e)
-            await asyncio.sleep(1.5)
-
-# ---------- Discord bot (online presence) ----------
-_discord_bot_holder: Dict[str, Optional[object]] = {"client": None, "task": None}
-
-def create_discord_client():
-    try:
-        import discord
-    except Exception as e:
-        print("[discord] library not available:", e)
-        return None
-
-    intents = discord.Intents.none()
-    intents.guilds = True  # presence & guilds ok without privileged intents
-
-    client = discord.Client(intents=intents)
-
-    @client.event
-    async def on_ready():
-        try:
-            await client.change_presence(
-                activity=discord.Game(name="growcb.net"),
-                status=discord.Status.online
-            )
-        except Exception as e:
-            print("[discord] presence error:", e)
-        gcount = 0
-        try:
-            gcount = len(client.guilds)
-        except Exception:
-            pass
-        print(f"[discord] online as {client.user} in {gcount} guild(s)")
-
-    return client
-
-async def start_discord_bot():
-    if not START_DISCORD_BOT:
-        print("[discord] START_DISCORD_BOT=0 — not starting")
-        return
-    if not DISCORD_BOT_TOKEN:
-        print("[discord] missing DISCORD_BOT_TOKEN — not starting")
-        return
-    client = create_discord_client()
-    if not client:
-        return
-    _discord_bot_holder["client"] = client
-    try:
-        print("[discord] starting…")
-        await client.start(DISCORD_BOT_TOKEN)
-    except Exception as e:
-        print("[discord] start error:", e)
-
-async def stop_discord_bot():
-    client = _discord_bot_holder["client"]
-    if client:
-        try:
-            await client.close()
-        except Exception as e:
-            print("[discord] close error:", e)
-    _discord_bot_holder["client"] = None
-
-# ---------- App startup/shutdown ----------
-_crash_task: Optional[asyncio.Task] = None
+bot: Optional["commands.Bot"] = None
 _bot_task: Optional[asyncio.Task] = None
 
-@app.on_event("startup")
-async def _on_startup():
-    # DB up
+def _is_site_admin(user_id: str) -> bool:
     try:
-        init_db()
-        apply_migrations()
-        print("[startup] database ready")
+        info = profile_info(user_id)
+        return (info.get("role") in ("admin","owner"))
+    except Exception:
+        return False
+
+def _is_site_owner(user_id: str) -> bool:
+    try:
+        info = profile_info(user_id)
+        return (info.get("role") == "owner") or (str(user_id) == str(OWNER_ID))
+    except Exception:
+        return str(user_id) == str(OWNER_ID)
+
+async def _bot_create_and_start():
+    global bot
+    if not discord:
+        print("[BOT] Library missing — skipping bot startup.")
+        return
+    if not DISCORD_BOT_TOKEN:
+        print("[BOT] DISCORD_BOT_TOKEN not set — skipping bot startup.")
+        return
+
+    intents = discord.Intents.default()
+    intents.guilds = True
+    intents.members = True
+    intents.message_content = False
+
+    bot = commands.Bot(command_prefix=PREFIX, intents=intents)
+
+    @bot.event
+    async def on_ready():
+        _BOT_STATUS["online"] = True
+        try:
+            latency_ms = round(bot.latency * 1000, 1)
+        except Exception:
+            latency_ms = None
+        _BOT_STATUS["latency"] = latency_ms
+        name = bot.user.name if bot.user else "bot"
+        print(f"[BOT] Logged in as {name} (latency: {latency_ms} ms)")
+        # Sync commands to a specific guild for instant availability if GUILD_ID is provided
+        try:
+            if GUILD_ID:
+                guild = discord.Object(id=GUILD_ID)
+                await bot.tree.sync(guild=guild)
+                _BOT_STATUS["synced"] = True
+                print(f"[BOT] Slash commands synced to guild {GUILD_ID}")
+            else:
+                await bot.tree.sync()
+                _BOT_STATUS["synced"] = True
+                print("[BOT] Slash commands globally synced (may take time)")
+        except Exception as e:
+            print("[BOT] Sync error:", e)
+
+    # ---------- Slash Commands ----------
+
+    # /ping
+    @bot.tree.command(name="ping", description="Check if the bot is alive", guild=discord.Object(id=GUILD_ID) if GUILD_ID else None)
+    async def ping_cmd(inter: discord.Interaction):
+        try:
+            lat = round(bot.latency*1000,1) if bot else None
+        except Exception:
+            lat = None
+        await inter.response.send_message(f"Pong! {lat} ms" if lat is not None else "Pong!", ephemeral=True)
+
+    # /balance [user]
+    @bot.tree.command(name="balance", description="Show DL balance", guild=discord.Object(id=GUILD_ID) if GUILD_ID else None)
+    @app_commands.describe(user="User to check (optional)")
+    async def balance_cmd(inter: discord.Interaction, user: Optional[discord.Member] = None):
+        target = user or inter.user
+        uid = str(target.id)
+        bal = float(get_balance(uid))
+        await inter.response.send_message(f"**{target.display_name}** balance: **{fmtDL(bal)} DL**", ephemeral=True)
+
+    # /give <user> <amount> [reason]
+    @bot.tree.command(name="give", description="Admin: adjust a user's balance", guild=discord.Object(id=GUILD_ID) if GUILD_ID else None)
+    @app_commands.describe(user="Target user", amount="Amount (e.g. 10 or -5.25)", reason="Reason")
+    async def give_cmd(inter: discord.Interaction, user: discord.Member, amount: str, reason: Optional[str] = None):
+        actor_id = str(inter.user.id)
+        if not _is_site_admin(actor_id):
+            await inter.response.send_message("Admin only.", ephemeral=True)
+            return
+        try:
+            amt = q2(D(amount))
+        except Exception:
+            await inter.response.send_message("Invalid amount.", ephemeral=True)
+            return
+        new_bal = adjust_balance(actor_id, str(user.id), amt, reason or "bot/give")
+        await inter.response.send_message(f"Adjusted **{user.display_name}** by **{fmtDL(amt)} DL**. New balance: **{fmtDL(new_bal)} DL**", ephemeral=True)
+
+    # /role <user> <role>
+    @bot.tree.command(name="role", description="Owner: set a site role", guild=discord.Object(id=GUILD_ID) if GUILD_ID else None)
+    @app_commands.describe(user="Target user", role="member | media | moderator | admin | owner")
+    async def role_cmd(inter: discord.Interaction, user: discord.Member, role: str):
+        actor_id = str(inter.user.id)
+        if not _is_site_owner(actor_id):
+            await inter.response.send_message("Owner only.", ephemeral=True)
+            return
+        r = role.lower().strip()
+        if r not in ("member","media","moderator","admin","owner"):
+            await inter.response.send_message("Invalid role.", ephemeral=True)
+            return
+        try:
+            set_role(str(user.id), r)
+            await inter.response.send_message(f"Set **{user.display_name}** role to **{r}**.", ephemeral=True)
+        except Exception as e:
+            await inter.response.send_message(f"Error: {e}", ephemeral=True)
+
+    # /redeem <code>
+    @bot.tree.command(name="redeem", description="Redeem a promo code", guild=discord.Object(id=GUILD_ID) if GUILD_ID else None)
+    @app_commands.describe(code="Promo code")
+    async def redeem_cmd(inter: discord.Interaction, code: str):
+        uid = str(inter.user.id)
+        try:
+            amt = redeem_promo(uid, code.strip())
+            if amt:
+                new_bal = adjust_balance(uid, uid, amt, f"promo:{code.strip()}")
+                await inter.response.send_message(f"Code redeemed! +**{fmtDL(amt)} DL** — new balance **{fmtDL(new_bal)} DL**", ephemeral=True)
+            else:
+                await inter.response.send_message("Code redeemed.", ephemeral=True)
+        except PromoAlreadyRedeemed:
+            await inter.response.send_message("You already redeemed this code.", ephemeral=True)
+        except PromoExpired:
+            await inter.response.send_message("Code expired.", ephemeral=True)
+        except PromoExhausted:
+            await inter.response.send_message("Code has reached maximum uses.", ephemeral=True)
+        except PromoInvalid as e:
+            await inter.response.send_message(str(e) or "Invalid code", ephemeral=True)
+        except Exception as e:
+            await inter.response.send_message(f"Error: {e}", ephemeral=True)
+
+    # /withdraw <amount> <world> <growid>
+    @bot.tree.command(name="withdraw", description="Create a withdraw request", guild=discord.Object(id=GUILD_ID) if GUILD_ID else None)
+    @app_commands.describe(amount="DL amount", world="Your world", growid="Your GrowID")
+    async def withdraw_cmd(inter: discord.Interaction, amount: str, world: str, growid: str):
+        uid = str(inter.user.id)
+        try:
+            amt = q2(D(amount))
+            if amt <= 0:
+                await inter.response.send_message("Amount must be positive.", ephemeral=True); return
+            bal = get_balance(uid)
+            if bal < amt:
+                await inter.response.send_message("Insufficient balance.", ephemeral=True); return
+            # Lock funds and create transfer
+            adjust_balance(uid, uid, -amt, "withdraw request lock")
+            with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
+                cur.execute("""INSERT INTO transfers(user_id, ttype, amount, world, grow_id, status)
+                               VALUES (%s,'withdraw',%s,%s,%s,'pending') RETURNING id""",
+                            (uid, amt, world.strip(), growid.strip()))
+                tid = int(cur.fetchone()[0]); con.commit()
+            # Notify
+            if WITHDRAW_CHANNEL_ID:
+                await discord_send(WITHDRAW_CHANNEL_ID,
+                                   f"🏧 **Withdraw** request #{tid} by `<@{uid}>` — Amount: **{fmtDL(amt)} DL**, World: **{world}**, GrowID: **{growid}**")
+            await inter.response.send_message(f"Withdraw request **#{tid}** created for **{fmtDL(amt)} DL**.", ephemeral=True)
+        except Exception as e:
+            await inter.response.send_message(f"Error: {e}", ephemeral=True)
+
+    # /deposit <world> <growid>
+    @bot.tree.command(name="deposit", description="Create a deposit request", guild=discord.Object(id=GUILD_ID) if GUILD_ID else None)
+    @app_commands.describe(world="Your world", growid="Your GrowID")
+    async def deposit_cmd(inter: discord.Interaction, world: str, growid: str):
+        uid = str(inter.user.id)
+        try:
+            with psycopg.connect(DATABASE_URL) as con, con.cursor() as cur:
+                cur.execute("""INSERT INTO transfers(user_id, ttype, world, grow_id, status)
+                               VALUES (%s,'deposit',%s,%s,'pending') RETURNING id""",
+                            (uid, world.strip(), growid.strip()))
+                tid = int(cur.fetchone()[0]); con.commit()
+            if DEPOSIT_CHANNEL_ID:
+                await discord_send(DEPOSIT_CHANNEL_ID,
+                                   f"💰 **Deposit** request #{tid} by `<@{uid}>` — World: **{world}**, GrowID: **{growid}**")
+            await inter.response.send_message(f"Deposit request **#{tid}** created. Staff will contact you.", ephemeral=True)
+        except Exception as e:
+            await inter.response.send_message(f"Error: {e}", ephemeral=True)
+
+    # /crash — show state & last busts
+    @bot.tree.command(name="crash", description="Show current Crash state", guild=discord.Object(id=GUILD_ID) if GUILD_ID else None)
+    async def crash_cmd(inter: discord.Interaction):
+        try:
+            st = load_round()
+            phase = st.get("status")
+            bust = st.get("bust")
+            lasts = last_busts(8)
+            txt = f"Phase: **{phase}**"
+            if bust: txt += f" • Last bust: **{float(bust):.2f}×**"
+            if lasts: txt += "\nRecent: " + " • ".join(f"{float(x):.2f}×" for x in lasts)
+            await inter.response.send_message(txt, ephemeral=True)
+        except Exception as e:
+            await inter.response.send_message(f"Error: {e}", ephemeral=True)
+
+    # Start the bot
+    try:
+        await bot.start(DISCORD_BOT_TOKEN)
+    except asyncio.CancelledError:
+        pass
     except Exception as e:
-        print("[startup] DB init error:", e)
+        print("[BOT] start error:", e)
 
+async def _bot_shutdown():
+    global bot
+    if bot:
+        try:
+            await bot.close()
+        except Exception:
+            pass
+    _BOT_STATUS["online"] = False
+
+# ---------- Crash round daemon ----------
+_crash_task: Optional[asyncio.Task] = None
+
+async def _crash_daemon():
+    print("[CRASH] daemon started")
+    while True:
+        try:
+            # Ensure a betting round exists
+            try:
+                ensure_betting_round()
+            except Exception as e:
+                print("[CRASH] ensure_betting_round:", e)
+
+            st = {}
+            try:
+                st = load_round() or {}
+            except Exception as e:
+                print("[CRASH] load_round:", e)
+                await asyncio.sleep(1.0)
+                continue
+
+            phase = (st.get("status") or "betting").lower()
+            now = now_utc()
+
+            if phase == "betting":
+                ends = st.get("betting_ends_at")
+                if isinstance(ends, str):
+                    try: ends = datetime.datetime.fromisoformat(ends)
+                    except: ends = None
+                if ends and ends.tzinfo is None:
+                    ends = ends.replace(tzinfo=UTC)
+                if ends and now >= ends:
+                    try:
+                        await begin_running()
+                    except Exception as e:
+                        print("[CRASH] begin_running:", e)
+            elif phase == "running":
+                # If the engine tracks expected_end_at, finish when passed
+                exp = st.get("expected_end_at")
+                if isinstance(exp, str):
+                    try: exp = datetime.datetime.fromisoformat(exp)
+                    except: exp = None
+                if exp and exp.tzinfo is None:
+                    exp = exp.replace(tzinfo=UTC)
+                # If exp is in past, try to finish
+                if exp and now >= exp:
+                    try:
+                        await finish_round()
+                        await create_next_betting()
+                    except Exception as e:
+                        print("[CRASH] finish/create:", e)
+            elif phase == "ended":
+                try:
+                    await create_next_betting()
+                except Exception as e:
+                    print("[CRASH] create_next_betting:", e)
+            await asyncio.sleep(0.8)
+        except asyncio.CancelledError:
+            print("[CRASH] daemon cancelled"); break
+        except Exception as e:
+            print("[CRASH] loop err:", e)
+            await asyncio.sleep(1.5)
+
+# ---------- Startup / Shutdown ----------
+@app.on_event("startup")
+async def _startup():
+    # Start crash daemon
+    global _crash_task, _bot_task
     loop = asyncio.get_event_loop()
-    # crash daemon
-    global _crash_task
-    _crash_task = loop.create_task(crash_daemon())
+    if _crash_task is None:
+        _crash_task = loop.create_task(_crash_daemon())
 
-    # discord bot
-    global _bot_task
+    # Start Discord bot (non-blocking)
     if START_DISCORD_BOT and DISCORD_BOT_TOKEN:
-        _bot_task = loop.create_task(start_discord_bot())
+        if _bot_task is None:
+            _bot_task = loop.create_task(_bot_create_and_start())
     else:
-        print("[startup] discord bot disabled or not configured")
+        print("[BOT] START_DISCORD_BOT=0 or token missing — not starting bot.")
 
 @app.on_event("shutdown")
-async def _on_shutdown():
-    # stop discord first
-    try:
-        await stop_discord_bot()
-    except Exception:
-        pass
-    # cancel tasks
-    for t in (_crash_task, _bot_task):
-        if t:
-            try:
-                t.cancel()
-            except Exception:
-                pass
-            try:
-                await t
-            except Exception:
-                pass
-    print("[shutdown] graceful shutdown complete")
+async def _shutdown():
+    global _crash_task, _bot_task
+    # Stop crash daemon
+    if _crash_task and not _crash_task.done():
+        _crash_task.cancel()
+        try: await _crash_task
+        except: pass
+    _crash_task = None
 
-# ---------- Uvicorn entry ----------
+    # Stop bot
+    if _bot_task and not _bot_task.done():
+        try:
+            await _bot_shutdown()
+        finally:
+            _bot_task.cancel()
+            try: await _bot_task
+            except: pass
+    _bot_task = None
+
+# ---------- Optional: run with `python app/main.py` ----------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=RELOAD, forwarded_allow_ips="*")
+    uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=RELOAD)

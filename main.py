@@ -1,17 +1,5 @@
-# main.py — GROWCB (full, 2025-08-20)
-# - Stable BASE_URL -> growcb.net
-# - Long-lived cookie session (60 days)
-# - SPA routes (pretty URLs)
-# - Bottom-right toast announcements
-# - Deposit/Withdraw modal in header
-# - Tabs w/ hover-grow
-# - Chat: level 5 gate, Enter to send, username -> profile modal
-# - Discord bot (.bal, .level, .leaderboard with buttons, .addbal/.removebal owner/webhooks only)
-# - Embeds footer https://growcb.net/
-# - Referrals share as https://growcb.net/referral/<handle>
-# - Robust loader (hides on window load or 2.5s fallback)
-# - Game banners consistent sizing
-# - DiamondLock balance styling
+# main.py — GROWCB (resilient start + healthz + full app)
+# Date: 2025-08-20
 
 import os, json, asyncio, re, random, string, datetime, base64
 from urllib.parse import urlencode
@@ -44,7 +32,7 @@ getcontext().prec = 28
 PREFIX = "."
 CLIENT_ID = os.getenv("DISCORD_CLIENT_ID", "")
 CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET") or os.getenv("CLIENT_SECRET", "")
-# Ensure your Discord application redirect URL is set to https://growcb.net/callback
+# Set your Discord app redirect URL to https://growcb.net/callback
 OAUTH_REDIRECT = os.getenv("OAUTH_REDIRECT", "https://growcb.net/callback")
 
 SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret")
@@ -85,16 +73,29 @@ def _get_static_dir():
     except Exception: pass
     return static_dir
 
+app = FastAPI()
+
+# Serve a tiny health endpoint that never hits DB (so Cloudflare health checks pass)
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True, "ts": now_utc().isoformat()}
+
+# Resilient startup: try DB init/migrations, but never crash the process
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    init_db()
-    apply_migrations()
+async def lifespan(app_: FastAPI):
+    try:
+        init_db()
+        apply_migrations()
+        print("[startup] DB ready")
+    except Exception as e:
+        print("[startup] DB init/migrations skipped:", repr(e))
     yield
 
-app = FastAPI(lifespan=lifespan)
+app.router.lifespan_context = lifespan  # set custom lifespan
+
 app.mount("/static", StaticFiles(directory=_get_static_dir()), name="static")
 
-# Serve images from the SAME directory as main.py (or fallback to /static).
+# Serve images from app directory or /static; fall back to 1×1 transparent PNG
 _TRANSPARENT_PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
 )
@@ -113,8 +114,7 @@ async def serve_img(filename: str):
 SER = URLSafeSerializer(SECRET_KEY, salt="session-v1")
 
 def _set_session(resp, data: dict):
-    # 60 days persistence; SameSite Lax so it survives normal navigation;
-    # Secure will be used automatically by the browser if site is https.
+    # 60 days persistence; SameSite Lax; httpOnly; Secure when site is https
     resp.set_cookie(
         "session", SER.dumps(data),
         max_age=60*86400, httponly=True, samesite="lax"
@@ -137,6 +137,7 @@ def _require_session(request: Request) -> dict:
 def with_conn(fn):
     def wrapper(*args, **kwargs):
         if not DATABASE_URL:
+            # Defer errors to runtime endpoints instead of crashing boot
             raise RuntimeError("DATABASE_URL not set")
         with psycopg.connect(DATABASE_URL) as con:
             with con.cursor() as cur:
@@ -448,7 +449,7 @@ def create_promo(cur, actor_id: str, code: Optional[str], amount, max_uses: int 
     """, (code, amt, max_uses, expires_at, actor_id))
     return {"ok": True, "code": code}
 
-# ---------- Leaderboard ----------
+# ---------- Leaderboard helpers ----------
 def _start_of_utc_day(dt: datetime.datetime) -> datetime.datetime:
     return dt.astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
 def _start_of_utc_month(dt: datetime.datetime) -> datetime.datetime:
@@ -515,14 +516,12 @@ def get_leaderboard_rows_db(cur, period: str, limit: int = 50):
         })
     return out
 
-# ---------- Migrations ----------
 @with_conn
 def apply_migrations(cur):
     cur.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS is_anon BOOLEAN NOT NULL DEFAULT FALSE")
     cur.execute("CREATE INDEX IF NOT EXISTS ix_crash_games_created_at ON crash_games (created_at)")
     cur.execute("CREATE INDEX IF NOT EXISTS ix_mines_games_started_at ON mines_games (started_at)")
     cur.execute("ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS private_to TEXT")
-
 # ---------- OAuth token store & Discord join ----------
 @with_conn
 def save_tokens(cur, user_id: str, access_token: str, refresh_token: Optional[str], expires_in: Optional[int]):
@@ -685,7 +684,7 @@ async def api_settings_set_anon(request: Request, body: AnonIn):
     s = _require_session(request)
     return set_profile_is_anon(s["id"], bool(body.is_anon))
 
-# ---------- Leaderboard ----------
+# ---------- Leaderboard API ----------
 @app.get("/api/leaderboard")
 async def api_leaderboard(period: str = Query("daily"), limit: int = Query(50, ge=1, le=200)):
     rows = get_leaderboard_rows_db(period, limit)
@@ -831,7 +830,6 @@ async def api_crash_state(request: Request):
             begin_running(rid)
             info = load_round()
         if info and info["status"] == "running" and info["expected_end_at"] and now >= info["expected_end_at"]:
-            # Protect against mismatched crash.py signatures
             try:
                 finish_round(rid)
             except TypeError:
@@ -874,7 +872,6 @@ async def api_crash_cashout(request: Request):
     if not cur or cur["status"] != "running":
         raise HTTPException(400, "No running round")
     res = cashout_now(s["id"])
-    # Notify front-end success
     return {"ok": True, **res, "message": "Successfully cashed out."}
 
 @app.get("/api/crash/history")
@@ -913,7 +910,7 @@ async def api_mines_history(request: Request):
     s = _require_session(request)
     return {"rows": mines_history(s["id"], 15)}
 
-# ---------- Chat endpoints (with level 5 gate) ----------
+# ---------- Chat endpoints (level 5 gate + profile modal on name click) ----------
 class ChatIn(BaseModel):
     text: str
 
@@ -1008,10 +1005,9 @@ def chat_fetch(cur, since_id: int, limit: int, for_user_id: Optional[str]):
         for uid, xp, role in cur.fetchall():
             levels[str(uid)] = 1 + int(xp) // 100
             roles[str(uid)] = role or "member"
-    out = []
+    out: List[dict] = []
     for mid, uid, uname, txt, ts, priv in rows:
         uid = str(uid)
-        out = out  # keep linter quiet
         out.append({"id": int(mid), "user_id": uid, "username": uname,
                     "level": int(levels.get(uid,1)), "role": roles.get(uid,"member"),
                     "text": txt, "created_at": str(ts), "private_to": priv})
@@ -1028,7 +1024,6 @@ async def api_chat_send(request: Request, body: ChatIn):
     try:
         return chat_insert(s["id"], s["username"], body.text, None)
     except PermissionError as e:
-        # Front-end will show this in the toast area
         raise HTTPException(403, str(e))
     except ValueError as e:
         raise HTTPException(400, str(e))
@@ -1108,7 +1103,7 @@ async def api_discord_join(request: Request):
     nick = get_profile_name(s["id"]) or s["username"]
     return await guild_add_member(s["id"], nickname=nick)
 
-# ---------- Pretty SPA routes (serve same shell) ----------
+# ---------- Pretty SPA routes (serve same shell; HTML provided in Part 3) ----------
 @app.get("/crash", response_class=HTMLResponse)
 @app.get("/mines", response_class=HTMLResponse)
 @app.get("/promocodes", response_class=HTMLResponse)
@@ -1116,7 +1111,7 @@ async def api_discord_join(request: Request):
 @app.get("/about", response_class=HTMLResponse)
 @app.get("/referral/{_any}", response_class=HTMLResponse)
 async def spa_pages(_any: Optional[str] = None):
-    return await index()  # defined after HTML template
+    return await index()  # defined in Part 3
 # ---------- HTML (UI/UX) ----------
 HTML_TEMPLATE = r"""
 <!doctype html>
@@ -1162,19 +1157,19 @@ input,select,textarea{width:100%;appearance:none;background:var(--input-bg);colo
 .header-inner{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px}
 .left{display:flex;align-items:center;gap:14px;flex:1;min-width:0}
 .brand{display:flex;align-items:center;gap:12px;font-weight:900;white-space:nowrap}
-.brand .logo{width:40px;height:40px;border-radius:12px;object-fit:contain;border:1px solid var(--border);background:linear-gradient(135deg,var(--accent),var(--accent2))}
+.brand .logo{width:44px;height:44px;border-radius:12px;object-fit:contain;border:1px solid var(--border);background:linear-gradient(135deg,var(--accent),var(--accent2))}
 .brand .name{font-size:20px;letter-spacing:.3px}
 .tabs{display:flex;gap:4px;align-items:center;padding:4px;border-radius:16px;background:linear-gradient(180deg,#0f1a33,#0b1326);border:1px solid var(--border)}
 .tab{padding:8px 12px;border-radius:12px;cursor:pointer;font-weight:800;white-space:nowrap;color:#d8e6ff;opacity:.9;transition:transform .12s ease, background .12s ease, color .12s ease}
-.tab:hover{transform:scale(1.08);opacity:1}
+.tab:hover{transform:scale(1.10);opacity:1}
 .tab.active{background:linear-gradient(135deg,#3b82f6,#22c1dc);color:#051326;box-shadow:0 6px 16px rgba(59,130,246,.25)}
 .right{display:flex;gap:10px;align-items:center;margin-left:12px}
 
 /* Balance pill */
 .balance-pill{display:flex;align-items:center;gap:8px;background:#0c1631;border:1px solid var(--border);padding:6px 10px;border-radius:999px}
-.bal-int{font-size:16px;font-weight:900}
+.bal-int{font-size:18px;font-weight:900}
 .bal-dec{font-size:12px;opacity:.9;transform:translateY(1px)}
-.bal-icon{width:18px;height:18px;object-fit:contain}
+.bal-icon{width:22px;height:22px;object-fit:contain}
 
 /* Cards & grids */
 .card{background:linear-gradient(180deg,#0f1a33,#0b1326);border:1px solid var(--border);border-radius:16px;padding:16px}
@@ -1529,7 +1524,6 @@ const j = async (url, init) => {
   const ct = r.headers.get('content-type')||'';
   return ct.includes('application/json') ? r.json() : r.text();
 };
-const GEM = "💎";
 const fmtDL = (n)=> (Number(n)||0).toFixed(2);
 
 function toast(msg, type='ok', title='') {
@@ -1592,9 +1586,7 @@ async function renderHeader(){
         </div>
       </div>
     `;
-    // Open DW modal
     qs('btnDW').onclick = openDW;
-    // Avatar menu
     const menu = qs('userMenu'); const av = qs('avatarBtn');
     av.onclick = (e)=>{ e.stopPropagation(); menu.classList.toggle('open'); };
     document.body.addEventListener('click', ()=> menu.classList.remove('open'));
@@ -1617,9 +1609,7 @@ qs('tab-lb').onclick = ()=> { showOnly('page-lb'); refreshLeaderboard(); };
 qs('tab-about').onclick = ()=> showOnly('page-about');
 
 /* -------- Deposit / Withdraw modal -------- */
-function openDW(){
-  qs('dwBack').style.display='grid';
-}
+function openDW(){ qs('dwBack').style.display='grid'; }
 function closeDW(){ qs('dwBack').style.display='none'; }
 qs('dwClose').onclick = closeDW;
 qs('dwDepositTab').onclick = ()=>{ qs('dwDeposit').style.display='block'; qs('dwWithdraw').style.display='none'; };
@@ -1690,19 +1680,11 @@ qs('redeemBtn').onclick = async ()=>{
 
 /* -------- Leaderboard -------- */
 let lbPeriod = 'daily';
-function nextUtcMidnight(){
-  const now = new Date();
-  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()+1, 0,0,0,0));
-}
-function endOfUtcMonth(){
-  const now = new Date();
-  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth()+1, 1, 0,0,0,0));
-}
+function nextUtcMidnight(){ const now = new Date(); return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()+1, 0,0,0,0)); }
+function endOfUtcMonth(){ const now = new Date(); return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth()+1, 1, 0,0,0,0)); }
 function setLbActive(){
   const seg = qs('lbSeg');
-  seg.querySelectorAll('button').forEach(b=>{
-    b.classList.toggle('active', b.dataset.period===lbPeriod);
-  });
+  seg.querySelectorAll('button').forEach(b=>{ b.classList.toggle('active', b.dataset.period===lbPeriod); });
 }
 async function refreshLeaderboard(){
   const wrap = qs('lbWrap'); wrap.textContent = 'Loading…';
@@ -1981,21 +1963,20 @@ qs('openPump').onclick = ()=> showOnly('page-games');
 
 /* -------- Boot -------- */
 (function boot(){
-  // Loader – keep until all assets load or 5s fallback
+  // Loader – hide once window fully loaded or fallback at 5s
   let loaderHidden = false;
   function hideLoader(){
     if(loaderHidden) return; loaderHidden = true;
     const l = qs('loader'); if(!l) return; l.style.opacity='0'; l.style.transition='opacity .2s ease'; setTimeout(()=> l.remove(), 220);
   }
-  window.addEventListener('load', ()=> setTimeout(hideLoader, 150)); // give images time to paint
-  setTimeout(hideLoader, 5000); // fallback
+  window.addEventListener('load', ()=> setTimeout(hideLoader, 150));
+  setTimeout(hideLoader, 5000);
 
   showOnly(routeFromPath(location.pathname), false);
   renderHeader();
   refreshLeaderboard();
   buildMinesGrid();
 
-  // Fix external invite button on About tab
   const ad = qs('aboutDiscord');
   if(ad && ad.getAttribute('href') === '__INVITE__'){ ad.style.display='none'; }
 })();
@@ -2012,8 +1993,8 @@ function routeFromPath(path){
 </body>
 </html>
 """
+
 # ---------- Discord Bot (embeds, buttons, permissions) ----------
-# Placed near the end of the file so startup can find `bot`
 import math
 try:
     import discord
@@ -2024,21 +2005,17 @@ except Exception as _e:
     print("[bot] discord.py not available:", _e)
 
 def _fmt_dl_str(amount: Decimal) -> str:
-    s = f"{q2(D(amount)):.2f}"
-    return s
+    return f"{q2(D(amount)):.2f}"
 
 def _parse_user_identifier(s: str) -> Optional[str]:
-    """Accept raw ID or mention like <@123> / <@!123> / <@&123> and return numeric user id as str."""
     if not s: return None
     m = re.search(r"\d{5,}", s)
     return m.group(0) if m else None
 
 def _is_owner_or_webhook(ctx) -> bool:
-    # Owner or a webhook message (rare but allowed per requirement)
     try:
         if int(ctx.author.id) == int(OWNER_ID):
             return True
-        # In discord.py, a Message sent by webhook has webhook_id set (ctx.message.webhook_id)
         if getattr(ctx.message, "webhook_id", None):
             return True
     except Exception:
@@ -2050,29 +2027,25 @@ def _level_progress_bar(progress: int, need: int, width: int = 12) -> str:
     filled = int(round(pct * width))
     return "█" * filled + "░" * (width - filled), int(round(pct * 100))
 
-# Only create a bot if discord.py is available
 if discord and commands:
     intents = discord.Intents.default()
     intents.message_content = True
     bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
-    def _footer(embed: discord.Embed) -> discord.Embed:
+    def _footer(embed: "discord.Embed") -> "discord.Embed":
         embed.set_footer(text="https://growcb.net/")
         return embed
 
     @bot.event
     async def on_ready():
         try:
-            await bot.change_presence(
-                activity=discord.Game(name="growcb.net — .help")
-            )
+            await bot.change_presence(activity=discord.Game(name="growcb.net — .help"))
         except Exception:
             pass
         print(f"[bot] Logged in as {bot.user} (id={bot.user.id})")
 
-    # ------- .help -------
     @bot.command(name="help")
-    async def help_cmd(ctx: commands.Context):
+    async def help_cmd(ctx: "commands.Context"):
         e = discord.Embed(
             title="GROWCB — Commands",
             description=(
@@ -2087,57 +2060,37 @@ if discord and commands:
             ),
             color=0x3b82f6
         )
-        e = _footer(e)
-        await ctx.reply(embed=e, mention_author=False)
+        await ctx.reply(embed=_footer(e), mention_author=False)
 
-    # ------- .bal [user] -------
     @bot.command(name="bal")
-    async def bal_cmd(ctx: commands.Context, who: Optional[str] = None):
-        target_id = None
-        if who:
-            target_id = _parse_user_identifier(who)
-            if not target_id:
-                return await ctx.reply("Provide a valid user mention or numeric ID.", mention_author=False)
-        else:
-            target_id = str(ctx.author.id)
-
+    async def bal_cmd(ctx: "commands.Context", who: Optional[str] = None):
+        target_id = _parse_user_identifier(who) if who else str(ctx.author.id)
+        if not target_id:
+            return await ctx.reply("Provide a valid user mention or numeric ID.", mention_author=False)
         try:
             bal = get_balance(target_id)
         except Exception as e:
             return await ctx.reply(f"Error: {e}", mention_author=False)
+        e = discord.Embed(title="Balance", description=f"<@{target_id}> has **{_fmt_dl_str(bal)} DL**", color=0x22c1dc)
+        await ctx.reply(embed=_footer(e), mention_author=False)
 
-        s = _fmt_dl_str(bal)
-        e = discord.Embed(
-            title="Balance",
-            description=f"<@{target_id}> has **{s} DL**",
-            color=0x22c1dc
-        )
-        e = _footer(e)
-        await ctx.reply(embed=e, mention_author=False)
-
-    # ------- .level -------
     @bot.command(name="level")
-    async def level_cmd(ctx: commands.Context):
+    async def level_cmd(ctx: "commands.Context"):
         try:
             p = profile_info(str(ctx.author.id))
         except Exception as e:
             return await ctx.reply(f"Error: {e}", mention_author=False)
         bar, pct = _level_progress_bar(p["progress"], p["next_needed"])
-        e = discord.Embed(
-            title=f"Level • {ctx.author.display_name}",
-            color=0x6aa6ff
-        )
+        e = discord.Embed(title=f"Level • {ctx.author.display_name}", color=0x6aa6ff)
         e.add_field(name="Level", value=str(p["level"]), inline=True)
         e.add_field(name="XP", value=f'{p["xp"]}', inline=True)
         e.add_field(name="Next", value=f'{p["progress"]}/{p["next_needed"]} ({pct}%)', inline=True)
         e.add_field(name="Progress", value=f"`{bar}`", inline=False)
-        e = _footer(e)
-        await ctx.reply(embed=e, mention_author=False)
+        await ctx.reply(embed=_footer(e), mention_author=False)
 
-    # ------- Leaderboard view with buttons -------
     PERIOD_LABELS = {"daily": "Daily", "monthly": "Monthly", "alltime": "All-time"}
 
-    def _lb_embed(period: str) -> discord.Embed:
+    def _lb_embed(period: str) -> "discord.Embed":
         period = (period or "daily").lower()
         rows = get_leaderboard_rows_db(period, 15)
         lines = []
@@ -2160,21 +2113,18 @@ if discord and commands:
             super().__init__(timeout=60)
             self.current = (current or "daily").lower()
             self._rebuild()
-
         def _rebuild(self):
-            # clear then add buttons with active style
             self.clear_items()
             for p in ("daily", "monthly", "alltime"):
                 style = discord.ButtonStyle.primary if p == self.current else discord.ButtonStyle.secondary
                 self.add_item(LBButton(label=PERIOD_LABELS[p], period=p, style=style, parent=self))
 
     class LBButton(discord.ui.Button):
-        def __init__(self, label: str, period: str, style: discord.ButtonStyle, parent: "LBView"):
+        def __init__(self, label: str, period: str, style: "discord.ButtonStyle", parent: "LBView"):
             super().__init__(label=label, style=style)
             self.period = period
             self.parent_view = parent
-
-        async def callback(self, interaction: discord.Interaction):
+        async def callback(self, interaction: "discord.Interaction"):
             self.parent_view.current = self.period
             self.parent_view._rebuild()
             try:
@@ -2183,21 +2133,19 @@ if discord and commands:
                 pass
 
     @bot.command(name="leaderboard")
-    async def leaderboard_cmd(ctx: commands.Context, period: Optional[str] = "daily"):
+    async def leaderboard_cmd(ctx: "commands.Context", period: Optional[str] = "daily"):
         period = (period or "daily").lower()
         if period not in ("daily", "monthly", "alltime"):
             period = "daily"
         view = LBView(period)
         await ctx.reply(embed=_lb_embed(period), view=view, mention_author=False)
 
-    # ------- Owner/Webhook: addbal / removebal -------
     @bot.command(name="addbal")
-    async def addbal_cmd(ctx: commands.Context, who: Optional[str] = None, amount: Optional[str] = None, *, reason: Optional[str] = None):
+    async def addbal_cmd(ctx: "commands.Context", who: Optional[str] = None, amount: Optional[str] = None, *, reason: Optional[str] = None):
         if not _is_owner_or_webhook(ctx):
             return await ctx.reply("Only the owner or a webhook can use this command.", mention_author=False)
         if not who or not amount:
             return await ctx.reply("Usage: `.addbal <@user|id> <amount> [reason]`", mention_author=False)
-
         uid = _parse_user_identifier(who)
         if not uid:
             return await ctx.reply("Provide a valid user mention or ID.", mention_author=False)
@@ -2205,22 +2153,19 @@ if discord and commands:
             newbal = adjust_balance(str(ctx.author.id), uid, D(amount), reason)
         except Exception as e:
             return await ctx.reply(f"Error: {e}", mention_author=False)
-
         e = discord.Embed(
             title="Balance Updated",
             description=f"Added **{_fmt_dl_str(D(amount))} DL** to <@{uid}>.\nNew balance: **{_fmt_dl_str(newbal)} DL**",
             color=0x22c55e
         )
-        e = _footer(e)
-        await ctx.reply(embed=e, mention_author=False)
+        await ctx.reply(embed=_footer(e), mention_author=False)
 
     @bot.command(name="removebal")
-    async def removebal_cmd(ctx: commands.Context, who: Optional[str] = None, amount: Optional[str] = None, *, reason: Optional[str] = None):
+    async def removebal_cmd(ctx: "commands.Context", who: Optional[str] = None, amount: Optional[str] = None, *, reason: Optional[str] = None):
         if not _is_owner_or_webhook(ctx):
             return await ctx.reply("Only the owner or a webhook can use this command.", mention_author=False)
         if not who or not amount:
             return await ctx.reply("Usage: `.removebal <@user|id> <amount> [reason]`", mention_author=False)
-
         uid = _parse_user_identifier(who)
         if not uid:
             return await ctx.reply("Provide a valid user mention or ID.", mention_author=False)
@@ -2228,14 +2173,12 @@ if discord and commands:
             newbal = adjust_balance(str(ctx.author.id), uid, D(amount) * Decimal("-1"), reason)
         except Exception as e:
             return await ctx.reply(f"Error: {e}", mention_author=False)
-
         e = discord.Embed(
             title="Balance Updated",
             description=f"Removed **{_fmt_dl_str(D(amount))} DL** from <@{uid}>.\nNew balance: **{_fmt_dl_str(newbal)} DL**",
             color=0xef4444
         )
-        e = _footer(e)
-        await ctx.reply(embed=e, mention_author=False)
+        await ctx.reply(embed=_footer(e), mention_author=False)
 
 # ---------- HTML index ----------
 @app.get("/", response_class=HTMLResponse)
@@ -2244,3 +2187,46 @@ async def index():
     html = HTML_TEMPLATE.replace("__BASE_URL__", BASE_URL).replace("__INVITE__", invite)
     return HTMLResponse(html)
 
+# ---------- Startup / Shutdown ----------
+async def _ensure_owner_role():
+    try:
+        ensure_profile_row(str(OWNER_ID))
+        set_role(str(OWNER_ID), "owner")
+    except Exception as e:
+        print("[startup] ensure owner role failed:", e)
+
+async def _run_bot():
+    if not (discord and commands):
+        print("[bot] discord.py missing — skipping bot.")
+        return
+    try:
+        if not DISCORD_BOT_TOKEN:
+            print("[bot] DISCORD_BOT_TOKEN not set — skipping bot startup.")
+            return
+        print("[bot] starting…")
+        await bot.start(DISCORD_BOT_TOKEN)
+    except Exception as e:
+        print("[bot] exited:", repr(e))
+
+@app.on_event("startup")
+async def on_startup():
+    await _ensure_owner_role()
+    try:
+        asyncio.get_running_loop().create_task(_run_bot())
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        loop.create_task(_run_bot())
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    try:
+        if 'bot' in globals() and bot and bot.is_closed() is False:
+            await bot.close()
+            print("[bot] closed")
+    except Exception as e:
+        print("[bot] close error:", e)
+
+# ---------- Local dev runner ----------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=True)

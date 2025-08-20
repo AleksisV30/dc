@@ -2879,11 +2879,36 @@ async def _bot_shutdown():
 # ---------- Crash round daemon ----------
 _crash_task: Optional[asyncio.Task] = None
 
+def _call_with_optional_round(fn, round_id):
+    """Call crash engine fn, passing round_id only if it's required."""
+    import inspect
+    try:
+        sig = inspect.signature(fn)
+        # required positional-or-keyword params without defaults
+        req = [
+            p for p in sig.parameters.values()
+            if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+            and p.default is inspect._empty
+        ]
+        res = fn(round_id) if len(req) >= 1 else fn()
+    except Exception:
+        # Fallback attempts
+        try:
+            res = fn(round_id)
+        except Exception:
+            res = fn()
+    return res
+
+async def _maybe_await(x):
+    if asyncio.iscoroutine(x):
+        return await x
+    return x
+
 async def _crash_daemon():
     print("[CRASH] daemon started")
     while True:
         try:
-            # Ensure a betting round exists
+            # Always ensure there's a betting round
             try:
                 ensure_betting_round()
             except Exception as e:
@@ -2897,47 +2922,47 @@ async def _crash_daemon():
                 await asyncio.sleep(1.0)
                 continue
 
+            rid = st.get("id") or st.get("round_id")
             phase = (st.get("status") or "betting").lower()
             now = now_utc()
 
             if phase == "betting":
                 ends = st.get("betting_ends_at")
                 if isinstance(ends, str):
-                    try: ends = datetime.datetime.fromisoformat(ends)
-                    except: ends = None
+                    try:
+                        ends = datetime.datetime.fromisoformat(ends)
+                    except Exception:
+                        ends = None
                 if ends and ends.tzinfo is None:
                     ends = ends.replace(tzinfo=UTC)
                 if ends and now >= ends:
-                    try:
-                        await begin_running()
-                    except Exception as e:
-                        print("[CRASH] begin_running:", e)
+                    await _maybe_await(_call_with_optional_round(begin_running, rid))
+
             elif phase == "running":
-                # If the engine tracks expected_end_at, finish when passed
                 exp = st.get("expected_end_at")
                 if isinstance(exp, str):
-                    try: exp = datetime.datetime.fromisoformat(exp)
-                    except: exp = None
+                    try:
+                        exp = datetime.datetime.fromisoformat(exp)
+                    except Exception:
+                        exp = None
                 if exp and exp.tzinfo is None:
                     exp = exp.replace(tzinfo=UTC)
-                # If exp is in past, try to finish
                 if exp and now >= exp:
-                    try:
-                        await finish_round()
-                        await create_next_betting()
-                    except Exception as e:
-                        print("[CRASH] finish/create:", e)
+                    await _maybe_await(_call_with_optional_round(finish_round, rid))
+                    await _maybe_await(_call_with_optional_round(create_next_betting, rid))
+
             elif phase == "ended":
-                try:
-                    await create_next_betting()
-                except Exception as e:
-                    print("[CRASH] create_next_betting:", e)
+                await _maybe_await(_call_with_optional_round(create_next_betting, rid))
+
             await asyncio.sleep(0.8)
+
         except asyncio.CancelledError:
-            print("[CRASH] daemon cancelled"); break
+            print("[CRASH] daemon cancelled")
+            break
         except Exception as e:
-            print("[CRASH] loop err:", e)
-            await asyncio.sleep(1.5)
+            print("[CRASH] error:", e)
+            await asyncio.sleep(1.2)
+
 
 # ---------- Startup / Shutdown ----------
 @app.on_event("startup")
@@ -2979,3 +3004,4 @@ async def _shutdown():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=RELOAD)
+
